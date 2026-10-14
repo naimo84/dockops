@@ -3,7 +3,9 @@
 Deklarativer Docker-Compose-Stack-Manager: `stacks.yaml` im Host-Repo-Root
 beschreibt lokale Stacks (rekursiv via Include-Globs) und Import-Stacks aus
 Remote-Checkouts unter `global.work_dir`. Phase 1: Go-Bootstrap und
-YAML-Config-Loader (`internal/config`).
+YAML-Config-Loader (`internal/config`). Phase 2: Git-Manager
+(`internal/git`), deterministisches Stack-Hashing (`internal/hash`) und
+State-Store (`internal/state`).
 
 ## Umgebung
 
@@ -16,7 +18,14 @@ YAML-Config-Loader (`internal/config`).
 - `cmd/dockops/` — CLI-Entry-Point
 - `internal/config/` — Config-Loader: Root-Config, Stack-Discovery über
   Include-Globs, Compose-Auto-Detection, Import-Merge, Validierung
+- `internal/git/` — Git-Manager: Clone-or-Update der Remote-Checkouts über
+  die lokal installierte git-Binary (`os/exec`, keine Git-Library)
+- `internal/hash/` — Deterministisches Stack-Hashing (Package `stackhash`):
+  kanonische Serialisierung von Stack + normalisierter Compose-Datei
+- `internal/state/` — State-Store: Deployment-Zustand pro Stack (JSON-Datei,
+  atomar geschrieben)
 - `PHASE1_TASK.md` — Aufgabenstellung (nicht ändern)
+- `PHASE2_TASK.md` — Aufgabenstellung (nicht ändern)
 
 ## Konventionen
 
