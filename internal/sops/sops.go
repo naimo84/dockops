@@ -63,6 +63,21 @@ func DecryptFiles(ctx context.Context, files []config.SopsFile, baseDir string) 
 	return merged, nil
 }
 
+// DecryptFileKeyfile decrypts the sops-encrypted dotenv file at path like
+// DecryptFile, additionally exporting SOPS_AGE_KEY_FILE=ageKeyfile to the
+// child process when ageKeyfile is non-empty (the dockops process
+// environment itself is never modified). ageKeyfile must already be
+// resolved to a concrete path — unlike DecryptFiles, no relativization
+// happens here; callers that resolve per stack pass the stack directory
+// themselves.
+func DecryptFileKeyfile(ctx context.Context, path, ageKeyfile string) (map[string]string, error) {
+	var extraEnv []string
+	if ageKeyfile != "" {
+		extraEnv = []string{"SOPS_AGE_KEY_FILE=" + ageKeyfile}
+	}
+	return decrypt(ctx, path, extraEnv)
+}
+
 // decrypt runs the sops CLI on path with extraEnv appended to the child
 // environment and parses its stdout as dotenv.
 func decrypt(ctx context.Context, path string, extraEnv []string) (map[string]string, error) {

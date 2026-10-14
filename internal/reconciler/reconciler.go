@@ -1,0 +1,655 @@
+// Package reconciler wires all dockops building blocks — git checkouts,
+// configuration loading, secret resolution, hooks and docker compose — into
+// one reconciliation pass that makes reality match the declarative
+// configuration.
+//
+// A pass (Reconcile) is idempotent: git checkouts are updated with
+// clone-or-update, unchanged stacks are skipped via their deterministic
+// hash, and docker compose up is convergent. Failures are collected per
+// stack and returned joined, so one broken stack never prevents the others
+// from being reconciled. Reconcile is not safe for concurrent use — the CLI
+// loop serializes passes, matching state.Store and vault.Client.
+//
+// Open points in the briefing are decided conservatively and documented at
+// the decision sites; the two most prominent:
+//
+//   - The host repository is bootstrapped below Deps.WorkDir (the config
+//     default when unset), while the remotes live below global.work_dir,
+//     resolved exactly the way config.Load resolves it. With the default
+//     configuration both are the same directory, so host and remotes share
+//     one checkout root as the briefing describes.
+//   - Post-deploy hook failures are logged AND collected in the pass error
+//     ("errors.Join aller aufgetretenen Fehler"), but the stack still
+//     counts as deployed, exactly as the briefing prescribes.
+package reconciler
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/local/dockops/internal/compose"
+	"github.com/local/dockops/internal/config"
+	"github.com/local/dockops/internal/env"
+	"github.com/local/dockops/internal/git"
+	"github.com/local/dockops/internal/hash"
+	"github.com/local/dockops/internal/hooks"
+	"github.com/local/dockops/internal/secrets"
+	"github.com/local/dockops/internal/sops"
+	"github.com/local/dockops/internal/state"
+	"github.com/local/dockops/internal/vault"
+)
+
+const (
+	// hostRepoName is the checkout name of the primary host repository; the
+	// root configuration is read from <workDir>/host/stacks.yaml.
+	hostRepoName = "host"
+
+	// rootConfigFile is the fixed file name of the root configuration in
+	// the host repository root (stacks.yaml, plural — distinct from the
+	// per-stack stack.yaml the include globs discover).
+	rootConfigFile = "stacks.yaml"
+
+	// hookTimeout is passed to the hook engine per command; 0 makes the
+	// engine apply its own default (5m). There is no per-hook timeout
+	// configuration in the schema yet — conservative: engine default.
+	hookTimeout = 0 * time.Second
+)
+
+// GitManager is the subset of git.Manager the reconciler needs: guaranteed
+// checkouts and the commit they point at.
+type GitManager interface {
+	// EnsureRepo guarantees that <work dir>/<name> is a checkout of url at
+	// the latest commit of branch and returns the local path.
+	EnsureRepo(name, url, branch string) (string, error)
+
+	// HeadCommit returns the commit currently checked out at repoPath.
+	HeadCommit(repoPath string) (string, error)
+}
+
+// ComposeExecutor is the subset of compose.Executor the reconciler needs.
+type ComposeExecutor interface {
+	// Up brings a stack up detached (compose.Executor.Up).
+	Up(ctx context.Context, stack config.Stack, stackDir, envFile string) error
+
+	// Down tears a stack down (compose.Executor.Down).
+	Down(ctx context.Context, stack config.Stack, stackDir, envFile string) error
+
+	// DownProject tears a project down by name only, without a compose
+	// file (compose.Executor.DownProject).
+	DownProject(ctx context.Context, project string) error
+}
+
+// HookRunner is the subset of hooks.Engine the reconciler needs.
+type HookRunner interface {
+	// Run executes commands sequentially via sh -c (hooks.Engine.Run).
+	Run(ctx context.Context, commands []string, dir string, env []string, timeout time.Duration) error
+}
+
+// VaultClient is the subset of vault.Client the reconciler needs.
+type VaultClient interface {
+	// Login authenticates the client (vault.Client.Login).
+	Login(ctx context.Context) error
+
+	// ReadKV reads a KV v2 secret (vault.Client.ReadKV).
+	ReadKV(ctx context.Context, path string) (map[string]string, error)
+}
+
+// SopsDecryptFunc decrypts one sops-encrypted dotenv file; it matches the
+// signature of sops.DecryptFileKeyfile.
+type SopsDecryptFunc func(ctx context.Context, path, ageKeyfile string) (map[string]string, error)
+
+// VaultFactory builds a Vault client for the given configuration; it
+// matches the signature of vault.New.
+type VaultFactory func(cfg config.Vault, logger *slog.Logger) (VaultClient, error)
+
+// Compile-time assertions that the real implementations satisfy the
+// injection interfaces, and that the resolver below satisfies the interface
+// env.MergeStackEnv consumes.
+var (
+	_ GitManager       = (*git.Manager)(nil)
+	_ ComposeExecutor  = (*compose.Executor)(nil)
+	_ HookRunner       = (*hooks.Engine)(nil)
+	_ VaultClient      = (*vault.Client)(nil)
+	_ secrets.Resolver = (*stackResolver)(nil)
+)
+
+// Deps are the collaborators of a Reconciler. Git, Compose, Hooks, Sops and
+// NewVault are injection points so tests run without the git, docker, sops
+// and vault binaries; nil selects the real implementations from the
+// corresponding internal packages.
+type Deps struct {
+	// RepoURL and Branch identify the primary host repository; the CLI
+	// supplies them via -repo and -branch.
+	RepoURL string
+	Branch  string
+
+	// WorkDir bootstraps the host checkout below <WorkDir>/host. Empty
+	// selects config.DefaultWorkDir — the same value the config loader
+	// defaults global.work_dir to, so with an unset work_dir the host and
+	// all remotes share one directory.
+	WorkDir string
+
+	// State persists deployment hashes and prune metadata (required).
+	State *state.Store
+
+	// Logger; nil falls back to slog.Default().
+	Logger *slog.Logger
+
+	// OnConfigLoaded, when set, is called with the fully loaded
+	// configuration at the start of every successful pass — the CLI uses
+	// it to pick up global.poll_interval changes.
+	OnConfigLoaded func(cfg *config.Config)
+
+	// Git, nil → git.Manager below WorkDir.
+	Git GitManager
+
+	// Compose, nil → compose.Executor with the default binary.
+	Compose ComposeExecutor
+
+	// Hooks, nil → hooks.Engine.
+	Hooks HookRunner
+
+	// Sops, nil → sops.DecryptFileKeyfile.
+	Sops SopsDecryptFunc
+
+	// NewVault, nil → vault.New. Called at most once per pass, and only
+	// when a stack actually has vault paths.
+	NewVault VaultFactory
+}
+
+// Reconciler executes reconciliation passes over the declarative
+// configuration. Build it with New and run Reconcile per pass.
+type Reconciler struct {
+	repoURL  string
+	branch   string
+	workDir  string
+	state    *state.Store
+	logger   *slog.Logger
+	onConfig func(*config.Config)
+	git      GitManager
+	compose  ComposeExecutor
+	hooks    HookRunner
+	sops     SopsDecryptFunc
+	newVault VaultFactory
+}
+
+// New returns a Reconciler for deps, applying the defaults documented on
+// Deps. Requirement violations (empty repo URL or branch, nil state store)
+// are deliberately not rejected here — New has no error return per the
+// briefing — but Reconcile reports them at the start of every pass.
+func New(deps Deps) *Reconciler {
+	workDir := deps.WorkDir
+	if workDir == "" {
+		workDir = config.DefaultWorkDir
+	}
+	logger := deps.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	composeExec := deps.Compose
+	if composeExec == nil {
+		composeExec = compose.New(logger, "")
+	}
+	hookRunner := deps.Hooks
+	if hookRunner == nil {
+		hookRunner = hooks.New(logger)
+	}
+	sopsFn := deps.Sops
+	if sopsFn == nil {
+		sopsFn = sops.DecryptFileKeyfile
+	}
+	vaultFactory := deps.NewVault
+	if vaultFactory == nil {
+		vaultFactory = func(cfg config.Vault, logger *slog.Logger) (VaultClient, error) {
+			return vault.New(cfg, logger)
+		}
+	}
+	return &Reconciler{
+		repoURL:  deps.RepoURL,
+		branch:   deps.Branch,
+		workDir:  filepath.Clean(workDir),
+		state:    deps.State,
+		logger:   logger,
+		onConfig: deps.OnConfigLoaded,
+		git:      deps.Git,
+		compose:  composeExec,
+		hooks:    hookRunner,
+		sops:     sopsFn,
+		newVault: vaultFactory,
+	}
+}
+
+// Reconcile runs one complete pass:
+//
+//  1. clone-or-update the host repository and read the root stacks.yaml,
+//  2. clone-or-update every configured remote,
+//  3. load the full configuration (local discovery + import merge),
+//  4. deploy every enabled stack whose hash changed (secrets, env file,
+//     pre_deploy hooks, compose up, post_deploy hooks, state),
+//  5. prune stacks that disappeared from the configuration, and
+//  6. persist the state file.
+//
+// Failures are collected per step or stack and returned joined (nil when
+// all is well); the pass is idempotent and aborts early when ctx is
+// cancelled. Bootstrapping failures (host repo, root config) abort the
+// whole pass since nothing downstream can run without them.
+func (r *Reconciler) Reconcile(ctx context.Context) error {
+	if err := r.validate(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("reconciler: %w", err)
+	}
+	var errs []error
+
+	// 1. Primary host repository.
+	gitMgr := r.git
+	if gitMgr == nil {
+		m, err := git.New(r.workDir, r.logger)
+		if err != nil {
+			return fmt.Errorf("reconciler: git manager: %w", err)
+		}
+		gitMgr = m
+	}
+	hostPath, err := gitMgr.EnsureRepo(hostRepoName, r.repoURL, r.branch)
+	if err != nil {
+		return fmt.Errorf("reconciler: host repo: %w", err)
+	}
+	rootFile := filepath.Join(hostPath, rootConfigFile)
+	root, err := config.LoadRoot(rootFile)
+	if err != nil {
+		return fmt.Errorf("reconciler: %w", err)
+	}
+
+	// 2. Remotes. They live below global.work_dir, resolved the same way
+	// config.Load resolves it (relative against the host repository root),
+	// so the imports are found exactly where the loader looks for them.
+	// With the default configuration this equals the bootstrap work dir,
+	// so host and remotes share one manager.
+	remotesGit := gitMgr
+	remotesDir := resolveWorkDir(rootFile, root.Global.WorkDir)
+	if remotesDir != r.workDir {
+		if r.git == nil {
+			m, err := git.New(remotesDir, r.logger)
+			if err != nil {
+				return fmt.Errorf("reconciler: git manager for work dir %s: %w", remotesDir, err)
+			}
+			remotesGit = m
+		} else {
+			// Injected managers (tests) control their checkout placement
+			// themselves; the configured work_dir is expected to match.
+			r.logger.Warn("global.work_dir differs from the bootstrap work dir; using the injected git manager unchanged",
+				"config_work_dir", remotesDir, "bootstrap_work_dir", r.workDir)
+		}
+	}
+	remotePaths := make(map[string]string, len(root.Remotes))
+	for _, name := range sortedKeys(root.Remotes) {
+		rem := root.Remotes[name]
+		path, err := remotesGit.EnsureRepo(name, rem.URL, rem.Branch)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("remote %s: %w", name, err))
+			continue
+		}
+		remotePaths[name] = path
+	}
+
+	// 3. Full configuration: local stack discovery plus import merge.
+	cfg, err := config.Load(rootFile)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("reconciler: %w", err))
+		return errors.Join(errs...)
+	}
+	if r.onConfig != nil {
+		r.onConfig(cfg)
+	}
+
+	// GIT_COMMIT per stack: the commit of the checkout the stack
+	// definition lives in (host checkout for local stacks, owning remote
+	// checkout for imports). Missing git metadata only degrades GIT_COMMIT
+	// to "" — it does not put the deployment at risk.
+	commits := make(map[string]string, 1+len(remotePaths))
+	recordCommit(gitMgr, commits, hostPath, r.logger)
+	for _, name := range sortedKeys(remotePaths) {
+		recordCommit(remotesGit, commits, remotePaths[name], r.logger)
+	}
+
+	// 4. Deploy every enabled stack; a failing stack is skipped while the
+	// pass continues with the next one.
+	vaultSess := &vaultSession{factory: r.newVault, cfg: cfg.Global.Vault, logger: r.logger}
+	for _, stack := range cfg.Stacks {
+		if !stack.Enabled {
+			r.logger.Debug("stack disabled, skipping", "stack", stack.Name)
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, fmt.Errorf("reconciler: aborted before stack %s: %w", stack.Name, err))
+			break
+		}
+		if err := r.deployStack(ctx, stack, vaultSess, commits); err != nil {
+			r.logger.Error("stack deployment failed", "stack", stack.Name, "error", err)
+			errs = append(errs, err)
+		}
+	}
+
+	// 5. Prune stacks that disappeared from the configuration.
+	if cfg.Global.PruneRemovedStacks {
+		errs = append(errs, r.prune(ctx, cfg)...)
+	}
+
+	// 6. Persist all recorded state changes (deployed, failed, pruned) in
+	// one atomic write; a failure to persist is itself a pass error.
+	if err := r.state.Save(); err != nil {
+		errs = append(errs, fmt.Errorf("reconciler: save state: %w", err))
+	}
+	return errors.Join(errs...)
+}
+
+// deployStack runs the deployment sequence of one enabled stack: hash,
+// change detection, secrets, environment, hooks and compose up. Per-stack
+// failures are returned; the caller collects them and continues with the
+// next stack. All deferred cleanup (the shm env file) runs when this
+// function returns, i.e. at the end of the stack.
+func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultSess *vaultSession, commits map[string]string) error {
+	composeContent, err := os.ReadFile(stack.ComposeFile)
+	if err != nil {
+		return fmt.Errorf("stack %s: read compose file: %w", stack.Name, err)
+	}
+	newHash, err := stackhash.Compute(stack, composeContent)
+	if err != nil {
+		return fmt.Errorf("stack %s: compute hash: %w", stack.Name, err)
+	}
+
+	// Unchanged hash and last attempt deployed → skip (logged at debug per
+	// the briefing). Changed() also redeploys entries whose last attempt
+	// failed, so a transient failure is retried on the next pass even with
+	// an unchanged hash.
+	if !r.state.Changed(stack.Name, newHash) {
+		r.logger.Debug("stack unchanged, skipping", "stack", stack.Name, "hash", newHash)
+		return nil
+	}
+	r.logger.Info("deploying stack", "stack", stack.Name, "hash", newHash)
+
+	// Secrets: the Vault client is built and logged in lazily, at most once
+	// per pass, and only when a stack actually carries vault paths.
+	var vaultClient VaultClient
+	if len(stack.VaultPaths) > 0 {
+		vaultClient, err = vaultSess.get(ctx)
+		if err != nil {
+			r.markFailed(stack, newHash)
+			return fmt.Errorf("stack %s: vault: %w", stack.Name, err)
+		}
+	}
+
+	sysEnv := env.SystemVars{GitCommit: commitFor(stack.Dir, commits)}
+	resolver := &stackResolver{stack: stack, decrypt: r.sops, vault: vaultClient}
+	merged, err := env.MergeStackEnv(ctx, stack, resolver, stack.Dir, sysEnv)
+	if err != nil {
+		r.markFailed(stack, newHash)
+		return fmt.Errorf("stack %s: resolve environment: %w", stack.Name, err)
+	}
+
+	envFile, cleanup, err := env.WriteShm(merged)
+	if err != nil {
+		r.markFailed(stack, newHash)
+		return fmt.Errorf("stack %s: write env file: %w", stack.Name, err)
+	}
+	defer cleanup()
+
+	hookEnv := envList(merged)
+	if err := r.hooks.Run(ctx, stack.Hooks.PreDeploy, stack.Dir, hookEnv, hookTimeout); err != nil {
+		r.markFailed(stack, newHash)
+		return fmt.Errorf("stack %s: pre_deploy: %w", stack.Name, err)
+	}
+	if err := r.compose.Up(ctx, stack, stack.Dir, envFile); err != nil {
+		r.markFailed(stack, newHash)
+		return fmt.Errorf("stack %s: up: %w", stack.Name, err)
+	}
+
+	// A failed post_deploy hook does not undeploy the stack — the briefing
+	// says it still counts as deployed — but the error is logged here and
+	// returned so it joins the pass result.
+	var postErr error
+	if err := r.hooks.Run(ctx, stack.Hooks.PostDeploy, stack.Dir, hookEnv, hookTimeout); err != nil {
+		r.logger.Error("post_deploy failed; stack counts as deployed anyway", "stack", stack.Name, "error", err)
+		postErr = fmt.Errorf("stack %s: post_deploy: %w", stack.Name, err)
+	}
+
+	if err := r.state.Set(stack.Name, state.State{
+		Hash:        newHash,
+		Status:      state.StatusDeployed,
+		StackDir:    stack.Dir,
+		ComposeFile: stack.ComposeFile,
+	}); err != nil {
+		return fmt.Errorf("stack %s: record state: %w", stack.Name, err)
+	}
+	return postErr
+}
+
+// markFailed records a failed deployment attempt so the next pass retries
+// the stack even when its hash is unchanged (state.Changed treats every
+// non-deployed status as changed). The bookkeeping itself must never mask
+// the original failure, so a Set error is only logged.
+func (r *Reconciler) markFailed(stack config.Stack, newHash string) {
+	if err := r.state.Set(stack.Name, state.State{
+		Hash:        newHash,
+		Status:      state.StatusFailed,
+		StackDir:    stack.Dir,
+		ComposeFile: stack.ComposeFile,
+	}); err != nil {
+		r.logger.Error("cannot record failed state", "stack", stack.Name, "error", err)
+	}
+}
+
+// prune tears down every state entry whose stack no longer exists in the
+// configuration and removes the entry. Disabled stacks still exist in the
+// configuration and are therefore never pruned. A failed teardown keeps the
+// entry so the next pass retries it.
+func (r *Reconciler) prune(ctx context.Context, cfg *config.Config) []error {
+	configured := make(map[string]struct{}, len(cfg.Stacks))
+	for _, s := range cfg.Stacks {
+		configured[s.Name] = struct{}{}
+	}
+	var errs []error
+	for _, name := range r.state.Names() {
+		if _, ok := configured[name]; ok {
+			continue
+		}
+		st, _ := r.state.Get(name)
+		if err := r.pruneStack(ctx, name, st); err != nil {
+			r.logger.Error("prune failed; state entry kept for retry", "stack", name, "error", err)
+			errs = append(errs, fmt.Errorf("prune %s: %w", name, err))
+			continue
+		}
+		r.state.Delete(name)
+		r.logger.Info("pruned removed stack", "stack", name)
+	}
+	return errs
+}
+
+// pruneStack tears one removed stack down. When the persisted compose file
+// still exists, the full Down command line runs — an empty env file stands
+// in for the secrets, which are gone with the stack definition; down only
+// interpolates, it does not need the values. Otherwise (the checkout
+// directory vanished with the stack) the briefing's fallback runs: docker
+// compose -p <name> down --remove-orphans without -f, which may fail
+// depending on the docker compose version; the failure is returned to the
+// caller for logging and retry.
+func (r *Reconciler) pruneStack(ctx context.Context, name string, st state.State) error {
+	if st.ComposeFile != "" && st.StackDir != "" && regularFileExists(st.ComposeFile) {
+		envFile, cleanup, err := env.WriteShm(map[string]string{})
+		if err != nil {
+			return fmt.Errorf("write empty env file: %w", err)
+		}
+		defer cleanup()
+		ghost := config.Stack{Name: name, ComposeFile: st.ComposeFile}
+		return r.compose.Down(ctx, ghost, st.StackDir, envFile)
+	}
+	return r.compose.DownProject(ctx, name)
+}
+
+// validate checks the invariant requirements at the start of every pass so
+// miswired dependencies fail with a clear message instead of a panic.
+func (r *Reconciler) validate() error {
+	if r.repoURL == "" {
+		return fmt.Errorf("reconciler: repo url must not be empty (flag -repo or env DOCKOPS_REPO_URL)")
+	}
+	if r.branch == "" {
+		return fmt.Errorf("reconciler: branch must not be empty (flag -branch or env DOCKOPS_BRANCH)")
+	}
+	if r.state == nil {
+		return fmt.Errorf("reconciler: state store must not be nil")
+	}
+	return nil
+}
+
+// vaultSession builds and logs in the Vault client at most once per
+// reconcile pass (briefing: "Login einmal pro Reconcile-Durchlauf") and
+// caches the outcome: a failed construction or login is replayed for every
+// later stack with vault paths instead of hammering an unreachable server.
+// The next pass starts fresh with a new session.
+type vaultSession struct {
+	factory VaultFactory
+	cfg     config.Vault
+	logger  *slog.Logger
+	client  VaultClient
+	err     error
+	tried   bool
+}
+
+// get returns the logged-in Vault client, constructing and logging in on
+// first use.
+func (v *vaultSession) get(ctx context.Context) (VaultClient, error) {
+	if v.tried {
+		return v.client, v.err
+	}
+	v.tried = true
+	c, err := v.factory(v.cfg, v.logger)
+	if err != nil {
+		v.err = fmt.Errorf("build client: %w", err)
+		return nil, v.err
+	}
+	if err := c.Login(ctx); err != nil {
+		v.err = fmt.Errorf("login: %w", err)
+		return nil, v.err
+	}
+	v.client = c
+	return c, nil
+}
+
+// stackResolver adapts the reconciler's sops function and — for stacks with
+// vault paths — the logged-in Vault client to the secrets.Resolver
+// interface consumed by env.MergeStackEnv. It is bound to one stack so a
+// relative age key file resolves against that stack's directory, mirroring
+// sops.DecryptFiles, which resolves relative key files against baseDir.
+type stackResolver struct {
+	stack   config.Stack
+	decrypt SopsDecryptFunc
+	vault   VaultClient // nil for stacks without vault paths
+}
+
+// ResolveSops implements secrets.Resolver. file.Path arrives already
+// resolved to an absolute path from env.MergeStackEnv; only the age key
+// file is relativized here.
+func (s *stackResolver) ResolveSops(ctx context.Context, file config.SopsFile) (map[string]string, error) {
+	keyfile := file.AgeKeyfile
+	if keyfile != "" && !filepath.IsAbs(keyfile) {
+		keyfile = filepath.Join(s.stack.Dir, keyfile)
+	}
+	return s.decrypt(ctx, file.Path, keyfile)
+}
+
+// ResolveVault implements secrets.Resolver.
+func (s *stackResolver) ResolveVault(ctx context.Context, path string) (map[string]string, error) {
+	if s.vault == nil {
+		// Unreachable in the reconciler flow: the client is nil only for
+		// stacks without vault paths, and those never call ResolveVault.
+		return nil, fmt.Errorf("stack %s: vault path %q but no vault client was provided", s.stack.Name, path)
+	}
+	return s.vault.ReadKV(ctx, path)
+}
+
+// resolveWorkDir makes the configured work dir absolute exactly the way
+// config.Load does: relative values resolve against the directory of the
+// root configuration file. LoadRoot only applies the empty-value default;
+// replicating the resolution here keeps the remotes where the loader will
+// look for the imports.
+func resolveWorkDir(rootFile, workDir string) string {
+	if workDir == "" {
+		return config.DefaultWorkDir
+	}
+	if filepath.IsAbs(workDir) {
+		return filepath.Clean(workDir)
+	}
+	return filepath.Join(filepath.Dir(rootFile), workDir)
+}
+
+// recordCommit records the commit of the checkout at path. On error it logs
+// a warning and leaves the checkout unrecorded — GIT_COMMIT degrades to ""
+// rather than failing the deployment over missing git metadata.
+func recordCommit(m GitManager, commits map[string]string, path string, logger *slog.Logger) {
+	commit, err := m.HeadCommit(path)
+	if err != nil {
+		logger.Warn("cannot determine commit; GIT_COMMIT stays empty", "path", path, "error", err)
+		return
+	}
+	commits[path] = commit
+}
+
+// commitFor returns the git commit of the checkout containing dir: the
+// host checkout for local stacks, the owning remote checkout for imports.
+// The longest matching checkout wins, so nested checkouts resolve to the
+// innermost one; directories outside every checkout yield "" (unknown).
+func commitFor(dir string, commits map[string]string) string {
+	best, bestLen := "", -1
+	for path, commit := range commits {
+		if commit == "" {
+			continue
+		}
+		if dir == path || strings.HasPrefix(dir, path+string(filepath.Separator)) {
+			if len(path) > bestLen {
+				best, bestLen = commit, len(path)
+			}
+		}
+	}
+	return best
+}
+
+// envList renders env as sorted KEY=VALUE entries for the hook engine
+// (sorted so recorded calls and log output stay deterministic).
+func envList(env map[string]string) []string {
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k+"="+env[k])
+	}
+	return out
+}
+
+// sortedKeys returns the keys of m sorted for deterministic iteration
+// (remotes are processed and logged in a stable order).
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// regularFileExists reports whether path exists and is a regular file
+// (same semantics as the config loader's helper).
+func regularFileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}

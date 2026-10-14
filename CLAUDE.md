@@ -8,7 +8,10 @@ YAML-Config-Loader (`internal/config`). Phase 2: Git-Manager
 State-Store (`internal/state`). Phase 3: Secret-Auflösung und Deployment-
 Bausteine — Vault-Client (`internal/vault`), SOPS (`internal/sops`),
 Env-Merge (`internal/env`), Hook-Engine (`internal/hooks`) und Compose-
-Executor (`internal/compose`).
+Executor (`internal/compose`). Phase 4: Reconciliation-Loop
+(`internal/reconciler`), CLI-Agent (`cmd/dockops`: `-once`, Poll- und
+Webhook-Modus mit Graceful Shutdown) und Webhook-Server
+(`internal/webhook`: GitHub-HMAC/GitLab-Token, `/healthz`).
 
 ## Umgebung
 
@@ -18,7 +21,9 @@ Executor (`internal/compose`).
 
 ## Struktur
 
-- `cmd/dockops/` — CLI-Entry-Point
+- `cmd/dockops/` — CLI-Entry-Point: Flags mit Env-Fallbacks, `-once`- und
+  Daemon-Modus (Webhook-Server + Poll-Timer, debounced Trigger, Graceful
+  Shutdown), slog-JSON auf stdout
 - `internal/config/` — Config-Loader: Root-Config, Stack-Discovery über
   Include-Globs, Compose-Auto-Detection, Import-Merge, Validierung
 - `internal/git/` — Git-Manager: Clone-or-Update der Remote-Checkouts über
@@ -40,10 +45,19 @@ Executor (`internal/compose`).
 - `internal/hooks/` — Hook-Engine: sequenzielle `sh -c`-Ausführung mit
   Per-Kommando-Timeout (Prozessgruppen-Kill) und slog-Output
 - `internal/compose/` — Compose-Executor: `docker compose up/down` mit
-  deterministischem Projektnamen (`-p <stack-name>`)
+  deterministischem Projektnamen (`-p <stack-name>`), plus `DownProject`
+  (Prune ohne Compose-Datei)
+- `internal/reconciler/` — Reconciliation-Loop: verdrahtet git, config,
+  hash, state, secrets (Vault-Login einmal pro Durchlauf), env, hooks und
+  compose zu einem idempotenten Durchlauf mit Prune und `errors.Join`;
+  Git/Compose/Hooks/Sops/Vault als injizierbare Interfaces für Tests
+- `internal/webhook/` — Webhook-HTTP-Handler: `POST /webhook` mit
+  GitHub-HMAC-SHA256 (`X-Hub-Signature-256`) oder GitLab-Token
+  (`X-Gitlab-Token`), konstante Vergleiche, `GET /healthz`
 - `PHASE1_TASK.md` — Aufgabenstellung (nicht ändern)
 - `PHASE2_TASK.md` — Aufgabenstellung (nicht ändern)
 - `PHASE3_TASK.md` — Aufgabenstellung (nicht ändern)
+- `PHASE4_TASK.md` — Aufgabenstellung (nicht ändern)
 
 ## Konventionen
 

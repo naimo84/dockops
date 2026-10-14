@@ -119,6 +119,26 @@ func (m *Manager) EnsureRepo(name, url, branch string) (string, error) {
 	return path, nil
 }
 
+// HeadCommit returns the commit that the checkout at repoPath currently has
+// checked out (git rev-parse HEAD). The reconciler uses it to expose
+// GIT_COMMIT to stacks and hooks. repoPath must be a checkout below the
+// manager's work directory; anything else is refused (conservative choice:
+// the manager only answers for directories it manages).
+func (m *Manager) HeadCommit(repoPath string) (string, error) {
+	abs, err := filepath.Abs(repoPath)
+	if err != nil {
+		return "", fmt.Errorf("git: resolve %s: %w", repoPath, err)
+	}
+	if abs != m.workDir && !strings.HasPrefix(abs, m.workDir+string(filepath.Separator)) {
+		return "", fmt.Errorf("git: %s is not below the work directory %s", abs, m.workDir)
+	}
+	out, err := m.runGit(abs, "rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // validateName rejects repository names that would escape the work directory
 // or are unusable as a single path segment. The briefing is silent on name
 // validation; rejecting is the conservative choice.

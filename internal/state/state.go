@@ -52,6 +52,14 @@ type State struct {
 	Status string `json:"status"`
 	// UpdatedAt is the UTC time of the last state change.
 	UpdatedAt time.Time `json:"updated_at"`
+	// StackDir is the directory the stack definition lived in at deploy
+	// time. Only used by pruning, to tear a stack down after it disappeared
+	// from the configuration. Optional: state files written before the
+	// field existed simply have no value here.
+	StackDir string `json:"stack_dir,omitempty"`
+	// ComposeFile is the resolved compose file path at deploy time, for the
+	// same purpose as StackDir. Optional, see there.
+	ComposeFile string `json:"compose_file,omitempty"`
 }
 
 // fileModel is the JSON document persisted by Save.

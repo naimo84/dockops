@@ -83,6 +83,20 @@ func (e *Executor) Down(ctx context.Context, stack config.Stack, stackDir, envFi
 	return e.run(ctx, args)
 }
 
+// DownProject tears a project down by name only, without a compose file:
+//
+//	<binary> compose -p <project> down --remove-orphans
+//
+// It is the prune fallback for stacks whose definition (and with it the
+// compose file and checkout directory) has disappeared; only the project
+// name — which docker compose derives its resource labels from — is still
+// known. Depending on the docker compose version this may fail (some
+// versions insist on a compose file even for teardown); the caller logs and
+// retries on the next pass.
+func (e *Executor) DownProject(ctx context.Context, project string) error {
+	return e.run(ctx, []string{"compose", "-p", project, "down", "--remove-orphans"})
+}
+
 // composeFilePath returns the compose file to pass to -f: the stack's
 // resolved ComposeFile when absolute (the config loader resolves it),
 // otherwise ComposeFile joined below stackDir.

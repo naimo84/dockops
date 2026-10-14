@@ -15,10 +15,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// DefaultWorkDir is the fallback for global.work_dir. It is exported so the
+// reconciler can bootstrap the host checkout below it before the root
+// configuration (which declares work_dir) is loadable.
+const DefaultWorkDir = "/var/lib/dockops/repos"
+
 // Smart defaults applied when the corresponding field is unset in stacks.yaml.
 const (
 	defaultPollInterval     = 5 * time.Minute
-	defaultWorkDir          = "/var/lib/dockops/repos"
 	defaultVaultMountPath   = "secret"
 	defaultVaultAuthMethod  = "token"
 	defaultVaultTokenEnv    = "VAULT_TOKEN"
@@ -82,6 +86,15 @@ func Load(rootFile string) (*Config, error) {
 	return cfg, nil
 }
 
+// LoadRoot parses, validates and applies defaults to only the root
+// stacks.yaml at path, without discovering local stacks and without loading
+// imports. The reconciler needs it to read remotes and global settings
+// before the remote checkouts exist (imports would fail to load); everyone
+// else wants Load.
+func LoadRoot(path string) (*Root, error) {
+	return loadRoot(path)
+}
+
 // loadRoot reads, decodes and validates the root stacks.yaml.
 func loadRoot(path string) (*Root, error) {
 	var root Root
@@ -105,7 +118,7 @@ func applyRootDefaults(root *Root) {
 		g.PollInterval = Duration(defaultPollInterval)
 	}
 	if g.WorkDir == "" {
-		g.WorkDir = defaultWorkDir
+		g.WorkDir = DefaultWorkDir
 	}
 	if len(g.Include) == 0 {
 		g.Include = slices.Clone(defaultInclude)
