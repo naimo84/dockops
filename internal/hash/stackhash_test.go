@@ -122,13 +122,13 @@ func TestComputeSensitiveToConfigChanges(t *testing.T) {
 	}
 
 	mutations := map[string]func(s *config.Stack){
-		"name":        func(s *config.Stack) { s.Name = "web2" },
-		"enabled":     func(s *config.Stack) { s.Enabled = false },
-		"compose_file": func(s *config.Stack) { s.ComposeFile = "/srv/other/compose.yaml" },
-		"profiles":     func(s *config.Stack) { s.Profiles = []string{"minimal"} },
-		"services":     func(s *config.Stack) { s.Services = []string{"app"} },
-		"env_files":    func(s *config.Stack) { s.EnvFiles = []string{"web.env"} },
-		"sops path":    func(s *config.Stack) { s.SopsFiles[0].Path = "other.enc" },
+		"name":             func(s *config.Stack) { s.Name = "web2" },
+		"enabled":          func(s *config.Stack) { s.Enabled = false },
+		"compose_file":     func(s *config.Stack) { s.ComposeFile = "/srv/other/compose.yaml" },
+		"profiles":         func(s *config.Stack) { s.Profiles = []string{"minimal"} },
+		"services":         func(s *config.Stack) { s.Services = []string{"app"} },
+		"env_files":        func(s *config.Stack) { s.EnvFiles = []string{"web.env"} },
+		"sops path":        func(s *config.Stack) { s.SopsFiles[0].Path = "other.enc" },
 		"sops age_keyfile": func(s *config.Stack) { s.SopsFiles[0].AgeKeyfile = "" },
 		"vault_paths":      func(s *config.Stack) { s.VaultPaths = []string{"secret/web/tls"} },
 		"pre_deploy hook":  func(s *config.Stack) { s.Hooks.PreDeploy = []string{"echo pre1"} },
@@ -240,13 +240,13 @@ func TestComputeComposeErrors(t *testing.T) {
 	stack := baseStack()
 	stack.ComposeFile = "/srv/stacks/web/compose.yaml"
 	cases := map[string]struct {
-		content  string
-		wantErr  string
+		content string
+		wantErr string
 	}{
-		"syntax error":     {"services:\n  - [unclosed", "normalize compose file"},
-		"duplicate keys":   {"services: {}\nservices: {}", `duplicate mapping key "services"`},
-		"non-scalar key":   {"? [a, b]\n: v", "non-scalar mapping key"},
-		"cyclic alias":     {"a: &x\n  b: *x\n", "cyclic alias"},
+		"syntax error":   {"services:\n  - [unclosed", "normalize compose file"},
+		"duplicate keys": {"services: {}\nservices: {}", `duplicate mapping key "services"`},
+		"non-scalar key": {"? [a, b]\n: v", "non-scalar mapping key"},
+		"cyclic alias":   {"a: &x\n  b: *x\n", "cyclic alias"},
 	}
 	for name, tc := range cases {
 		_, err := Compute(stack, []byte(tc.content))

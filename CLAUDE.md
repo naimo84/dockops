@@ -5,7 +5,10 @@ beschreibt lokale Stacks (rekursiv via Include-Globs) und Import-Stacks aus
 Remote-Checkouts unter `global.work_dir`. Phase 1: Go-Bootstrap und
 YAML-Config-Loader (`internal/config`). Phase 2: Git-Manager
 (`internal/git`), deterministisches Stack-Hashing (`internal/hash`) und
-State-Store (`internal/state`).
+State-Store (`internal/state`). Phase 3: Secret-Auflösung und Deployment-
+Bausteine — Vault-Client (`internal/vault`), SOPS (`internal/sops`),
+Env-Merge (`internal/env`), Hook-Engine (`internal/hooks`) und Compose-
+Executor (`internal/compose`).
 
 ## Umgebung
 
@@ -24,8 +27,23 @@ State-Store (`internal/state`).
   kanonische Serialisierung von Stack + normalisierter Compose-Datei
 - `internal/state/` — State-Store: Deployment-Zustand pro Stack (JSON-Datei,
   atomar geschrieben)
+- `internal/dotenv/` — Minimaler dotenv-Dialekt (Parse/Format), geteilt von
+  SOPS-Output, env_files und der erzeugten `--env-file`
+- `internal/secrets/` — `Resolver`-Interface: abstrahiert SOPS-Dateien und
+  Vault-Pfade für den Env-Merge
+- `internal/vault/` — Vault-Client für KV v2 über net/http (keine
+  Vault-Library): Token/AppRole-Login, ReadKV
+- `internal/sops/` — Entschlüsseln via `sops`-Binary (os/exec), Auflösung
+  von age-Keyfiles über SOPS_AGE_KEY_FILE im Child-Prozess
+- `internal/env/` — Env-Merge (env_files < sops < vault < Systemvars) und
+  WriteShm: 0600-Env-Datei in /dev/shm mit idempotentem Cleanup
+- `internal/hooks/` — Hook-Engine: sequenzielle `sh -c`-Ausführung mit
+  Per-Kommando-Timeout (Prozessgruppen-Kill) und slog-Output
+- `internal/compose/` — Compose-Executor: `docker compose up/down` mit
+  deterministischem Projektnamen (`-p <stack-name>`)
 - `PHASE1_TASK.md` — Aufgabenstellung (nicht ändern)
 - `PHASE2_TASK.md` — Aufgabenstellung (nicht ändern)
+- `PHASE3_TASK.md` — Aufgabenstellung (nicht ändern)
 
 ## Konventionen
 
