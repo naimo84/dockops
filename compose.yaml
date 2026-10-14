@@ -1,0 +1,46 @@
+# Runs the dockops agent on the Docker host it manages. The agent speaks to
+# the host's docker daemon through the mounted socket (docker CLI inside the
+# container, daemon outside — stack projects appear on the host like any
+# other compose project, identified by their -p <stack-name> labels).
+#
+# Required context from the shell (or an .env file next to this file):
+#   DOCKOPS_WEBHOOK_SECRET  shared secret for POST /webhook
+#   VAULT_TOKEN             token for global.vault auth_method "token"
+#
+# Build the image first (see Dockerfile):
+#   docker compose build
+
+services:
+  dockops:
+    build: .
+    image: dockops:latest
+    restart: unless-stopped
+    # Default daemon mode: webhook server on :8080 plus the poll loop.
+    # One-shot alternative:  command: ["-once"]
+    environment:
+      # Host repository with the root stacks.yaml (flags -repo / -branch).
+      DOCKOPS_REPO_URL: "git@github.com:example/homelab-stacks.git"
+      DOCKOPS_BRANCH: "main"
+      # Shared secret of POST /webhook (GitHub HMAC / GitLab token).
+      DOCKOPS_WEBHOOK_SECRET: "${DOCKOPS_WEBHOOK_SECRET:?set DOCKOPS_WEBHOOK_SECRET}"
+      # Vault: VAULT_ADDR is the fallback for an unset global.vault.address;
+      # VAULT_TOKEN is read at login time (token auth method).
+      VAULT_ADDR: "https://vault.example.com"
+      VAULT_TOKEN: "${VAULT_TOKEN:?set VAULT_TOKEN}"
+      # SSH for git remotes: the read-only mounted key authenticates, the
+      # mounted known_hosts pins the hosts (accept-new covers first contact).
+      GIT_SSH_COMMAND: "ssh -i /root/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new"
+    volumes:
+      # The daemon dockops drives; without it every compose command fails.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # state.json plus the host and remote checkouts (default work_dir
+      # /var/lib/dockops/repos) survive container recreation.
+      - dockops-data:/var/lib/dockops
+      # Git credentials for the host repo and shared remotes (read-only).
+      - ~/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro
+      - ~/.ssh/known_hosts:/root/.ssh/known_hosts:ro
+    ports:
+      - "8080:8080" # POST /webhook (CI webhooks), GET /healthz (liveness)
+
+volumes:
+  dockops-data:

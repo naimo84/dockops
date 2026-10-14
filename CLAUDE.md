@@ -11,7 +11,11 @@ Env-Merge (`internal/env`), Hook-Engine (`internal/hooks`) und Compose-
 Executor (`internal/compose`). Phase 4: Reconciliation-Loop
 (`internal/reconciler`), CLI-Agent (`cmd/dockops`: `-once`, Poll- und
 Webhook-Modus mit Graceful Shutdown) und Webhook-Server
-(`internal/webhook`: GitHub-HMAC/GitLab-Token, `/healthz`).
+(`internal/webhook`: GitHub-HMAC/GitLab-Token, `/healthz`). Phase 5:
+E2E-Integrationstest (`internal/reconciler/e2e_test.go`: echte Git-Repos,
+Fake-docker/sops via PATH, Fake-Vault via httptest), Dockerfile
+(Multi-Stage, alpine + docker-cli/git/ssh), `compose.yaml` für den
+dockops-Container und `README.md`.
 
 ## Umgebung
 
@@ -54,6 +58,17 @@ Webhook-Modus mit Graceful Shutdown) und Webhook-Server
 - `internal/webhook/` — Webhook-HTTP-Handler: `POST /webhook` mit
   GitHub-HMAC-SHA256 (`X-Hub-Signature-256`) oder GitLab-Token
   (`X-Gitlab-Token`), konstante Vergleiche, `GET /healthz`
+- `internal/reconciler/e2e_test.go` — E2E-Integrationstest: komplette
+  Reconcile-Durchläufe gegen Bare-Repos (Host + Shared-Remote), Fake-
+  `docker`/`sops`-Skripte via PATH-Override, Fake-Vault via
+  `httptest.Server`
+- `Dockerfile` — Multi-Stage-Build (statisches Binary, alpine-Runtime mit
+  docker-cli + compose-Plugin, git, openssh-client, CA-Certs)
+- `compose.yaml` — dockops selbst als Container: docker.sock-Mount,
+  SSH-Key-Mount (ro), `DOCKOPS_*`-Env, Vault-Env, Port 8080
+- `README.md` — Dokumentation: Architektur, Config-Beispiele (Root +
+  immich-Stack, beide Import-Varianten), Reconcile-Ablauf, Secret-Priorität,
+  CLI-Referenz, Docker-Deployment, Development
 - `PHASE1_TASK.md` — Aufgabenstellung (nicht ändern)
 - `PHASE2_TASK.md` — Aufgabenstellung (nicht ändern)
 - `PHASE3_TASK.md` — Aufgabenstellung (nicht ändern)

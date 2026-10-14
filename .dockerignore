@@ -1,0 +1,8 @@
+# Keep the build context minimal: only what `COPY . .` needs to compile.
+.git
+.gitignore
+.claude
+Dockerfile
+compose.yaml
+.dockerignore
+*.md
