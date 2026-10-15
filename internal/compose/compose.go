@@ -1,11 +1,12 @@
 // Package compose drives the docker compose CLI to bring stacks up and
 // down. It builds explicit, deterministic command lines — project name from
-// the stack name, one -f per compose file, one --env-file — and never
-// parses running state; change detection is the stack hash's job
-// (internal/hash). The one exception is the service filter: when a stack
-// ignores services without naming the ones to keep, the compose files' own
-// service names are read (they describe the desired state, not the running
-// one) to materialize "all but ignored" as positional arguments.
+// the stack name, one -f per compose file, one --env-file — and never lets
+// running state drive deployments; change detection is the stack hash's job
+// (internal/hash). Two exceptions read instead of write: the service filter,
+// where the compose files' own service names (desired, not running, state)
+// materialize "all but ignored" as positional arguments, and the Ps* methods
+// (ps.go), which inspect running containers solely for the GET /status
+// monitoring endpoint (internal/webhook).
 package compose
 
 import (

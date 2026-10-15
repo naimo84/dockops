@@ -339,6 +339,64 @@ explizit aktiviert werden, inkl. der URL-Variable:
 
 (Build des Images: `docker compose --profile sops build`.)
 
+## Monitoring (`/status` Endpoint)
+
+`GET /status` (nur Daemon-Modus) stellt den Ist-Zustand der verwalteten
+Stacks dem Soll-Zustand aus `state.json` gegenüber — Grundlage für externes
+Monitoring (Gatus, curl, Telegram-Bot), ohne dass der Abfrager selbst
+Docker-Zugriff bräuchte:
+
+    curl http://localhost:8080/status
+
+```json
+{
+  "generated_at": "2026-10-15T09:32:11Z",
+  "host_repo": {"url": "git@github.com:example/homelab-stacks.git", "branch": "main", "commit": "abc123def456"},
+  "stacks": [
+    {
+      "name": "immich",
+      "deployed_hash": "abc123…",
+      "last_deployed": "2026-10-14T12:00:00Z",
+      "containers": [
+        {"name": "immich-server", "state": "running", "health": "healthy"}
+      ],
+      "drift": "ok"
+    }
+  ],
+  "unmanaged": [
+    {"project": "legacy-thing", "containers": ["legacy-1"]}
+  ]
+}
+```
+
+**Drift pro Stack** (Container via `docker compose -p <stack> ps --all`):
+
+| drift | Bedeutung |
+|---|---|
+| `ok` | min. 1 Container `running`, keiner `exited` |
+| `stopped` | Stack im State, aber 0 Container laufen (alles exited/missing) |
+| `partial` | Container laufen, aber mind. 1 ist `exited` |
+| `unknown` | `compose ps` schlug fehl → `"error": "<msg>"` im Stack-Objekt |
+
+Schlägt das `ps` eines Stacks fehl, bleibt der Endpoint trotzdem **200** und
+listet den Stack mit `drift: "unknown"` — Monitoring soll an einem kaputten
+Stack nicht komplett scheitern. (Da der State bisher keine Soll-Service-Liste
+führt, läuft der partial-Vergleich in der Fallback-Form: running > 0 und
+kein exited-Container ⇒ `ok`.) `stacks` und `unmanaged` sind immer JSON-
+Arrays (auch leer), beide sortiert.
+
+**Unmanaged**: laufende Compose-Projekte (`docker ps`, Label
+`com.docker.compose.project`) ohne State-Eintrag. Container ohne
+Compose-Label zählen nicht (Buildkit & Co.). Das dockops-eigene Projekt wird
+nie als unmanaged gemeldet — default `dockops` (der Projektname beim
+Deployment aus der `compose.yaml` dieses Repos), über `DOCKOPS_SELF_PROJECT`
+anpassbar, falls der Agent unter einem anderen Projektnamen läuft.
+
+**Optionaler Schutz**: Ist `DOCKOPS_STATUS_TOKEN` gesetzt, verlangt der
+Endpoint `Authorization: Bearer <token>` (konstanter Zeitvergleich), sonst
+**401**. Ohne die Variable ist er offen wie `/healthz` — dann sollte der Port
+nicht öffentlich erreichbar sein.
+
 ## CLI
 
     dockops [-repo URL] [-branch NAME] [-state PFAD] [-addr HOST:PORT]
@@ -359,7 +417,9 @@ explizit aktiviert werden, inkl. der URL-Variable:
 Dazu die Vault-Variablen (Namen in `global.vault` konfigurierbar):
 `VAULT_ADDR` (Fallback für `global.vault.address`), `VAULT_TOKEN`
 (`auth_method: token`) bzw. `VAULT_ROLE_ID` + `VAULT_SECRET_ID`
-(`auth_method: approle`).
+(`auth_method: approle`). Ohne eigenes Flag: `DOCKOPS_STATUS_TOKEN`
+(Bearer-Schutz für `GET /status`, leer = offen) und `DOCKOPS_SELF_PROJECT`
+(eigenes Compose-Projekt für die Unmanaged-Erkennung, default `dockops`).
 
 **Betriebsmodi**: Ohne `-once` läuft dockops als Daemon — sofortiger erster
 Durchlauf, danach Poll-Timer (`-interval` überschreibt
@@ -377,6 +437,13 @@ beendet ihn kontrolliert.
         -H "X-Gitlab-Token: $DOCKOPS_WEBHOOK_SECRET"
 
 - `GET /healthz` — Liveness.
+
+- `GET /status` — Soll-vs-Ist-Snapshot für Monitoring (Drift-Matrix,
+  Container, unmanaged Projekte, optional Bearer-Token); Details siehe
+  „Monitoring (`/status` Endpoint)“:
+
+      curl -H "Authorization: Bearer $DOCKOPS_STATUS_TOKEN" \
+        http://localhost:8080/status
 
 Logs gehen als `slog`-JSON auf stdout.
 
@@ -396,7 +463,9 @@ zum Laufen, den er verwaltet (`docker compose build && docker compose up -d`):
 - **Env** `DOCKOPS_REPO_URL`, `DOCKOPS_BRANCH`, `DOCKOPS_WEBHOOK_SECRET`
   sowie `VAULT_ADDR`/`VAULT_TOKEN` (bzw. `VAULT_ROLE_ID`/`VAULT_SECRET_ID`).
   `DOCKOPS_WEBHOOK_SECRET` und `VAULT_TOKEN` werden beim `up` aus der Shell
-  bzw. einer `.env`-Datei neben der `compose.yaml` substituiert.
+  bzw. einer `.env`-Datei neben der `compose.yaml` substituiert; optional
+  `DOCKOPS_STATUS_TOKEN` (Bearer-Schutz für `GET /status`) und
+  `DOCKOPS_SELF_PROJECT` (Unmanaged-Erkennung, default `dockops`).
 - **Volume** `dockops-data:/var/lib/dockops` — überlebt Container-Neubau:
   `state.json` (flag `-state`) und die Checkouts unter
   `/var/lib/dockops/repos` (Default `global.work_dir`).

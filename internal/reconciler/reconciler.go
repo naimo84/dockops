@@ -47,9 +47,11 @@ import (
 )
 
 const (
-	// hostRepoName is the checkout name of the primary host repository; the
-	// root configuration is read from <workDir>/host/stacks.yaml.
-	hostRepoName = "host"
+	// HostRepoName is the checkout name of the primary host repository; the
+	// root configuration is read from <workDir>/host/stacks.yaml. Exported
+	// so the CLI can point other collaborators (GET /status' host commit)
+	// at the same checkout.
+	HostRepoName = "host"
 
 	// rootConfigFile is the fixed file name of the root configuration in
 	// the host repository root (stacks.yaml, plural — distinct from the
@@ -276,7 +278,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		}
 		gitMgr = m
 	}
-	hostPath, err := gitMgr.EnsureRepo(hostRepoName, r.repoURL, r.branch)
+	hostPath, err := gitMgr.EnsureRepo(HostRepoName, r.repoURL, r.branch)
 	if err != nil {
 		return fmt.Errorf("reconciler: host repo: %w", err)
 	}

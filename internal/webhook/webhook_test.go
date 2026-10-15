@@ -46,7 +46,7 @@ func countingTrigger(counts *int) func() {
 }
 
 func TestHealthz(t *testing.T) {
-	h := New("s3cr3t", func() {}, quietLogger())
+	h := New(Deps{Secret: "s3cr3t", Trigger: func() {}, Logger: quietLogger()})
 
 	rec := do(h, http.MethodGet, "/healthz", nil, nil)
 	if rec.Code != http.StatusOK {
@@ -66,7 +66,7 @@ func TestWebhookGitHubSignature(t *testing.T) {
 	const secret = "s3cr3t"
 	body := []byte(`{"ref":"refs/heads/main","repository":{"name":"host"}}`)
 	triggers := 0
-	h := New(secret, countingTrigger(&triggers), quietLogger())
+	h := New(Deps{Secret: secret, Trigger: countingTrigger(&triggers), Logger: quietLogger()})
 
 	// Valid signature: accepted, trigger fired exactly once.
 	rec := do(h, http.MethodPost, "/webhook", body, map[string]string{
@@ -106,7 +106,7 @@ func TestWebhookGitHubSignature(t *testing.T) {
 
 func TestWebhookGitLabToken(t *testing.T) {
 	triggers := 0
-	h := New("s3cr3t", countingTrigger(&triggers), quietLogger())
+	h := New(Deps{Secret: "s3cr3t", Trigger: countingTrigger(&triggers), Logger: quietLogger()})
 	body := []byte(`{"object_kind":"push"}`)
 
 	rec := do(h, http.MethodPost, "/webhook", body, map[string]string{
@@ -132,7 +132,7 @@ func TestWebhookGitLabToken(t *testing.T) {
 
 func TestWebhookAtLeastOneMethodMustMatch(t *testing.T) {
 	triggers := 0
-	h := New("s3cr3t", countingTrigger(&triggers), quietLogger())
+	h := New(Deps{Secret: "s3cr3t", Trigger: countingTrigger(&triggers), Logger: quietLogger()})
 	body := []byte(`{}`)
 
 	// No authentication headers at all.
@@ -172,7 +172,7 @@ func TestWebhookAtLeastOneMethodMustMatch(t *testing.T) {
 
 func TestWebhookWithoutSecretAcceptsEverything(t *testing.T) {
 	triggers := 0
-	h := New("", countingTrigger(&triggers), quietLogger())
+	h := New(Deps{Trigger: countingTrigger(&triggers), Logger: quietLogger()})
 
 	rec := do(h, http.MethodPost, "/webhook", []byte(`{}`), nil)
 	if rec.Code != http.StatusOK {
@@ -185,7 +185,7 @@ func TestWebhookWithoutSecretAcceptsEverything(t *testing.T) {
 
 func TestWebhookRoutingAndMethods(t *testing.T) {
 	triggers := 0
-	h := New("s3cr3t", countingTrigger(&triggers), quietLogger())
+	h := New(Deps{Secret: "s3cr3t", Trigger: countingTrigger(&triggers), Logger: quietLogger()})
 
 	if rec := do(h, http.MethodGet, "/webhook", nil, nil); rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("GET /webhook status = %d, want 405", rec.Code)
@@ -199,7 +199,7 @@ func TestWebhookRoutingAndMethods(t *testing.T) {
 }
 
 func TestWebhookBodyTooLarge(t *testing.T) {
-	h := New("s3cr3t", func() {}, quietLogger())
+	h := New(Deps{Secret: "s3cr3t", Trigger: func() {}, Logger: quietLogger()})
 	big := bytes.Repeat([]byte("x"), maxBody+1)
 
 	rec := do(h, http.MethodPost, "/webhook", big, map[string]string{

@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -72,12 +73,15 @@ type fileModel struct {
 	Stacks  map[string]State `json:"stacks"`
 }
 
-// Store holds the per-stack deployment states of one state file. It is not
-// safe for concurrent use; the poll loop is single-goroutine (conservative:
-// no locking until there is an actual second goroutine).
+// Store holds the per-stack deployment states of one state file. It is safe
+// for concurrent use: the poll loop mutates it from its own goroutine while
+// the webhook server's request goroutines read it (GET /status, phase 8).
+// Before that second reader existed the store deliberately went without
+// locking; the RWMutex is its documented successor.
 type Store struct {
 	path   string
 	logger *slog.Logger
+	mu     sync.RWMutex
 	stacks map[string]State
 }
 
@@ -125,6 +129,8 @@ func New(path string, logger *slog.Logger) (*Store, error) {
 // Get returns the persisted state of the named stack; ok is false when the
 // store holds no entry for it.
 func (s *Store) Get(name string) (State, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	st, ok := s.stacks[name]
 	return st, ok
 }
@@ -147,6 +153,8 @@ func (s *Store) Set(name string, st State) error {
 	} else {
 		st.UpdatedAt = st.UpdatedAt.UTC()
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.stacks[name] = st
 	return nil
 }
@@ -154,6 +162,8 @@ func (s *Store) Set(name string, st State) error {
 // Delete removes the named stack's entry and reports whether one existed.
 // Call Save to persist the removal.
 func (s *Store) Delete(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.stacks[name]; !ok {
 		return false
 	}
@@ -163,6 +173,8 @@ func (s *Store) Delete(name string) bool {
 
 // Names returns all stack names with an entry, sorted for determinism.
 func (s *Store) Names() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	names := make([]string, 0, len(s.stacks))
 	for name := range s.stacks {
 		names = append(names, name)
@@ -176,6 +188,8 @@ func (s *Store) Names() []string {
 // not end in StatusDeployed (failed deploys are retried on the next poll
 // even with an unchanged hash).
 func (s *Store) Changed(name string, hash string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	st, ok := s.stacks[name]
 	return !ok || st.Hash != hash || st.Status != StatusDeployed
 }
@@ -186,6 +200,8 @@ func (s *Store) Changed(name string, hash string) bool {
 // created with 0o600 and keep that permission after the rename (the state
 // is not secret, but restrictive defaults are the conservative choice).
 func (s *Store) Save() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	f := fileModel{Version: fileVersion, Stacks: s.stacks}
 	raw, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {

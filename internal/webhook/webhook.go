@@ -1,15 +1,19 @@
 // Package webhook exposes the HTTP surface of a dockops agent: an
-// authenticated POST /webhook that triggers a reconcile pass and a GET
-// /healthz liveness probe.
+// authenticated POST /webhook that triggers a reconcile pass, a GET
+// /healthz liveness probe and a GET /status monitoring endpoint that
+// compares the desired state (state.json) against the running containers
+// (see status.go).
 //
-// Authentication understands both common webhook flavors — GitHub
+// Webhook authentication understands both common flavors — GitHub
 // (X-Hub-Signature-256: "sha256=<hex>" HMAC-SHA256 over the raw request
 // body) and GitLab (X-Gitlab-Token: plain shared secret). When a secret is
 // configured, at least one of the two must match, otherwise the request is
-// rejected with 401. Both comparisons run in constant time.
+// rejected with 401. Both comparisons run in constant time. /status is
+// optionally guarded by its own Bearer token (Deps.Token).
 package webhook
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -19,6 +23,9 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+
+	"github.com/local/dockops/internal/compose"
+	"github.com/local/dockops/internal/state"
 )
 
 // maxBody bounds the request body: webhook payloads are small JSON
@@ -35,30 +42,105 @@ const (
 	gitlabTokenHeader = "X-Gitlab-Token"
 )
 
-// Handler serves POST /webhook and GET /healthz. It is a plain
-// http.Handler, so it composes with any router or middleware. trigger is
-// called synchronously after successful authentication; it must not block
-// (the CLI passes a non-blocking channel send that merges concurrent
-// requests into one pending reconcile).
+// ComposeLister is the subset of compose.Executor GET /status needs: the
+// running containers of one project and the running compose projects of the
+// host. It is an injection point so handler tests run without docker.
+type ComposeLister interface {
+	// PsProject lists all containers of a compose project
+	// (compose.Executor.PsProject).
+	PsProject(ctx context.Context, project string) ([]compose.Container, error)
+
+	// PsAllProjects lists the running compose projects with their
+	// containers (compose.Executor.PsAllProjects).
+	PsAllProjects(ctx context.Context) ([]compose.ProjectRef, error)
+}
+
+// Compile-time assertion that the real executor satisfies the injection
+// interface.
+var _ ComposeLister = (*compose.Executor)(nil)
+
+// Deps are the collaborators of the Handler, mirroring reconciler.Deps: the
+// first three fields existed as positional parameters of New before /status
+// joined the surface; the rest feeds the status endpoint.
+type Deps struct {
+	// Secret authenticates POST /webhook (GitHub HMAC / GitLab token);
+	// empty disables webhook authentication — callers should warn about
+	// that (the CLI does).
+	Secret string
+
+	// Trigger fires a reconcile pass. It is called synchronously after
+	// successful webhook authentication and must not block (the CLI passes
+	// a non-blocking channel send that merges concurrent requests into one
+	// pending reconcile).
+	Trigger func()
+
+	// Logger; nil falls back to slog.Default().
+	Logger *slog.Logger
+
+	// State is the deployment state store GET /status reads (nil → /status
+	// answers 503, see status.go).
+	State *state.Store
+
+	// Compose lists the running containers for GET /status; nil → 503 like
+	// State. Injecting a ComposeLister other than *compose.Executor is the
+	// tests' lever.
+	Compose ComposeLister
+
+	// RepoURL and Branch identify the host repository; /status reports them
+	// under host_repo.
+	RepoURL string
+	Branch  string
+
+	// HeadCommit returns the commit currently checked out in the host
+	// repository (host_repo.commit). Nil or an error degrades the commit to
+	// "" — missing git metadata must not fail the endpoint.
+	HeadCommit func() (string, error)
+
+	// SelfProject is the compose project dockops itself runs under; it is
+	// never reported as unmanaged. The CLI defaults it to "dockops" (the
+	// project name of this repository's own compose.yaml) and lets
+	// DOCKOPS_SELF_PROJECT override it.
+	SelfProject string
+
+	// Token optionally guards GET /status: when set, requests must carry
+	// "Authorization: Bearer <token>" (compared in constant time), else
+	// /status answers 401. Empty keeps the endpoint open like /healthz.
+	Token string
+}
+
+// Handler serves POST /webhook, GET /healthz and GET /status. It is a plain
+// http.Handler, so it composes with any router or middleware.
 type Handler struct {
 	secret  string
 	trigger func()
 	logger  *slog.Logger
+	status  statusDeps
 }
 
-// New creates a Handler for the given shared secret and trigger callback.
-// An empty secret disables authentication — every POST /webhook then
-// triggers — which callers should warn about (the CLI does); a nil logger
-// falls back to slog.Default().
-func New(secret string, trigger func(), logger *slog.Logger) *Handler {
+// New creates a Handler from deps, applying the defaults documented on Deps.
+func New(deps Deps) *Handler {
+	logger := deps.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Handler{secret: secret, trigger: trigger, logger: logger}
+	return &Handler{
+		secret:  deps.Secret,
+		trigger: deps.Trigger,
+		logger:  logger,
+		status: statusDeps{
+			state:       deps.State,
+			compose:     deps.Compose,
+			repoURL:     deps.RepoURL,
+			branch:      deps.Branch,
+			headCommit:  deps.HeadCommit,
+			selfProject: deps.SelfProject,
+			token:       deps.Token,
+		},
+	}
 }
 
-// ServeHTTP implements http.Handler. Unknown paths answer 404; /webhook
-// and /healthz answer 405 for other methods.
+// ServeHTTP implements http.Handler. Unknown paths answer 404; /webhook,
+// /healthz and /status answer 405 for other methods.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/healthz":
@@ -76,6 +158,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleWebhook(w, r)
+	case "/status":
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handleStatus(w, r)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}

@@ -47,7 +47,23 @@ sichert lokale (Host-seitige) Änderungen vor dem deterministischen Reset:
 Worktree per `git status --porcelain` und stasht Dirty-State inkl. untracked
 als `dockops-wip: <RFC3339>` (INFO-Log mit Restore-Hint; Stash-Fehler nur
 WARN ohne Abbruch; bewusst kein Auto-Pop — Restore per `git stash list`/`pop`
-ist Handarbeit, Konflikte dürfen Deploys nie blockieren).
+ist Handarbeit, Konflikte dürfen Deploys nie blockieren). Phase 8: Monitoring-
+Endpoint `GET /status` — Soll (state.json) vs. Ist (laufende Container):
+`internal/compose/ps.go` mit `PsProject` (`docker compose -p X ps --all
+--format json`, tolerant JSON-Array/Lines/Einzelobjekt, `Name`/`Names`-
+Alias) und `PsAllProjects` (`docker ps --format {{json .}}`, Label-Parsing
+der Formen String/array/object; ohne `com.docker.compose.project`-Label =
+Rauschen, wird geskipped); `internal/webhook/status.go` mit Drift-Matrix
+(`ok`/`stopped`/`partial`/`unknown` — State führt keine Soll-Services, also
+Fallback-Vergleich running>0 und keine exited), unmanaged = laufende
+Compose-Projekte ohne State-Eintrag minus Eigenprojekt (`DOCKOPS_SELF_PROJECT`,
+Default `dockops`), per-Stack-ps-Fehler → `"error"`-Feld + drift `unknown`,
+Endpoint bleibt 200; Konstruktor `webhook.New(webhook.Deps{...})` mit
+injizierbarem `ComposeLister`, optionaler Bearer-Schutz via
+`DOCKOPS_STATUS_TOKEN` (constant-time); `state.Store` jetzt RWMutex-gesichert
+(HTTP-Goroutines lesen parallel zum Poll-Loop); CLI teilt compose-executor und
+git-manager zwischen Reconciler und /status, `reconciler.HostRepoName`
+exportiert.
 
 ## Umgebung
 
@@ -60,7 +76,9 @@ ist Handarbeit, Konflikte dürfen Deploys nie blockieren).
 - `cmd/dockops/` — CLI-Entry-Point: Flags mit Env-Fallbacks (`-repo`,
   `-branch`, `-webhook-secret`, `-sops-sidecar`, `-interval`), `-once`- und
   Daemon-Modus (Webhook-Server + Poll-Timer, debounced Trigger, Graceful
-  Shutdown), slog-JSON auf stdout
+  Shutdown), slog-JSON auf stdout; teilt compose-executor und git-manager
+  zwischen Reconciler und /status (Env ohne Flag: `DOCKOPS_STATUS_TOKEN`,
+  `DOCKOPS_SELF_PROJECT`)
 - `cmd/sops-sidecar/` — Mini-Programm des Decrypt-Sidecars: Startet den
   Handler aus `internal/sops` hinter `net/http` mit Graceful Shutdown;
   Wurzeln aus `SOPS_SIDECAR_ALLOWED_ROOTS` (doppelpunkt-separiert, absolut,
@@ -89,7 +107,8 @@ ist Handarbeit, Konflikte dürfen Deploys nie blockieren).
   vault_env_templates) + normalisierten Compose-Inhalten (einer pro Datei,
   in `-f`-Reihenfolge)
 - `internal/state/` — State-Store: Deployment-Zustand pro Stack (JSON-Datei,
-  atomar geschrieben; `compose_files` für Multi-File-Prune aufgezeichnet)
+  atomar geschrieben; `compose_files` für Multi-File-Prune aufgezeichnet);
+  RWMutex-gesichert, /status liest aus HTTP-Goroutines parallel zum Poll-Loop
 - `internal/dotenv/` — Minimaler dotenv-Dialekt (Parse/Format), geteilt von
   SOPS-Output, env_files, Vault-Templates und der erzeugten
   `--env-file`/Stack-`.env`
@@ -120,7 +139,13 @@ ist Handarbeit, Konflikte dürfen Deploys nie blockieren).
   Compose-Datei in Listenreihenfolge, Service-Filter als positionale
   Argumente (services minus ignore_services; ohne services: Service-Namen
   der Compose-Dateien minus ignore, "alles ignoriert" = Fehler), plus
-  `DownProject` (Prune ohne Compose-Datei)
+  `DownProject` (Prune ohne Compose-Datei) und `ps.go` mit `PsProject`/
+  `PsAllProjects` (Container-/Projekt-Listen für `GET /status`, nie
+  deploy-relevant)
+- `internal/webhook/` — Webhook-HTTP-Handler: `POST /webhook` mit
+  GitHub-HMAC-SHA256 (`X-Hub-Signature-256`) oder GitLab-Token
+  (`X-Gitlab-Token`), konstante Vergleiche, `GET /healthz`; Konstruktor
+  `New(Deps{...})` (Secret/Trigger/Logger + /status-Kollaborateure)
 - `internal/reconciler/` — Reconciliation-Loop: verdrahtet git, config,
   hash, state, secrets (Vault-Login einmal pro Durchlauf, sobald ein Stack
   vault_paths ODER vault_env_templates hat), env, hooks und compose zu
@@ -134,6 +159,13 @@ ist Handarbeit, Konflikte dürfen Deploys nie blockieren).
   mit Warnung ohne compose-Aufruf; Git/Compose/Hooks/Sops/Vault als
   injizierbare Interfaces für Tests, `Deps.SopsSidecarURL` schaltet die
   sops_files-Dekryptierung auf den Sidecar um (injiziertes Sops gewinnt)
+- `internal/webhook/status.go` — `GET /status` (Phase 8): Drift-Matrix pro
+  State-Stack (`ok`/`stopped`/`partial`, ps-Fehler → `unknown` +
+  `"error"`-Feld, Endpoint bleibt 200), unmanaged = laufende Compose-
+  Projekte ohne State-Eintrag minus Eigenprojekt, `host_repo` mit HEAD-Commit
+  via injizierter Callback-Funktion, Bearer-Schutz (`DOCKOPS_STATUS_TOKEN`,
+  constant-time, leer = offen wie `/healthz`), Stacks/Unmanaged immer
+  sortierte JSON-Arrays
 - `internal/reconciler/phase6c_test.go` — Phase-6c-Regressionstests: die
   drei Prune-Fälle (a/b/c), Skip-über-Prune-Pass (identischer Hash deployt
   nicht neu) und der unterbrochene Pass (State-Dir wird mid-Pass read-only,

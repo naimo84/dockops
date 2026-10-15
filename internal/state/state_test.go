@@ -2,12 +2,14 @@ package state
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -26,6 +28,40 @@ func statePath(t *testing.T) string {
 
 // stamp is a fixed timestamp for deterministic assertions.
 var stamp = time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+
+// TestConcurrentAccess pins the concurrency contract phase 8 relies on: the
+// webhook server reads the store from its request goroutines while the poll
+// loop mutates it. The test only fails deterministically under -race, which
+// the CI checks should run with.
+func TestConcurrentAccess(t *testing.T) {
+	s, err := New(statePath(t), quietLogger())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				name := fmt.Sprintf("stack-%d", j%4)
+				_ = s.Set(name, State{Hash: fmt.Sprintf("h-%d", i), Status: StatusDeployed})
+				_, _ = s.Get(name)
+				_ = s.Changed(name, "h-x")
+				_ = s.Names()
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	if got := len(s.Names()); got != 4 {
+		t.Errorf("Names() = %v entries, want 4", got)
+	}
+}
 
 func TestNewMissingFileYieldsEmptyStore(t *testing.T) {
 	s, err := New(statePath(t), quietLogger())

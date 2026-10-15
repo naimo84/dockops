@@ -15,22 +15,28 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/local/dockops/internal/compose"
 	"github.com/local/dockops/internal/config"
+	"github.com/local/dockops/internal/git"
 	"github.com/local/dockops/internal/reconciler"
 	"github.com/local/dockops/internal/state"
 	"github.com/local/dockops/internal/webhook"
 )
 
-// Environment variables backing the flags; see parseFlags.
+// Environment variables backing the flags; see parseFlags. The two status
+// variables have no flag of their own (briefing phase 8 names the env only).
 const (
 	envRepoURL        = "DOCKOPS_REPO_URL"
 	envBranch         = "DOCKOPS_BRANCH"
 	envWebhookSecret  = "DOCKOPS_WEBHOOK_SECRET"
 	envSopsSidecarURL = "DOCKOPS_SOPS_SIDECAR_URL"
+	envStatusToken    = "DOCKOPS_STATUS_TOKEN"
+	envSelfProject    = "DOCKOPS_SELF_PROJECT"
 )
 
 // Defaults for the flags and the poll loop.
@@ -40,7 +46,22 @@ const (
 	defaultAddr         = ":8080"
 	defaultPollInterval = 5 * time.Minute // same value the config loader defaults to
 	shutdownTimeout     = 10 * time.Second
+	// defaultSelfProject is the compose project dockops itself runs under
+	// when deployed from this repository's compose.yaml (no top-level
+	// `name:`, so the project defaults to the directory name). GET /status
+	// never reports it as unmanaged; DOCKOPS_SELF_PROJECT overrides.
+	defaultSelfProject = "dockops"
 )
+
+// collaborators are the state-reading collaborators shared between the
+// reconcile passes and the HTTP surface: the compose executor is stateless,
+// and the git manager answers HeadCommit for GET /status (the reconciler
+// drives the checkouts itself). git may be nil — see run.
+type collaborators struct {
+	store   *state.Store
+	compose *compose.Executor
+	git     *git.Manager
+}
 
 // options is the parsed command line (with environment fallbacks).
 type options struct {
@@ -163,22 +184,57 @@ func run(opts options, logger *slog.Logger) error {
 	// global.poll_interval is only known after the first pass loaded the
 	// host repository; the callback hands it over to the poll loop.
 	intervals := &intervalSource{}
-	rec := reconciler.New(reconciler.Deps{
+
+	// Shared collaborators of the reconcile passes and GET /status: one
+	// compose executor (stateless) and one git manager over the bootstrap
+	// work dir (the same default the reconciler applies when Deps.WorkDir
+	// is unset). An unavailable git binary degrades exactly as before
+	// phase 8 — the daemon starts, every pass fails with the git error —
+	// and /status additionally reports an empty host commit.
+	composeExec := compose.New(logger, "")
+	gitMgr, gitErr := git.New(config.DefaultWorkDir, logger)
+	if gitErr != nil {
+		logger.Warn("git manager unavailable; reconcile passes will fail and /status reports an empty host commit",
+			"error", gitErr)
+	}
+	recDeps := reconciler.Deps{
 		RepoURL:        opts.RepoURL,
 		Branch:         opts.Branch,
 		State:          store,
 		Logger:         logger,
+		Compose:        composeExec,
 		SopsSidecarURL: opts.SopsSidecarURL,
 		OnConfigLoaded: func(cfg *config.Config) {
 			intervals.set(time.Duration(cfg.Global.PollInterval))
 		},
-	})
+	}
+	if gitMgr != nil { // nil *git.Manager would be a non-nil interface and panic on use
+		recDeps.Git = gitMgr
+	}
+	rec := reconciler.New(recDeps)
 
 	if opts.Once {
 		logger.Info("running single reconcile pass")
 		return rec.Reconcile(ctx)
 	}
-	return serve(ctx, opts, logger, rec, intervals)
+	return serve(ctx, opts, logger, rec, intervals, collaborators{
+		store:   store,
+		compose: composeExec,
+		git:     gitMgr,
+	})
+}
+
+// selfProject returns the compose project dockops itself runs under, for
+// GET /status' unmanaged detection: DOCKOPS_SELF_PROJECT overrides the
+// "dockops" default (this repository's compose.yaml project name). Set the
+// variable to a non-empty foreign value when running dockops outside
+// compose, so a legitimate project that happens to be named "dockops" is
+// still reported.
+func selfProject() string {
+	if p := os.Getenv(envSelfProject); p != "" {
+		return p
+	}
+	return defaultSelfProject
 }
 
 // serve runs the daemon: the webhook server plus the poll loop, until the
@@ -187,7 +243,7 @@ func run(opts options, logger *slog.Logger) error {
 // number of webhook requests during a run collapse into exactly one
 // subsequent pass (the trigger channel holds one pending slot and drops
 // further sends).
-func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconciler.Reconciler, intervals *intervalSource) error {
+func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconciler.Reconciler, intervals *intervalSource, collab collaborators) error {
 	if opts.WebhookSecret == "" {
 		logger.Warn("no webhook secret configured; every caller can trigger reconciles",
 			"hint", "set -webhook-secret or "+envWebhookSecret)
@@ -202,8 +258,24 @@ func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconcil
 	}
 
 	server := &http.Server{
-		Addr:              opts.Addr,
-		Handler:           webhook.New(opts.WebhookSecret, notify, logger),
+		Addr: opts.Addr,
+		Handler: webhook.New(webhook.Deps{
+			Secret:  opts.WebhookSecret,
+			Trigger: notify,
+			Logger:  logger,
+			State:   collab.store,
+			Compose: collab.compose,
+			RepoURL: opts.RepoURL,
+			Branch:  opts.Branch,
+			HeadCommit: func() (string, error) {
+				if collab.git == nil {
+					return "", errors.New("git manager unavailable (see startup log)")
+				}
+				return collab.git.HeadCommit(filepath.Join(config.DefaultWorkDir, reconciler.HostRepoName))
+			},
+			SelfProject: selfProject(),
+			Token:       os.Getenv(envStatusToken),
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	ln, err := net.Listen("tcp", opts.Addr)
@@ -219,7 +291,7 @@ func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconcil
 		serveErr <- err
 	}()
 	logger.Info("webhook server listening",
-		"addr", opts.Addr, "endpoints", "POST /webhook, GET /healthz")
+		"addr", opts.Addr, "endpoints", "POST /webhook, GET /healthz, GET /status")
 
 	// First pass immediately: deploy the current state on startup; it also
 	// loads the config and thereby the poll interval.

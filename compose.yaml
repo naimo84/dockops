@@ -31,6 +31,13 @@ services:
       # Empty (default) = dockops decrypts sops_files via the local sops
       # binary inside its own container.
       DOCKOPS_SOPS_SIDECAR_URL: "${DOCKOPS_SOPS_SIDECAR_URL:-}"
+      # Optional Bearer token for GET /status (empty = open endpoint, like
+      # /healthz). Substituted from the shell/.env like the secret above.
+      DOCKOPS_STATUS_TOKEN: "${DOCKOPS_STATUS_TOKEN:-}"
+      # Compose project dockops itself runs under; never reported as
+      # unmanaged by GET /status. Only needs overriding when the agent is
+      # deployed under a different project name.
+      DOCKOPS_SELF_PROJECT: "${DOCKOPS_SELF_PROJECT:-dockops}"
       # Vault: VAULT_ADDR is the fallback for an unset global.vault.address;
       # VAULT_TOKEN is read at login time (token auth method).
       VAULT_ADDR: "https://vault.example.com"
@@ -48,7 +55,7 @@ services:
       - ~/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro
       - ~/.ssh/known_hosts:/root/.ssh/known_hosts:ro
     ports:
-      - "8080:8080" # POST /webhook (CI webhooks), GET /healthz (liveness)
+      - "8080:8080" # POST /webhook (CI webhooks), GET /healthz (liveness), GET /status (monitoring)
 
   # Optional sops decrypt sidecar — starts only with `--profile sops`. The
   # sops binary, .sops.yaml rules and Vault-Transit credentials live HERE,

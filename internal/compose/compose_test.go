@@ -17,7 +17,9 @@ import (
 // fakeDocker writes a shell script named "docker" into a fresh directory
 // and prepends it to PATH. The fake dumps its arguments one per line into
 // $DOCKER_ARGS_FILE, echoes stdin-free noise to stdout/stderr and exits with
-// $DOCKER_EXIT (default 0).
+// $DOCKER_EXIT (default 0). When $DOCKER_STDOUT_FILE is set (see
+// setDockerStdout), its content replaces the stdout noise — the ps methods
+// parse stdout, the mutating commands only log it.
 func fakeDocker(t *testing.T) (argsFile string) {
 	t.Helper()
 	binDir := t.TempDir()
@@ -26,7 +28,11 @@ func fakeDocker(t *testing.T) (argsFile string) {
 for arg in "$@"; do
 	echo "$arg" >> "$DOCKER_ARGS_FILE"
 done
-echo "fake docker stdout"
+if [ -n "$DOCKER_STDOUT_FILE" ]; then
+	cat "$DOCKER_STDOUT_FILE"
+else
+	echo "fake docker stdout"
+fi
 echo "fake docker stderr" >&2
 exit ${DOCKER_EXIT:-0}
 `
