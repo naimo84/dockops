@@ -45,11 +45,13 @@ func (f *fakeGit) HeadCommit(repoPath string) (string, error) {
 
 // upCall records one compose.Up invocation.
 type upCall struct {
-	stack     config.Stack
-	stackDir  string
-	envFile   string
-	envExists bool
-	env       map[string]string // content of the env file at call time
+	stack          config.Stack
+	stackDir       string
+	envFile        string
+	envExists      bool
+	env            map[string]string // content of the env file at call time
+	stackEnvExists bool              // <stackDir>/.env existed at call time
+	stackEnv       map[string]string // content of <stackDir>/.env at call time
 }
 
 // downCall records one compose.Down invocation.
@@ -77,6 +79,10 @@ func (f *fakeCompose) Up(_ context.Context, stack config.Stack, stackDir, envFil
 		if raw, err := os.ReadFile(envFile); err == nil {
 			call.env = dotenv.Parse(raw)
 		}
+	}
+	if raw, err := os.ReadFile(filepath.Join(stackDir, ".env")); err == nil {
+		call.stackEnvExists = true
+		call.stackEnv = dotenv.Parse(raw)
 	}
 	f.ups = append(f.ups, call)
 	if f.failUpFor == stack.Name {
@@ -390,6 +396,146 @@ func TestReconcileRetriesAfterFailedAttempt(t *testing.T) {
 	}
 }
 
+func TestReconcileWritesStackEnvBeforeUp(t *testing.T) {
+	f := newFixture(t, defaultRoot)
+	f.git.commits = map[string]string{filepath.Join(f.workDir, "host"): "abc123def"}
+	f.sops.kv = map[string]map[string]string{
+		filepath.Join(f.workDir, "host", "web", "enc.env"): {"SECRET": "hunter2"},
+	}
+	stackDir := filepath.Join(f.workDir, "host", "web")
+	f.addLocalStack("web", "name: web\nenv_files:\n  - base.env\nsops_files:\n  - path: enc.env\n")
+	writeFile(t, filepath.Join(stackDir, "base.env"), "BASE=from-base\n")
+	// A stale .env (previous deployment or committed artifact) is neither
+	// read as a source nor left behind.
+	writeFile(t, filepath.Join(stackDir, ".env"), "STALE=old-value\n")
+
+	r := f.reconciler()
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	if len(f.compose.ups) != 1 {
+		t.Fatalf("Ups = %d, want 1", len(f.compose.ups))
+	}
+	up := f.compose.ups[0]
+	// The stack-dir .env exists when compose Up runs and carries the whole
+	// merged environment — including the secrets.
+	if !up.stackEnvExists {
+		t.Errorf("<stackDir>/.env did not exist during Up")
+	}
+	for k, want := range map[string]string{
+		"BASE":       "from-base",
+		"SECRET":     "hunter2",
+		"STACK_NAME": "web",
+		"GIT_COMMIT": "abc123def",
+	} {
+		if got := up.stackEnv[k]; got != want {
+			t.Errorf("stack .env[%s] = %q, want %q", k, got, want)
+		}
+	}
+	if stale, ok := up.stackEnv["STALE"]; ok && stale != "" {
+		t.Errorf("stack .env[STALE] = %q, want absent (old .env is not a source)", stale)
+	}
+	// The shm env file handed to compose carries the same environment.
+	if got := up.env["SECRET"]; got != "hunter2" {
+		t.Errorf("shm env file[SECRET] = %q, want hunter2 (WriteShm is kept)", got)
+	}
+
+	// Success: the generated .env stays in the stack dir after the pass.
+	raw, err := os.ReadFile(filepath.Join(stackDir, ".env"))
+	if err != nil {
+		t.Fatalf("read generated stack .env after Reconcile: %v", err)
+	}
+	if got := dotenv.Parse(raw)["SECRET"]; got != "hunter2" {
+		t.Errorf("stack .env after Reconcile[SECRET] = %q, want hunter2", got)
+	}
+
+	// Second pass: hash unchanged → still exactly one Up (the skip).
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if len(f.compose.ups) != 1 {
+		t.Errorf("Ups after second pass = %d, want 1 (unchanged hash skips)", len(f.compose.ups))
+	}
+}
+
+func TestReconcileUpFailureRollsBackStackEnv(t *testing.T) {
+	t.Run("no previous .env is removed", func(t *testing.T) {
+		f := newFixture(t, defaultRoot)
+		f.addLocalStack("web", "name: web\n")
+		f.compose.failUpFor = "web"
+
+		if err := f.reconciler().Reconcile(context.Background()); err == nil {
+			t.Fatal("Reconcile() error = nil, want up failure")
+		}
+		if _, err := os.Stat(filepath.Join(f.workDir, "host", "web", ".env")); !os.IsNotExist(err) {
+			t.Errorf("generated .env still exists after failed up: %v", err)
+		}
+	})
+
+	t.Run("previous .env is restored", func(t *testing.T) {
+		f := newFixture(t, defaultRoot)
+		f.addLocalStack("web", "name: web\n")
+		envPath := filepath.Join(f.workDir, "host", "web", ".env")
+		writeFile(t, envPath, "OLD=previous\n")
+		f.compose.failUpFor = "web"
+
+		if err := f.reconciler().Reconcile(context.Background()); err == nil {
+			t.Fatal("Reconcile() error = nil, want up failure")
+		}
+		raw, err := os.ReadFile(envPath)
+		if err != nil {
+			t.Fatalf("read .env after failed up: %v", err)
+		}
+		if want := "OLD=previous\n"; string(raw) != want {
+			t.Errorf(".env after failed up = %q, want restored %q", raw, want)
+		}
+	})
+}
+
+func TestReconcileComposeFiles(t *testing.T) {
+	f := newFixture(t, defaultRoot)
+	stackDir := filepath.Join(f.workDir, "host", "multi")
+	writeFile(t, filepath.Join(stackDir, "stack.yaml"),
+		"name: multi\ncompose_files: [compose.yaml, override.yaml]\n")
+	writeFile(t, filepath.Join(stackDir, "compose.yaml"), "services:\n  app:\n    image: nginx:1\n")
+	writeFile(t, filepath.Join(stackDir, "override.yaml"), "services:\n  app:\n    image: nginx:2\n")
+
+	r := f.reconciler()
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if len(f.compose.ups) != 1 {
+		t.Fatalf("Ups = %d, want 1", len(f.compose.ups))
+	}
+	wantFiles := []string{
+		filepath.Join(stackDir, "compose.yaml"),
+		filepath.Join(stackDir, "override.yaml"),
+	}
+	if got := f.compose.ups[0].stack.ComposeFiles; !reflect.DeepEqual(got, wantFiles) {
+		t.Errorf("Up stack.ComposeFiles = %v, want %v", got, wantFiles)
+	}
+	st, ok := f.state.Get("multi")
+	if !ok {
+		t.Fatal("state has no entry for multi")
+	}
+	if !reflect.DeepEqual(st.ComposeFiles, wantFiles) {
+		t.Errorf("state.ComposeFiles = %v, want %v (recorded for pruning)", st.ComposeFiles, wantFiles)
+	}
+	if st.ComposeFile != "" {
+		t.Errorf("state.ComposeFile = %q, want empty in the multi-file case", st.ComposeFile)
+	}
+
+	// Changing only the override file changes the hash and redeploys.
+	writeFile(t, filepath.Join(stackDir, "override.yaml"), "services:\n  app:\n    image: nginx:3\n")
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if len(f.compose.ups) != 2 {
+		t.Errorf("Ups = %d, want 2 (override change redeploys)", len(f.compose.ups))
+	}
+}
+
 func TestReconcilePreDeployFailureSkipsStackButContinues(t *testing.T) {
 	f := newFixture(t, defaultRoot)
 	f.hooks.failFirstCmd = "pre-boom"
@@ -629,6 +775,61 @@ func TestReconcilePrune(t *testing.T) {
 		}
 		if len(f.compose.downProjects) != 0 || len(f.compose.downs) != 0 {
 			t.Error("teardown ran although pruning is disabled")
+		}
+	})
+}
+
+func TestReconcilePruneMultiFileStack(t *testing.T) {
+	seed := func(f *fixture, stackDir string, files []string) {
+		f.t.Helper()
+		if err := f.state.Set("gone", state.State{
+			Hash: "h-gone", Status: state.StatusDeployed,
+			StackDir: stackDir, ComposeFiles: files,
+		}); err != nil {
+			f.t.Fatalf("state.Set(gone) error = %v", err)
+		}
+	}
+
+	t.Run("all files exist tears down with every -f", func(t *testing.T) {
+		f := newFixture(t, "global:\n  work_dir: WORKDIR\n  prune_removed_stacks: true\n")
+		f.addLocalStack("web", "name: web\n")
+		gone := filepath.Join(f.workDir, "gone")
+		files := []string{filepath.Join(gone, "compose.yaml"), filepath.Join(gone, "override.yaml")}
+		for _, file := range files {
+			writeFile(t, file, "services:\n  old:\n    image: nginx\n")
+		}
+		seed(f, gone, files)
+
+		if err := f.reconciler().Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile() error = %v", err)
+		}
+		if len(f.compose.downs) != 1 {
+			t.Fatalf("Down calls = %d, want 1", len(f.compose.downs))
+		}
+		if got := f.compose.downs[0].stack.ComposeFiles; !reflect.DeepEqual(got, files) {
+			t.Errorf("Down stack.ComposeFiles = %v, want %v (teardown needs the full merged config)", got, files)
+		}
+		if len(f.compose.downProjects) != 0 {
+			t.Errorf("DownProject calls = %v, want none", f.compose.downProjects)
+		}
+	})
+
+	t.Run("one file missing falls back to down without -f", func(t *testing.T) {
+		f := newFixture(t, "global:\n  work_dir: WORKDIR\n  prune_removed_stacks: true\n")
+		f.addLocalStack("web", "name: web\n")
+		gone := filepath.Join(f.workDir, "gone")
+		writeFile(t, filepath.Join(gone, "compose.yaml"), "services:\n  old:\n    image: nginx\n")
+		// override.yaml recorded but not on disk anymore.
+		seed(f, gone, []string{filepath.Join(gone, "compose.yaml"), filepath.Join(gone, "override.yaml")})
+
+		if err := f.reconciler().Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile() error = %v", err)
+		}
+		if !reflect.DeepEqual(f.compose.downProjects, []string{"gone"}) {
+			t.Errorf("DownProject calls = %v, want [gone]", f.compose.downProjects)
+		}
+		if len(f.compose.downs) != 0 {
+			t.Errorf("Down calls = %d, want 0 (incomplete file set)", len(f.compose.downs))
 		}
 	})
 }

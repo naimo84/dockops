@@ -177,6 +177,31 @@ func TestMergeStackEnvMissingEnvFile(t *testing.T) {
 	}
 }
 
+func TestMergeStackEnvSkipsStackDirDotEnv(t *testing.T) {
+	baseDir := t.TempDir()
+	// A stale generated .env from a previous deployment (or one committed to
+	// the repository) must never be read back as a source.
+	writeFile(t, filepath.Join(baseDir, ".env"), "STALE=old-secret\nKEEP_OUT=nope\n")
+	writeFile(t, filepath.Join(baseDir, "real.env"), "REAL=1\n")
+
+	stack := config.Stack{
+		Name:     "web",
+		EnvFiles: []string{".env", "./.env", "real.env", filepath.Join(baseDir, ".env")},
+	}
+	got, err := MergeStackEnv(context.Background(), stack, &fakeResolver{}, baseDir, SystemVars{})
+	if err != nil {
+		t.Fatalf("MergeStackEnv() error = %v", err)
+	}
+	for _, stale := range []string{"STALE", "KEEP_OUT"} {
+		if v, ok := got[stale]; ok && v != "" {
+			t.Errorf("merged env[%s] = %q, want absent (<stackDir>/.env must be skipped in every spelling)", stale, v)
+		}
+	}
+	if got["REAL"] != "1" {
+		t.Errorf("merged env[REAL] = %q, want 1 (regular env_files are still read)", got["REAL"])
+	}
+}
+
 func TestMergeStackEnvResolverErrors(t *testing.T) {
 	baseDir := t.TempDir()
 	resolver := &fakeResolver{
@@ -285,4 +310,138 @@ func TestWriteShmEmptyEnv(t *testing.T) {
 		t.Errorf("permissions = %o, want 600", perm)
 	}
 	cleanup()
+}
+
+func TestWriteStackEnv(t *testing.T) {
+	stackDir := t.TempDir()
+
+	path, rollback, err := WriteStackEnv(stackDir, map[string]string{"SECRET": "hunter2", "A": "1"})
+	if err != nil {
+		t.Fatalf("WriteStackEnv() error = %v", err)
+	}
+	if want := filepath.Join(stackDir, ".env"); path != want {
+		t.Errorf("path = %q, want %q", path, want)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("permissions = %o, want 600", perm)
+	}
+
+	// Deterministic content: sorted keys, plain KEY=value lines.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if want := "A=1\nSECRET=hunter2\n"; string(raw) != want {
+		t.Errorf("content = %q, want %q", raw, want)
+	}
+
+	// Atomic write: no temporary files are left behind in the stack dir.
+	entries, err := os.ReadDir(stackDir)
+	if err != nil {
+		t.Fatalf("read dir %s: %v", stackDir, err)
+	}
+	if len(entries) != 1 || entries[0].Name() != ".env" {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("stack dir contains %v, want exactly [.env] (no temp leftovers)", names)
+	}
+
+	// Success case: rollback exists but is not called — the file stays. Its
+	// no-op on success is verified by not invoking it here; the removal and
+	// restore paths have their own tests.
+	_ = rollback
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("file must stay after a successful write: %v", err)
+	}
+}
+
+func TestWriteStackEnvRollbackRemovesNewFile(t *testing.T) {
+	stackDir := t.TempDir()
+
+	path, rollback, err := WriteStackEnv(stackDir, map[string]string{"A": "1"})
+	if err != nil {
+		t.Fatalf("WriteStackEnv() error = %v", err)
+	}
+	rollback()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("file still exists after rollback: %v", err)
+	}
+	rollback() // idempotent
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("second rollback changed anything: %v", err)
+	}
+}
+
+func TestWriteStackEnvRollbackRestoresPreviousFile(t *testing.T) {
+	stackDir := t.TempDir()
+	path := filepath.Join(stackDir, ".env")
+	if err := os.WriteFile(path, []byte("OLD=previous\n"), 0o644); err != nil {
+		t.Fatalf("write previous .env: %v", err)
+	}
+	// Chmod (not the WriteFile mode) fixes the permission regardless of the
+	// process umask, so the assertion below is host-independent.
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("chmod previous .env: %v", err)
+	}
+
+	gotPath, rollback, err := WriteStackEnv(stackDir, map[string]string{"NEW": "value"})
+	if err != nil {
+		t.Fatalf("WriteStackEnv() error = %v", err)
+	}
+	if gotPath != path {
+		t.Fatalf("path = %q, want %q", gotPath, path)
+	}
+	if raw, _ := os.ReadFile(path); string(raw) != "NEW=value\n" {
+		t.Fatalf("content before rollback = %q, want the new content", raw)
+	}
+
+	rollback()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read restored %s: %v", path, err)
+	}
+	if want := "OLD=previous\n"; string(raw) != want {
+		t.Errorf("restored content = %q, want %q", raw, want)
+	}
+	// The previous permissions are restored with the content.
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o644 {
+		t.Errorf("restored permissions = %o, want 644", perm)
+	}
+	rollback() // idempotent: still the restored state
+	if raw, _ := os.ReadFile(path); string(raw) != "OLD=previous\n" {
+		t.Errorf("second rollback changed the content: %q", raw)
+	}
+}
+
+func TestWriteStackEnvMissingDir(t *testing.T) {
+	_, _, err := WriteStackEnv(filepath.Join(t.TempDir(), "does-not-exist"), map[string]string{"A": "1"})
+	if err == nil || !strings.Contains(err.Error(), "does-not-exist") {
+		t.Errorf("WriteStackEnv() into missing dir error = %v, want error naming the dir", err)
+	}
+}
+
+func TestWriteStackEnvEmptyEnv(t *testing.T) {
+	stackDir := t.TempDir()
+	path, rollback, err := WriteStackEnv(stackDir, map[string]string{})
+	if err != nil {
+		t.Fatalf("WriteStackEnv() error = %v", err)
+	}
+	if raw, _ := os.ReadFile(path); len(raw) != 0 {
+		t.Errorf("content = %q, want empty", raw)
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("permissions = %v, %v; want 600", info, err)
+	}
+	rollback()
 }

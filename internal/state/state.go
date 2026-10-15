@@ -60,6 +60,10 @@ type State struct {
 	// ComposeFile is the resolved compose file path at deploy time, for the
 	// same purpose as StackDir. Optional, see there.
 	ComposeFile string `json:"compose_file,omitempty"`
+	// ComposeFiles holds the resolved compose file paths when the stack was
+	// deployed from multiple files (compose_files); ComposeFile stays empty
+	// in that case. Optional, see ComposeFile.
+	ComposeFiles []string `json:"compose_files,omitempty"`
 }
 
 // fileModel is the JSON document persisted by Save.

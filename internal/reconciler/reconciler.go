@@ -355,13 +355,20 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 // change detection, secrets, environment, hooks and compose up. Per-stack
 // failures are returned; the caller collects them and continues with the
 // next stack. All deferred cleanup (the shm env file) runs when this
-// function returns, i.e. at the end of the stack.
+// function returns, i.e. at the end of the stack; the generated stack-dir
+// .env deliberately outlives a successful deployment (see the WriteStackEnv
+// call below).
 func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultSess *vaultSession, commits map[string]string) error {
-	composeContent, err := os.ReadFile(stack.ComposeFile)
-	if err != nil {
-		return fmt.Errorf("stack %s: read compose file: %w", stack.Name, err)
+	composeFiles := stack.EffectiveComposeFiles()
+	contents := make([][]byte, 0, len(composeFiles))
+	for _, file := range composeFiles {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			return fmt.Errorf("stack %s: read compose file: %w", stack.Name, err)
+		}
+		contents = append(contents, content)
 	}
-	newHash, err := stackhash.Compute(stack, composeContent)
+	newHash, err := stackhash.Compute(stack, contents...)
 	if err != nil {
 		return fmt.Errorf("stack %s: compute hash: %w", stack.Name, err)
 	}
@@ -407,14 +414,36 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		r.markFailed(stack, newHash)
 		return fmt.Errorf("stack %s: pre_deploy: %w", stack.Name, err)
 	}
+
+	// The stack-dir .env backs compose's stack-relative env_file: ./.env
+	// references and ${...} interpolation, which the shm --env-file alone
+	// cannot serve (docker compose resolves them against the compose
+	// file's directory). It is written from the same merged environment,
+	// after pre_deploy so a failing hook leaves the previous file intact.
+	// It stays after a successful deployment; a checkout-updating pass may
+	// remove or revert it, and the next deployment regenerates it. It is
+	// deliberately not part of the stack hash: a changed secret value must
+	// not trigger a redeployment (Komodo reality; see env.WriteStackEnv).
+	stackEnvPath, rollbackStackEnv, err := env.WriteStackEnv(stack.Dir, merged)
+	if err != nil {
+		r.markFailed(stack, newHash)
+		return fmt.Errorf("stack %s: write stack env file: %w", stack.Name, err)
+	}
+	r.logger.Debug("wrote stack env file", "stack", stack.Name, "path", stackEnvPath)
+
 	if err := r.compose.Up(ctx, stack, stack.Dir, envFile); err != nil {
+		// Deployment failed: restore whatever .env was there before, so the
+		// stack directory does not advertise an environment its services
+		// are not running with.
+		rollbackStackEnv()
 		r.markFailed(stack, newHash)
 		return fmt.Errorf("stack %s: up: %w", stack.Name, err)
 	}
 
 	// A failed post_deploy hook does not undeploy the stack — the briefing
 	// says it still counts as deployed — but the error is logged here and
-	// returned so it joins the pass result.
+	// returned so it joins the pass result. The generated .env stays: the
+	// services are up and later compose calls need the same environment.
 	var postErr error
 	if err := r.hooks.Run(ctx, stack.Hooks.PostDeploy, stack.Dir, hookEnv, hookTimeout); err != nil {
 		r.logger.Error("post_deploy failed; stack counts as deployed anyway", "stack", stack.Name, "error", err)
@@ -422,10 +451,11 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	}
 
 	if err := r.state.Set(stack.Name, state.State{
-		Hash:        newHash,
-		Status:      state.StatusDeployed,
-		StackDir:    stack.Dir,
-		ComposeFile: stack.ComposeFile,
+		Hash:         newHash,
+		Status:       state.StatusDeployed,
+		StackDir:     stack.Dir,
+		ComposeFile:  stack.ComposeFile,
+		ComposeFiles: stack.ComposeFiles,
 	}); err != nil {
 		return fmt.Errorf("stack %s: record state: %w", stack.Name, err)
 	}
@@ -438,10 +468,11 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 // the original failure, so a Set error is only logged.
 func (r *Reconciler) markFailed(stack config.Stack, newHash string) {
 	if err := r.state.Set(stack.Name, state.State{
-		Hash:        newHash,
-		Status:      state.StatusFailed,
-		StackDir:    stack.Dir,
-		ComposeFile: stack.ComposeFile,
+		Hash:         newHash,
+		Status:       state.StatusFailed,
+		StackDir:     stack.Dir,
+		ComposeFile:  stack.ComposeFile,
+		ComposeFiles: stack.ComposeFiles,
 	}); err != nil {
 		r.logger.Error("cannot record failed state", "stack", stack.Name, "error", err)
 	}
@@ -473,15 +504,29 @@ func (r *Reconciler) prune(ctx context.Context, cfg *config.Config) []error {
 	return errs
 }
 
-// pruneStack tears one removed stack down. When the persisted compose file
-// still exists, the full Down command line runs — an empty env file stands
-// in for the secrets, which are gone with the stack definition; down only
-// interpolates, it does not need the values. Otherwise (the checkout
-// directory vanished with the stack) the briefing's fallback runs: docker
-// compose -p <name> down --remove-orphans without -f, which may fail
+// pruneStack tears one removed stack down. When the persisted compose files
+// all still exist, the full Down command line runs — with every -f the
+// stack was deployed from, so the merged configuration matches the one the
+// services were created with. An empty env file stands in for the secrets,
+// which are gone with the stack definition; down only interpolates, it does
+// not need the values. Otherwise (the checkout directory vanished with the
+// stack, or any compose file is missing) the briefing's fallback runs:
+// docker compose -p <name> down --remove-orphans without -f, which may fail
 // depending on the docker compose version; the failure is returned to the
 // caller for logging and retry.
 func (r *Reconciler) pruneStack(ctx context.Context, name string, st state.State) error {
+	if len(st.ComposeFiles) > 0 {
+		if st.StackDir == "" || !allRegularFiles(st.ComposeFiles) {
+			return r.compose.DownProject(ctx, name)
+		}
+		envFile, cleanup, err := env.WriteShm(map[string]string{})
+		if err != nil {
+			return fmt.Errorf("write empty env file: %w", err)
+		}
+		defer cleanup()
+		ghost := config.Stack{Name: name, ComposeFiles: st.ComposeFiles}
+		return r.compose.Down(ctx, ghost, st.StackDir, envFile)
+	}
 	if st.ComposeFile != "" && st.StackDir != "" && regularFileExists(st.ComposeFile) {
 		envFile, cleanup, err := env.WriteShm(map[string]string{})
 		if err != nil {
@@ -492,6 +537,16 @@ func (r *Reconciler) pruneStack(ctx context.Context, name string, st state.State
 		return r.compose.Down(ctx, ghost, st.StackDir, envFile)
 	}
 	return r.compose.DownProject(ctx, name)
+}
+
+// allRegularFiles reports whether every path exists and is a regular file.
+func allRegularFiles(paths []string) bool {
+	for _, p := range paths {
+		if !regularFileExists(p) {
+			return false
+		}
+	}
+	return true
 }
 
 // validate checks the invariant requirements at the start of every pass so

@@ -9,7 +9,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -24,6 +26,10 @@ import (
 // tmpfs, so the plaintext never touches the disk). A package variable so
 // tests can simulate a host without /dev/shm.
 var shmDir = "/dev/shm"
+
+// stackEnvFile is the name of the generated dotenv file in the stack
+// directory (see WriteStackEnv).
+const stackEnvFile = ".env"
 
 // SystemVars are the variables dockops itself injects into every stack
 // environment. They are passed explicitly instead of being read from the
@@ -56,10 +62,19 @@ type SystemVars struct {
 func MergeStackEnv(ctx context.Context, stack config.Stack, secrets secrets.Resolver, baseDir string, sys SystemVars) (map[string]string, error) {
 	env := make(map[string]string)
 
+	// The stack directory's own .env is dockops output: WriteStackEnv
+	// regenerates it from exactly these inputs before every compose call.
+	// Reading it back (a stale file from a previous deployment or one
+	// committed to the repository) would freeze old resolved values into
+	// the merge, so any env_files entry resolving to it is skipped.
+	generatedEnv := filepath.Clean(filepath.Join(baseDir, stackEnvFile))
 	for i, rel := range stack.EnvFiles {
 		path := rel
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(baseDir, path)
+		}
+		if filepath.Clean(path) == generatedEnv {
+			continue
 		}
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -186,6 +201,96 @@ func randomHex(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+// WriteStackEnv writes env in dotenv format to <stackDir>/.env — atomically
+// (a temporary file in the same directory, renamed over the target) and
+// with 0600 permissions, since the merged environment carries secrets. The
+// content is the deterministic dotenv format (sorted keys, literal
+// KEY=VALUE lines, no quoting) that the compose dotenv parser reads
+// verbatim.
+//
+// The file backs everything compose resolves relative to the stack
+// directory: `env_file: ./.env` references and ${...} interpolation in the
+// compose file. It carries the same merged environment as the shm --env-file
+// (env_files, sops, vault, system variables).
+//
+// It returns the file path and a rollback function for deployment failures:
+// rollback restores the file that occupied the path before — overwriting it
+// with the saved previous content — or removes it when none existed. On a
+// successful deployment rollback must NOT be called: the file stays so
+// later `docker compose logs/exec` invocations resolve the same
+// environment. Note that a checkout-updating pass (git reset/clean) may
+// remove or revert it; the next deployment of the stack regenerates it.
+//
+// The generated file is deliberately NOT part of the stack hash
+// (internal/hash): it is a deployment artifact derived from sources the
+// hash already covers by reference. A changed secret value therefore does
+// not trigger a redeployment — a conscious decision matching the Komodo
+// reality the briefing describes (secret rotation alone deploys nothing
+// until the stack definition changes).
+func WriteStackEnv(stackDir string, env map[string]string) (path string, rollback func(), err error) {
+	content := dotenv.Format(env)
+	path = filepath.Join(stackDir, stackEnvFile)
+
+	// Snapshot the previous file (content and permissions) for rollback.
+	var prev []byte
+	var prevMode os.FileMode
+	hadPrev := true
+	prev, err = os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", nil, fmt.Errorf("env: read previous %s: %w", path, err)
+		}
+		hadPrev = false
+	} else if info, statErr := os.Stat(path); statErr == nil {
+		prevMode = info.Mode().Perm()
+	}
+
+	tmp, err := os.CreateTemp(stackDir, "."+stackEnvFile+".dockops-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("env: create temp file in %s: %w", stackDir, err)
+	}
+	tmpName := tmp.Name()
+	// os.CreateTemp creates 0600 files; the permission survives the rename.
+	if _, err := tmp.Write(content); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return "", nil, fmt.Errorf("env: write %s: %w", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return "", nil, fmt.Errorf("env: close %s: %w", tmpName, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return "", nil, fmt.Errorf("env: rename %s to %s: %w", tmpName, path, err)
+	}
+
+	var once sync.Once
+	rollback = func() {
+		once.Do(func() {
+			if !hadPrev {
+				if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+					slog.Default().Warn("cannot remove generated stack env file", "path", path, "error", err)
+				}
+				return
+			}
+			// Restore the previous file with its original permissions;
+			// failures are logged because rollback must stay callable in
+			// defer chains. os.WriteFile only applies perm to newly created
+			// files, so the mode is restored with an explicit Chmod.
+			if prevMode == 0 {
+				prevMode = 0o600
+			}
+			if err := os.WriteFile(path, prev, prevMode); err != nil {
+				slog.Default().Warn("cannot restore previous stack env file", "path", path, "error", err)
+			} else if err := os.Chmod(path, prevMode); err != nil {
+				slog.Default().Warn("cannot restore stack env file permissions", "path", path, "error", err)
+			}
+		})
+	}
+	return path, rollback, nil
 }
 
 // contentHash returns the first 12 hex characters of the SHA-256 over data.

@@ -69,15 +69,16 @@ type Remote struct {
 // Import references a stack definition inside a remote checkout plus
 // overrides that are merged on top of the loaded base stack.
 type Import struct {
-	Remote     string   `yaml:"remote"`
-	Path       string   `yaml:"path"`
-	Name       string   `yaml:"name"`
-	Profiles   []string `yaml:"profiles"`
-	Services   []string `yaml:"services"`
-	EnvFiles   []string `yaml:"env_files"`
-	SopsFiles  []string `yaml:"sops_files"`
-	VaultPaths []string `yaml:"vault_paths"`
-	Hooks      Hooks    `yaml:"hooks"`
+	Remote         string   `yaml:"remote"`
+	Path           string   `yaml:"path"`
+	Name           string   `yaml:"name"`
+	Profiles       []string `yaml:"profiles"`
+	Services       []string `yaml:"services"`
+	IgnoreServices []string `yaml:"ignore_services"`
+	EnvFiles       []string `yaml:"env_files"`
+	SopsFiles      []string `yaml:"sops_files"`
+	VaultPaths     []string `yaml:"vault_paths"`
+	Hooks          Hooks    `yaml:"hooks"`
 }
 
 // Hooks holds shell commands that run before and after a stack deployment.
@@ -94,18 +95,22 @@ type SopsFile struct {
 }
 
 // Stack is a single stack definition loaded from stack.yaml or *.stack.yaml.
-// EnvFiles and SopsFiles paths are relative to Dir; ComposeFile is resolved
-// to a concrete path by the loader.
+// EnvFiles and SopsFiles paths are relative to Dir; ComposeFile and
+// ComposeFiles are resolved to concrete paths by the loader.
 type Stack struct {
-	Name        string     `yaml:"name"`
-	Enabled     bool       `yaml:"enabled"`
-	ComposeFile string     `yaml:"compose_file"`
-	Profiles    []string   `yaml:"profiles"`
-	Services    []string   `yaml:"services"`
-	EnvFiles    []string   `yaml:"env_files"`
-	SopsFiles   []SopsFile `yaml:"sops_files"`
-	VaultPaths  []string   `yaml:"vault_paths"`
-	Hooks       Hooks      `yaml:"hooks"`
+	Name        string `yaml:"name"`
+	Enabled     bool   `yaml:"enabled"`
+	ComposeFile string `yaml:"compose_file"`
+	// ComposeFiles lists multiple compose files that docker compose merges
+	// in list order (later files win). Mutually exclusive with ComposeFile.
+	ComposeFiles   []string   `yaml:"compose_files"`
+	Profiles       []string   `yaml:"profiles"`
+	Services       []string   `yaml:"services"`
+	IgnoreServices []string   `yaml:"ignore_services"`
+	EnvFiles       []string   `yaml:"env_files"`
+	SopsFiles      []SopsFile `yaml:"sops_files"`
+	VaultPaths     []string   `yaml:"vault_paths"`
+	Hooks          Hooks      `yaml:"hooks"`
 
 	// Load metadata, not part of the YAML schema. Dir is the directory
 	// containing the definition, File the YAML file it was loaded from, and
@@ -113,4 +118,54 @@ type Stack struct {
 	Dir    string `yaml:"-"`
 	File   string `yaml:"-"`
 	Source string `yaml:"-"`
+}
+
+// EffectiveComposeFiles returns every compose file of the stack in docker
+// compose -f order: the multi-file compose_files list when set (the loader
+// resolves it to absolute paths), otherwise the single ComposeFile (which
+// hand-constructed stacks may still carry as a relative path — callers like
+// the compose executor resolve entries against the stack directory).
+func (s Stack) EffectiveComposeFiles() []string {
+	if len(s.ComposeFiles) > 0 {
+		return s.ComposeFiles
+	}
+	if s.ComposeFile != "" {
+		return []string{s.ComposeFile}
+	}
+	return nil
+}
+
+// EffectiveServices returns the services docker compose up receives as
+// positional arguments when the stack configures services: Services minus
+// IgnoreServices, in configured order. Nil means "no restriction": either
+// neither list is set (deploy everything) or only ignore_services is set —
+// the latter case cannot be answered from the stack definition alone, so
+// the compose executor subtracts ignore_services from the service names of
+// the compose files instead. An empty (non-nil) result means every
+// configured service is ignored, which the loader rejects as contradictory.
+func (s Stack) EffectiveServices() []string {
+	return ExcludeServices(s.Services, s.IgnoreServices)
+}
+
+// ExcludeServices returns services without the entries of ignored, first
+// occurrence per name, order otherwise preserved. The result may be empty
+// (everything ignored) — callers decide whether that is an error. It is the
+// shared set operation behind the service filters (see EffectiveServices
+// and the compose executor's ignore handling).
+func ExcludeServices(services, ignored []string) []string {
+	if len(ignored) == 0 {
+		return services
+	}
+	drop := make(map[string]struct{}, len(ignored))
+	for _, name := range ignored {
+		drop[name] = struct{}{}
+	}
+	out := make([]string, 0, len(services))
+	for _, name := range services {
+		if _, ok := drop[name]; ok {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
 }

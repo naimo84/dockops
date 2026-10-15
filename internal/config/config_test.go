@@ -812,3 +812,190 @@ func TestRelativeWorkDirResolvesAgainstHostRoot(t *testing.T) {
 		t.Errorf("Name = %q, want app (import resolved via relative work_dir)", cfg.Stacks[0].Name)
 	}
 }
+
+func TestIgnoreServicesLocalStack(t *testing.T) {
+	rootFile, hostDir, workDir := newRepo(t)
+	writeFile(t, rootFile, fmt.Sprintf("global:\n  work_dir: %q\n", workDir))
+	// Disjoint lists (the overlap is a validation error, see below); the
+	// loader must keep both as configured.
+	writeFile(t, filepath.Join(hostDir, "app", "stack.yaml"), "name: app\nservices: [api, worker]\nignore_services: [debug]\n")
+	writeFile(t, filepath.Join(hostDir, "app", "compose.yaml"), "services: {}\n")
+
+	cfg, err := Load(rootFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if want := []string{"api", "worker"}; !reflect.DeepEqual(cfg.Stacks[0].Services, want) {
+		t.Errorf("Services = %v, want %v (loaded as configured)", cfg.Stacks[0].Services, want)
+	}
+	if want := []string{"debug"}; !reflect.DeepEqual(cfg.Stacks[0].IgnoreServices, want) {
+		t.Errorf("IgnoreServices = %v, want %v", cfg.Stacks[0].IgnoreServices, want)
+	}
+	// Disjoint ignore lists leave the configured services untouched.
+	if want := []string{"api", "worker"}; !reflect.DeepEqual(cfg.Stacks[0].EffectiveServices(), want) {
+		t.Errorf("EffectiveServices() = %v, want %v", cfg.Stacks[0].EffectiveServices(), want)
+	}
+}
+
+func TestExcludeServices(t *testing.T) {
+	cases := []struct {
+		name     string
+		services []string
+		ignored  []string
+		want     []string
+	}{
+		{name: "nothing ignored", services: []string{"a", "b"}, ignored: nil, want: []string{"a", "b"}},
+		{name: "subtraction preserves order", services: []string{"a", "b", "c"}, ignored: []string{"b"}, want: []string{"a", "c"}},
+		{name: "ignored entry not present", services: []string{"a", "b"}, ignored: []string{"x"}, want: []string{"a", "b"}},
+		{name: "everything ignored", services: []string{"a"}, ignored: []string{"a"}, want: []string{}},
+		{name: "empty services", services: nil, ignored: []string{"a"}, want: []string{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ExcludeServices(tc.services, tc.ignored); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("ExcludeServices(%v, %v) = %v, want %v", tc.services, tc.ignored, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestServicesIgnoreOverlapRejected(t *testing.T) {
+	t.Run("local stack", func(t *testing.T) {
+		rootFile, hostDir, workDir := newRepo(t)
+		writeFile(t, rootFile, fmt.Sprintf("global:\n  work_dir: %q\n", workDir))
+		stackFile := filepath.Join(hostDir, "app", "stack.yaml")
+		writeFile(t, stackFile, "name: app\nservices: [api, worker]\nignore_services: [worker]\n")
+		writeFile(t, filepath.Join(hostDir, "app", "compose.yaml"), "services: {}\n")
+
+		_, err := Load(rootFile)
+		if err == nil {
+			t.Fatal("Load() error = nil, want overlap error")
+		}
+		for _, want := range []string{stackFile, "services and ignore_services overlap", "worker"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not contain %q", err, want)
+			}
+		}
+	})
+
+	t.Run("overlap only arises from the import merge", func(t *testing.T) {
+		rootFile, _, workDir := newRepo(t)
+		writeRemoteStack(t, workDir, "stacks/app", "name: app\nservices: [api, worker]\n", "compose.yaml")
+		writeFile(t, rootFile, rootWithImports(workDir, "imports:\n  - remote: infra\n    path: stacks/app\n    ignore_services: [worker]\n"))
+
+		_, err := Load(rootFile)
+		if err == nil {
+			t.Fatal("Load() error = nil, want overlap error from the merged stack")
+		}
+		if !strings.Contains(err.Error(), "services and ignore_services overlap") {
+			t.Errorf("error %q does not contain the overlap message", err)
+		}
+	})
+}
+
+func TestImportIgnoreServicesConcat(t *testing.T) {
+	rootFile, _, workDir := newRepo(t)
+	writeRemoteStack(t, workDir, "stacks/app", "name: app\nservices: [api]\nignore_services: [debug, base-only]\n", "compose.yaml")
+	writeFile(t, rootFile, rootWithImports(workDir, `imports:
+  - remote: infra
+    path: stacks/app
+    ignore_services: [debug, imp-only]
+`))
+
+	cfg, err := Load(rootFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	s := cfg.Stacks[0]
+	// Concat + dedup, base first — like profiles and env_files.
+	if want := []string{"debug", "base-only", "imp-only"}; !reflect.DeepEqual(s.IgnoreServices, want) {
+		t.Errorf("IgnoreServices = %v, want %v (concat base + import, deduplicated)", s.IgnoreServices, want)
+	}
+	// Base services survive; only import services replace them.
+	if want := []string{"api"}; !reflect.DeepEqual(s.Services, want) {
+		t.Errorf("Services = %v, want %v (ignore does not touch services)", s.Services, want)
+	}
+}
+
+func TestComposeFilesExplicit(t *testing.T) {
+	rootFile, hostDir, workDir := newRepo(t)
+	writeFile(t, rootFile, fmt.Sprintf("global:\n  work_dir: %q\n", workDir))
+	appDir := filepath.Join(hostDir, "app")
+	writeFile(t, filepath.Join(appDir, "stack.yaml"), "name: app\ncompose_files: [compose.yaml, override.yaml]\n")
+	writeFile(t, filepath.Join(appDir, "compose.yaml"), "services: {}\n")
+	writeFile(t, filepath.Join(appDir, "override.yaml"), "services: {}\n")
+
+	cfg, err := Load(rootFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	s := cfg.Stacks[0]
+	want := []string{filepath.Join(appDir, "compose.yaml"), filepath.Join(appDir, "override.yaml")}
+	if !reflect.DeepEqual(s.ComposeFiles, want) {
+		t.Errorf("ComposeFiles = %v, want %v (resolved, list order)", s.ComposeFiles, want)
+	}
+	if s.ComposeFile != "" {
+		t.Errorf("ComposeFile = %q, want empty in the multi-file case", s.ComposeFile)
+	}
+	if got := s.EffectiveComposeFiles(); !reflect.DeepEqual(got, want) {
+		t.Errorf("EffectiveComposeFiles() = %v, want %v", got, want)
+	}
+}
+
+func TestComposeFilesValidation(t *testing.T) {
+	cases := []struct {
+		name      string
+		stackYAML string
+		wantErr   string
+	}{
+		{
+			name:      "compose_file and compose_files together",
+			stackYAML: "name: app\ncompose_file: compose.yaml\ncompose_files: [compose.yaml, override.yaml]\n",
+			wantErr:   "compose_file and compose_files are mutually exclusive",
+		},
+		{
+			name:      "missing file",
+			stackYAML: "name: app\ncompose_files: [compose.yaml, missing.yaml]\n",
+			wantErr:   `compose_files[1] "missing.yaml" not found`,
+		},
+		{
+			name:      "explicitly empty list",
+			stackYAML: "name: app\ncompose_files: []\n",
+			wantErr:   "compose_files must list at least one file",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rootFile, hostDir, workDir := newRepo(t)
+			writeFile(t, rootFile, fmt.Sprintf("global:\n  work_dir: %q\n", workDir))
+			appDir := filepath.Join(hostDir, "app")
+			writeFile(t, filepath.Join(appDir, "stack.yaml"), tc.stackYAML)
+			writeFile(t, filepath.Join(appDir, "compose.yaml"), "services: {}\n")
+			writeFile(t, filepath.Join(appDir, "override.yaml"), "services: {}\n")
+
+			_, err := Load(rootFile)
+			if err == nil {
+				t.Fatal("Load() error = nil, want validation error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error %q does not contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestImportComposeFiles(t *testing.T) {
+	rootFile, _, workDir := newRepo(t)
+	writeRemoteStack(t, workDir, "stacks/app", "name: app\ncompose_files: [base.yaml, prod.yaml]\n", "base.yaml", "prod.yaml")
+	writeFile(t, rootFile, rootWithImports(workDir, "imports:\n  - remote: infra\n    path: stacks/app\n"))
+
+	cfg, err := Load(rootFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	dir := filepath.Join(workDir, testRemote, "stacks", "app")
+	want := []string{filepath.Join(dir, "base.yaml"), filepath.Join(dir, "prod.yaml")}
+	if got := cfg.Stacks[0].EffectiveComposeFiles(); !reflect.DeepEqual(got, want) {
+		t.Errorf("EffectiveComposeFiles() = %v, want %v (import stacks resolve compose_files against the remote checkout)", got, want)
+	}
+}

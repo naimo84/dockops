@@ -9,7 +9,9 @@
 // sops_files with path and age_keyfile, vault_paths, hooks) plus a
 // "normalized" compose content, but is cut off mid-sentence. The remaining
 // decisions follow the project convention for open points and are documented
-// at the decision sites below.
+// at the decision sites below; phase 6a extended the field list to the
+// compose file list (compose_files), the effective service filter and
+// ignore_services.
 package stackhash
 
 import (
@@ -27,24 +29,32 @@ import (
 // schemaVersion prefixes the canonical form. Any change to the canonical
 // representation must bump it so persisted hashes (state store) are not
 // silently compared against a different scheme.
-const schemaVersion = 1
+//
+// Version 2 replaced the single compose_file with the compose file list
+// (compose_files), switched Services to the effective service filter result
+// (services minus ignore_services) and added the sorted ignore_services
+// list — all changes that affect what a deployment runs. A state file
+// written against version 1 therefore mismatches once and every stack
+// redeploys a single time, which is the safe direction.
+const schemaVersion = 2
 
 // canonicalStack is the fixed, JSON-serializable projection of a
 // config.Stack that enters the hash. Field order is irrelevant for the hash
 // (encoding/json emits struct fields in declaration order, which is stable),
 // but kept aligned with the briefing's field list for readability.
 type canonicalStack struct {
-	SchemaVersion int                 `json:"schema_version"`
-	Name          string              `json:"name"`
-	Enabled       bool                `json:"enabled"`
-	ComposeFile   string              `json:"compose_file"`
-	Profiles      []string            `json:"profiles"`
-	Services      []string            `json:"services"`
-	EnvFiles      []string            `json:"env_files"`
-	SopsFiles     []canonicalSopsFile `json:"sops_files"`
-	VaultPaths    []string            `json:"vault_paths"`
-	Hooks         canonicalHooks      `json:"hooks"`
-	Compose       any                 `json:"compose"`
+	SchemaVersion  int                 `json:"schema_version"`
+	Name           string              `json:"name"`
+	Enabled        bool                `json:"enabled"`
+	ComposeFiles   []string            `json:"compose_files"`
+	Profiles       []string            `json:"profiles"`
+	Services       []string            `json:"services"`
+	IgnoreServices []string            `json:"ignore_services"`
+	EnvFiles       []string            `json:"env_files"`
+	SopsFiles      []canonicalSopsFile `json:"sops_files"`
+	VaultPaths     []string            `json:"vault_paths"`
+	Hooks          canonicalHooks      `json:"hooks"`
+	Compose        []any               `json:"compose"`
 }
 
 // canonicalSopsFile is the hash-relevant projection of config.SopsFile.
@@ -60,20 +70,31 @@ type canonicalHooks struct {
 }
 
 // Compute returns the deterministic SHA-256 hash (hex encoded) over the
-// canonical representation of stack and the normalized composeContent.
+// canonical representation of stack and the normalized compose contents —
+// one content per compose file of the stack, in -f order. A stack with the
+// multi-file compose_files configuration hashes over all file contents;
+// a single-file stack passes exactly one content.
 //
 // Normalization decisions where the briefing is cut off (all conservative):
-//   - composeContent is parsed as YAML and canonicalized (see
+//   - every compose content is parsed as YAML and canonicalized (see
 //     canonicalYAML): key order, indentation, comments, anchors and quoting
 //     styles do not affect the hash; scalar text values (e.g. "1.0" vs
-//     "1.00") and their YAML types do.
-//   - profiles and services are sorted, per the briefing; the other list
-//     fields keep their order because it is semantically relevant
-//     (env_files and vault_paths override in sequence, hooks run in
-//     sequence).
-//   - compose_file enters as the resolved path stored in the stack; hashes
-//     are therefore only comparable within one host (the briefing lists the
-//     field explicitly).
+//     "1.00") and their YAML types do. The list order of the files is kept:
+//     compose override semantics ("later wins") make a different order a
+//     different deployment.
+//   - profiles and services are sorted, per the briefing; ignore_services
+//     is sorted for the same set-like reason. The other list fields keep
+//     their order because it is semantically relevant (env_files and
+//     vault_paths override in sequence, hooks run in sequence).
+//   - services enter the hash as the effective filter result
+//     (stack.EffectiveServices, i.e. services minus ignore_services). With
+//     no configured services the deployed set is "everything the compose
+//     files define minus ignore_services" — fully determined by the hashed
+//     ignore list and compose contents, so the effective deployment is
+//     always covered exactly once, never twice.
+//   - the compose file paths enter as the effective list stored in the
+//     stack; hashes are therefore only comparable within one host (the
+//     briefing lists the field explicitly).
 //   - nil and empty lists are normalized to the same form so a missing key
 //     and an explicit empty list hash identically.
 //   - empty compose content hashes as a null document instead of failing;
@@ -81,28 +102,38 @@ type canonicalHooks struct {
 //
 // The returned error signals unparsable or non-canonicalizable compose
 // content (syntax errors, duplicate keys after canonicalization, non-scalar
-// mapping keys, alias cycles), with stack and file context.
-func Compute(stack config.Stack, composeContent []byte) (string, error) {
-	compose, err := canonicalYAML(composeContent)
-	if err != nil {
-		return "", fmt.Errorf("stack %s: normalize compose file %s: %w", stack.Name, stack.ComposeFile, err)
+// mapping keys, alias cycles) or a mismatch between the number of contents
+// and the stack's compose files, with stack and file context.
+func Compute(stack config.Stack, composeContents ...[]byte) (string, error) {
+	files := stack.EffectiveComposeFiles()
+	if len(files) != len(composeContents) {
+		return "", fmt.Errorf("stack %s: %d compose contents for %d compose files", stack.Name, len(composeContents), len(files))
+	}
+	compose := make([]any, len(composeContents))
+	for i, content := range composeContents {
+		doc, err := canonicalYAML(content)
+		if err != nil {
+			return "", fmt.Errorf("stack %s: normalize compose file %s: %w", stack.Name, files[i], err)
+		}
+		compose[i] = doc
 	}
 
 	canon := canonicalStack{
-		SchemaVersion: schemaVersion,
-		Name:          stack.Name,
-		Enabled:       stack.Enabled,
-		ComposeFile:   stack.ComposeFile,
-		Profiles:      sorted(stack.Profiles),
-		Services:      sorted(stack.Services),
-		EnvFiles:      nilIfEmpty(stack.EnvFiles),
-		SopsFiles:     canonicalSopsFiles(stack.SopsFiles),
-		VaultPaths:    nilIfEmpty(stack.VaultPaths),
+		SchemaVersion:  schemaVersion,
+		Name:           stack.Name,
+		Enabled:        stack.Enabled,
+		ComposeFiles:   nilIfEmpty(files),
+		Profiles:       sorted(stack.Profiles),
+		Services:       sorted(stack.EffectiveServices()),
+		IgnoreServices: sorted(stack.IgnoreServices),
+		EnvFiles:       nilIfEmpty(stack.EnvFiles),
+		SopsFiles:      canonicalSopsFiles(stack.SopsFiles),
+		VaultPaths:     nilIfEmpty(stack.VaultPaths),
 		Hooks: canonicalHooks{
 			PreDeploy:  nilIfEmpty(stack.Hooks.PreDeploy),
 			PostDeploy: nilIfEmpty(stack.Hooks.PostDeploy),
 		},
-		Compose: compose,
+		Compose: nilIfEmptyAny(compose),
 	}
 
 	// encoding/json is deterministic: struct fields in declaration order,
@@ -113,6 +144,15 @@ func Compute(stack config.Stack, composeContent []byte) (string, error) {
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// nilIfEmptyAny is nilIfEmpty for the canonical compose document list (all
+// contents empty canonicalize to nil, an absent list stays nil).
+func nilIfEmptyAny(list []any) []any {
+	if len(list) == 0 {
+		return nil
+	}
+	return list
 }
 
 // sorted returns a sorted copy of list; nil and empty both normalize to nil

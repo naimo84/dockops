@@ -127,6 +127,7 @@ func TestComputeSensitiveToConfigChanges(t *testing.T) {
 		"compose_file":     func(s *config.Stack) { s.ComposeFile = "/srv/other/compose.yaml" },
 		"profiles":         func(s *config.Stack) { s.Profiles = []string{"minimal"} },
 		"services":         func(s *config.Stack) { s.Services = []string{"app"} },
+		"ignore_services":  func(s *config.Stack) { s.IgnoreServices = []string{"db"} },
 		"env_files":        func(s *config.Stack) { s.EnvFiles = []string{"web.env"} },
 		"sops path":        func(s *config.Stack) { s.SopsFiles[0].Path = "other.enc" },
 		"sops age_keyfile": func(s *config.Stack) { s.SopsFiles[0].AgeKeyfile = "" },
@@ -153,6 +154,109 @@ func TestComputeSensitiveToConfigChanges(t *testing.T) {
 	}
 	if got == baseHash {
 		t.Error("hash unchanged after changing compose content")
+	}
+}
+
+// multiFileStack is baseStack deployed from two compose files.
+func multiFileStack() config.Stack {
+	s := baseStack()
+	s.ComposeFile = ""
+	s.ComposeFiles = []string{"/srv/stacks/web/compose.yaml", "/srv/stacks/web/compose.override.yaml"}
+	return s
+}
+
+const overrideCompose = `services:
+  app:
+    environment:
+      LOG_LEVEL: info
+`
+
+func TestComputeMultiFile(t *testing.T) {
+	stack := multiFileStack()
+
+	base, err := Compute(stack, []byte(baseCompose), []byte(overrideCompose))
+	if err != nil {
+		t.Fatalf("Compute() error = %v", err)
+	}
+
+	// Reformatting the override file alone must not change the hash.
+	reformatted := "# comment\nservices:\n  app:\n    environment:\n      LOG_LEVEL: info   # inline\n"
+	got, err := Compute(stack, []byte(baseCompose), []byte(reformatted))
+	if err != nil {
+		t.Fatalf("Compute() (reformatted) error = %v", err)
+	}
+	if got != base {
+		t.Error("hash changed after reformatting the override file")
+	}
+
+	// Changing override content changes the hash.
+	changed := strings.Replace(overrideCompose, "info", "debug", 1)
+	got, err = Compute(stack, []byte(baseCompose), []byte(changed))
+	if err != nil {
+		t.Fatalf("Compute() (changed override) error = %v", err)
+	}
+	if got == base {
+		t.Error("hash unchanged after changing the override file content")
+	}
+
+	// Swapping the file order changes the hash: compose override rules make
+	// a different order a different deployment.
+	swappedStack := multiFileStack()
+	swappedStack.ComposeFiles = []string{swappedStack.ComposeFiles[1], swappedStack.ComposeFiles[0]}
+	got, err = Compute(swappedStack, []byte(overrideCompose), []byte(baseCompose))
+	if err != nil {
+		t.Fatalf("Compute() (swapped) error = %v", err)
+	}
+	if got == base {
+		t.Error("hash unchanged after swapping the compose file order")
+	}
+}
+
+func TestComputeContentsFilesMismatch(t *testing.T) {
+	stack := multiFileStack()
+	if _, err := Compute(stack, []byte(baseCompose)); err == nil {
+		t.Error("Compute() with one content for two files succeeded, want mismatch error")
+	}
+	single := baseStack()
+	if _, err := Compute(single); err == nil {
+		t.Error("Compute() with no contents for one file succeeded, want mismatch error")
+	}
+}
+
+func TestComputeIgnoreServicesWithUnsetServices(t *testing.T) {
+	// Services unset: the deployed set is "everything the compose files
+	// define minus ignore_services" — the hash must react to ignore changes
+	// even though the effective list cannot be enumerated here.
+	base := baseStack()
+	base.Services = nil
+	baseHash, err := Compute(base, []byte(baseCompose))
+	if err != nil {
+		t.Fatalf("Compute() error = %v", err)
+	}
+	ignored := base
+	ignored.IgnoreServices = []string{"db"}
+	got, err := Compute(ignored, []byte(baseCompose))
+	if err != nil {
+		t.Fatalf("Compute() (ignored) error = %v", err)
+	}
+	if got == baseHash {
+		t.Error("hash unchanged after adding ignore_services to a services-less stack")
+	}
+
+	// Reordering ignore_services is order-insensitive (a set, like services).
+	reordered := base
+	reordered.IgnoreServices = []string{"db", "app"}
+	first, err := Compute(reordered, []byte(baseCompose))
+	if err != nil {
+		t.Fatalf("Compute() error = %v", err)
+	}
+	reordered.IgnoreServices = []string{"app", "db"}
+	second, err := Compute(reordered, []byte(baseCompose))
+	if err != nil {
+		t.Fatalf("Compute() error = %v", err)
+	}
+	if first != second {
+		t.Error("hash changed after reordering ignore_services (should be a set)")
 	}
 }
 
@@ -263,6 +367,8 @@ func TestComputeComposeErrors(t *testing.T) {
 // TestComputeGoldenVector pins the exact hash of a fixed input. It must only
 // change together with a schemaVersion bump; otherwise the canonical form
 // changed unintentionally and persisted hashes would silently lose meaning.
+// The current vector is the schema-2 form (compose file list, effective
+// services, ignore_services).
 func TestComputeGoldenVector(t *testing.T) {
 	stack := config.Stack{
 		Name:        "web",
@@ -285,7 +391,7 @@ func TestComputeGoldenVector(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Compute() error = %v", err)
 	}
-	const want = "ec270d9f7bbb4f5ab1e216ce92ccc374ce22f97496eb9620faa27fc07575a10c"
+	const want = "05294051bb498074c0e77559aa505d28e3d17afb9a1e6f74848fb5586a08ccd5"
 	if got != want {
 		t.Errorf("golden vector hash = %s, want %s (schemaVersion changed?)", got, want)
 	}

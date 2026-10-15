@@ -4,8 +4,9 @@ package config
 // from the remote checkout and returns the merged stack.
 //
 // Merge semantics per the briefing:
-//   - profiles, env_files, sops_files, vault_paths, hooks.*: concatenated
-//     base-first and de-duplicated (first occurrence wins).
+//   - profiles, env_files, sops_files, vault_paths, hooks.* and
+//     ignore_services: concatenated base-first and de-duplicated (first
+//     occurrence wins).
 //   - services: if the import sets services, the import list replaces the
 //     base list (subset filter); an empty or unset import list means "all"
 //     and keeps the base list.
@@ -21,6 +22,7 @@ func applyImport(base Stack, imp Import) Stack {
 		merged.Name = imp.Name
 	}
 	merged.Profiles = concatDedup(base.Profiles, imp.Profiles)
+	merged.IgnoreServices = concatDedup(base.IgnoreServices, imp.IgnoreServices)
 	merged.EnvFiles = concatDedup(base.EnvFiles, imp.EnvFiles)
 	merged.VaultPaths = concatDedup(base.VaultPaths, imp.VaultPaths)
 	merged.Hooks = Hooks{

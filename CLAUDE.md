@@ -15,7 +15,13 @@ Webhook-Modus mit Graceful Shutdown) und Webhook-Server
 E2E-Integrationstest (`internal/reconciler/e2e_test.go`: echte Git-Repos,
 Fake-docker/sops via PATH, Fake-Vault via httptest), Dockerfile
 (Multi-Stage, alpine + docker-cli/git/ssh), `compose.yaml` für den
-dockops-Container und `README.md`.
+dockops-Container und `README.md`. Phase 6a: Env-File-Realität — generierte
+`<stackDir>/.env` neben der shm `--env-file` (`env.WriteStackEnv`, Self-
+Reference-Skip beim Env-Merge, bewusst NICHT im Stack-Hash: Secret-Rotation
+triggert keinen Deploy), Service-Filter für lokale Stacks (`services` jetzt
+wirksam auch für Basis-Stacks, neu `ignore_services` mit Komodo-Semantik,
+beide im Hash als effective Services) und Compose-Override-Files (neu
+`compose_files`, Multi-`-f` in Listenreihenfolge, Hash über alle Inhalte).
 
 ## Umgebung
 
@@ -29,32 +35,47 @@ dockops-Container und `README.md`.
   Daemon-Modus (Webhook-Server + Poll-Timer, debounced Trigger, Graceful
   Shutdown), slog-JSON auf stdout
 - `internal/config/` — Config-Loader: Root-Config, Stack-Discovery über
-  Include-Globs, Compose-Auto-Detection, Import-Merge, Validierung
+  Include-Globs, Compose-Auto-Detection, Import-Merge, Validierung;
+  Stack-Felder: `services` (auch Basis-Stacks), `ignore_services`
+  (Schnittmenge mit `services` = Validierungsfehler; Import-Merge:
+  services ersetzt, ignore concat+dedup), `compose_files`
+  (Multi-`-f`, exklusiv zu `compose_file`, alle Dateien müssen existieren);
+  Helper `EffectiveComposeFiles`/`EffectiveServices`/`ExcludeServices`
 - `internal/git/` — Git-Manager: Clone-or-Update der Remote-Checkouts über
   die lokal installierte git-Binary (`os/exec`, keine Git-Library)
-- `internal/hash/` — Deterministisches Stack-Hashing (Package `stackhash`):
-  kanonische Serialisierung von Stack + normalisierter Compose-Datei
+- `internal/hash/` — Deterministisches Stack-Hashing (Package `stackhash`,
+  Schema-Version 2): kanonische Serialisierung von Stack (inkl. Compose-
+  File-Liste, effective Services und ignore_services) + normalisierten
+  Compose-Inhalten (einer pro Datei, in `-f`-Reihenfolge)
 - `internal/state/` — State-Store: Deployment-Zustand pro Stack (JSON-Datei,
-  atomar geschrieben)
+  atomar geschrieben; `compose_files` für Multi-File-Prune aufgezeichnet)
 - `internal/dotenv/` — Minimaler dotenv-Dialekt (Parse/Format), geteilt von
-  SOPS-Output, env_files und der erzeugten `--env-file`
+  SOPS-Output, env_files und der erzeugten `--env-file`/Stack-`.env`
 - `internal/secrets/` — `Resolver`-Interface: abstrahiert SOPS-Dateien und
   Vault-Pfade für den Env-Merge
 - `internal/vault/` — Vault-Client für KV v2 über net/http (keine
   Vault-Library): Token/AppRole-Login, ReadKV
 - `internal/sops/` — Entschlüsseln via `sops`-Binary (os/exec), Auflösung
   von age-Keyfiles über SOPS_AGE_KEY_FILE im Child-Prozess
-- `internal/env/` — Env-Merge (env_files < sops < vault < Systemvars) und
-  WriteShm: 0600-Env-Datei in /dev/shm mit idempotentem Cleanup
+- `internal/env/` — Env-Merge (env_files < sops < vault < Systemvars;
+  `<stackDir>/.env` wird als Quelle übersprungen, weil dockops sie selbst
+  generiert), WriteShm (0600-Env-Datei in /dev/shm mit idempotentem
+  Cleanup) und WriteStackEnv (atomare 0600-`<stackDir>/.env` mit Rollback:
+  restore-or-remove; bewusst nicht im Stack-Hash)
 - `internal/hooks/` — Hook-Engine: sequenzielle `sh -c`-Ausführung mit
   Per-Kommando-Timeout (Prozessgruppen-Kill) und slog-Output
 - `internal/compose/` — Compose-Executor: `docker compose up/down` mit
-  deterministischem Projektnamen (`-p <stack-name>`), plus `DownProject`
-  (Prune ohne Compose-Datei)
+  deterministischem Projektnamen (`-p <stack-name>`), einem `-f` pro
+  Compose-Datei in Listenreihenfolge, Service-Filter als positionale
+  Argumente (services minus ignore_services; ohne services: Service-Namen
+  der Compose-Dateien minus ignore, "alles ignoriert" = Fehler), plus
+  `DownProject` (Prune ohne Compose-Datei)
 - `internal/reconciler/` — Reconciliation-Loop: verdrahtet git, config,
   hash, state, secrets (Vault-Login einmal pro Durchlauf), env, hooks und
   compose zu einem idempotenten Durchlauf mit Prune und `errors.Join`;
-  Git/Compose/Hooks/Sops/Vault als injizierbare Interfaces für Tests
+  schreibt vor jedem compose-Aufruf die generierte `<stackDir>/.env`
+  (Rollback nur bei Up-Fehler); Git/Compose/Hooks/Sops/Vault als
+  injizierbare Interfaces für Tests
 - `internal/webhook/` — Webhook-HTTP-Handler: `POST /webhook` mit
   GitHub-HMAC-SHA256 (`X-Hub-Signature-256`) oder GitLab-Token
   (`X-Gitlab-Token`), konstante Vergleiche, `GET /healthz`
@@ -73,6 +94,7 @@ dockops-Container und `README.md`.
 - `PHASE2_TASK.md` — Aufgabenstellung (nicht ändern)
 - `PHASE3_TASK.md` — Aufgabenstellung (nicht ändern)
 - `PHASE4_TASK.md` — Aufgabenstellung (nicht ändern)
+- `PHASE6A_TASK.md` — Aufgabenstellung (nicht ändern)
 
 ## Konventionen
 

@@ -343,7 +343,7 @@ profiles:
 services:
   - app
 env_files:
-  - .env
+  - base.env
 `
 		if extraEnvFile {
 			yaml += "  - extra.env\n"
@@ -364,7 +364,10 @@ hooks:
 	host.write("stacks.yaml", rootYAML(true))
 	host.write("web/stack.yaml", webStack(false))
 	host.write("web/compose.yaml", "services:\n  app:\n    image: nginx:1.27\n    environment:\n      FROM_ENV: ${FROM_ENV}\n")
-	host.write("web/.env", "FROM_ENV=plain-value\n")
+	host.write("web/base.env", "FROM_ENV=plain-value\n")
+	// A committed .env (a stale artifact of an earlier tool or deployment)
+	// must NOT be read as an env_files source — dockops regenerates it.
+	host.write("web/.env", "STALE=stale-value\n")
 	host.write("web/secrets.env", "SOPS_SECRET=sops-value\n")
 
 	shared.write("monitoring/stack.yaml", "name: monitoring\nprofiles:\n  - full\nservices:\n  - prometheus\n  - grafana\n")
@@ -434,6 +437,34 @@ hooks:
 		if got := dumps[0][k]; got != want {
 			t.Errorf("pass 1 web env[%s] = %q, want %q", k, got, want)
 		}
+	}
+	// The committed .env was skipped as a source (it is regenerated), so
+	// its stale value never reaches the merge.
+	if stale, ok := dumps[0]["STALE"]; ok && stale != "" {
+		t.Errorf("pass 1 web env[STALE] = %q, want absent (stack-dir .env is skipped as a source)", stale)
+	}
+
+	// The generated stack-dir .env exists right after the pass and carries
+	// the same merged environment — the file compose's env_file: ./.env
+	// references and ${...} interpolation resolve against.
+	stackEnvRaw, err := os.ReadFile(filepath.Join(webDir, ".env"))
+	if err != nil {
+		t.Fatalf("read generated stack .env: %v", err)
+	}
+	stackEnv := dotenv.Parse(stackEnvRaw)
+	for k, want := range map[string]string{
+		"FROM_ENV":     "plain-value",
+		"SOPS_SECRET":  "sops-value",
+		"VAULT_SECRET": "vault-value",
+		"STACK_NAME":   "web",
+		"GIT_COMMIT":   hostCommit1,
+	} {
+		if got := stackEnv[k]; got != want {
+			t.Errorf("pass 1 generated stack .env[%s] = %q, want %q", k, got, want)
+		}
+	}
+	if info, err := os.Stat(filepath.Join(webDir, ".env")); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("generated stack .env permissions = %v, %v; want 0600", info, err)
 	}
 	if got := dumps[1]["GIT_COMMIT"]; got != sharedCommit {
 		t.Errorf("pass 1 import env[GIT_COMMIT] = %q, want %q (commit of the shared checkout)", got, sharedCommit)

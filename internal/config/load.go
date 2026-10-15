@@ -374,6 +374,12 @@ func loadImportStack(g Global, imp Import) (Stack, error) {
 	if merged.Name == "" {
 		merged.Name = filepath.Base(dir)
 	}
+	// Re-validate after the merge: services/ignore_services can only
+	// become contradictory through the combination of base and import
+	// (e.g. import ignore_services hitting base services).
+	if err := validateStack(&merged); err != nil {
+		return Stack{}, fmt.Errorf("%s: %w", file, err)
+	}
 	if err := resolveComposeFile(&merged, g.ComposeFilePatterns); err != nil {
 		return Stack{}, fmt.Errorf("%s: %w", file, err)
 	}
@@ -410,26 +416,74 @@ func findImportStackFile(dir string) (string, error) {
 	}
 }
 
-// validateStack checks required fields within a parsed stack definition.
+// validateStack checks required fields and cross-field semantics within a
+// parsed stack definition.
 func validateStack(s *Stack) error {
 	for i, sf := range s.SopsFiles {
 		if sf.Path == "" {
 			return fmt.Errorf("sops_files[%d]: path is required", i)
 		}
 	}
+	if overlap := overlapSorted(s.Services, s.IgnoreServices); len(overlap) > 0 {
+		return fmt.Errorf("services and ignore_services overlap in %v (a service cannot be both deployed and ignored)", overlap)
+	}
 	return nil
 }
 
-// resolveComposeFile sets stack.ComposeFile either from the explicit
-// compose_file (which must exist) or by auto-detecting the first existing
-// candidate from composeFilePatterns in the stack directory.
+// overlapSorted returns the entries present in both lists, sorted for
+// reproducible validation errors.
+func overlapSorted(a, b []string) []string {
+	set := make(map[string]struct{}, len(b))
+	for _, v := range b {
+		set[v] = struct{}{}
+	}
+	var out []string
+	for _, v := range a {
+		if _, ok := set[v]; ok {
+			out = append(out, v)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// resolveComposeFile sets the stack's compose file paths: the multi-file
+// compose_files list (each entry must exist) when given, otherwise
+// stack.ComposeFile either from the explicit compose_file (which must
+// exist) or auto-detected as the first existing candidate from
+// composeFilePatterns in the stack directory.
 //
 // Decisions where the briefing is silent (kept conservative):
-//   - an explicit compose_file must exist regardless of `enabled`,
+//   - an explicit compose_file must exist regardless of `enabled`; the same
+//     holds for every compose_files entry,
 //   - if auto-detection finds nothing, only enabled stacks fail — disabled
 //     stacks stay without a compose file since they are never deployed,
-//   - relative compose_file paths resolve against the stack directory.
+//   - relative paths resolve against the stack directory,
+//   - compose_files and compose_file are mutually exclusive, and an
+//     explicitly empty compose_files list is rejected instead of silently
+//     falling back to auto-detection (a clear error beats a surprise).
 func resolveComposeFile(stack *Stack, composeFilePatterns []string) error {
+	if stack.ComposeFile != "" && len(stack.ComposeFiles) > 0 {
+		return fmt.Errorf("compose_file and compose_files are mutually exclusive (set only one)")
+	}
+	if stack.ComposeFiles != nil && len(stack.ComposeFiles) == 0 {
+		return fmt.Errorf("compose_files must list at least one file (unset the key to use compose_file or auto-detection)")
+	}
+	if len(stack.ComposeFiles) > 0 {
+		resolved := make([]string, 0, len(stack.ComposeFiles))
+		for i, f := range stack.ComposeFiles {
+			p := f
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(stack.Dir, p)
+			}
+			if !regularFileExists(p) {
+				return fmt.Errorf("compose_files[%d] %q not found (expected at %s)", i, f, p)
+			}
+			resolved = append(resolved, p)
+		}
+		stack.ComposeFiles = resolved
+		return nil
+	}
 	if stack.ComposeFile != "" {
 		p := stack.ComposeFile
 		if !filepath.IsAbs(p) {

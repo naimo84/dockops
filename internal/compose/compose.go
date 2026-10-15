@@ -1,16 +1,24 @@
 // Package compose drives the docker compose CLI to bring stacks up and
 // down. It builds explicit, deterministic command lines — project name from
-// the stack name, one -f, one --env-file — and never parses running state;
-// change detection is the stack hash's job (internal/hash).
+// the stack name, one -f per compose file, one --env-file — and never
+// parses running state; change detection is the stack hash's job
+// (internal/hash). The one exception is the service filter: when a stack
+// ignores services without naming the ones to keep, the compose files' own
+// service names are read (they describe the desired state, not the running
+// one) to materialize "all but ignored" as positional arguments.
 package compose
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/local/dockops/internal/config"
 )
@@ -43,43 +51,43 @@ func New(logger *slog.Logger, binary string) *Executor {
 
 // Up brings the stack up detached:
 //
-//	<binary> compose -p <stack.Name> -f <composeFile> [--profile p ...]
+//	<binary> compose -p <stack.Name> [-f <file> ...] [--profile p ...]
 //	         --env-file <envFile> up -d --remove-orphans [service ...]
 //
 // The explicit -p makes project names deterministic (stack name instead of
-// a directory-derived default). Profiles and services are appended in their
-// configured order; services are positional arguments — docker compose takes
-// them without a preceding "--".
+// a directory-derived default). One -f is passed per compose file — either
+// the multi-file compose_files configuration or the single compose_file —
+// in their configured order (compose merge rules apply, later files win).
+// Profiles are appended in their configured order; the service filter
+// (services minus ignore_services, see upServices) yields the positional
+// service arguments — docker compose takes them without a preceding "--".
 func (e *Executor) Up(ctx context.Context, stack config.Stack, stackDir, envFile string) error {
-	args := []string{
-		"compose",
-		"-p", stack.Name,
-		"-f", composeFilePath(stack, stackDir),
-	}
+	args := []string{"compose", "-p", stack.Name}
+	args = append(args, composeFileArgs(stack, stackDir)...)
 	for _, profile := range stack.Profiles {
 		args = append(args, "--profile", profile)
 	}
 	args = append(args, "--env-file", envFile)
 	args = append(args, "up", "-d", "--remove-orphans")
-	args = append(args, stack.Services...)
+	services, err := upServices(stack, stackDir)
+	if err != nil {
+		return err
+	}
+	args = append(args, services...)
 	return e.run(ctx, args)
 }
 
 // Down stops and removes the stack (used for pruning removed stacks):
 //
-//	<binary> compose -p <stack.Name> -f <composeFile> --env-file <envFile>
+//	<binary> compose -p <stack.Name> [-f <file> ...] --env-file <envFile>
 //	         down --remove-orphans
 //
 // envFile is passed so variable interpolation in the compose file resolves
 // identically to Up; profiles and services are irrelevant for teardown.
 func (e *Executor) Down(ctx context.Context, stack config.Stack, stackDir, envFile string) error {
-	args := []string{
-		"compose",
-		"-p", stack.Name,
-		"-f", composeFilePath(stack, stackDir),
-		"--env-file", envFile,
-		"down", "--remove-orphans",
-	}
+	args := []string{"compose", "-p", stack.Name}
+	args = append(args, composeFileArgs(stack, stackDir)...)
+	args = append(args, "--env-file", envFile, "down", "--remove-orphans")
 	return e.run(ctx, args)
 }
 
@@ -97,14 +105,94 @@ func (e *Executor) DownProject(ctx context.Context, project string) error {
 	return e.run(ctx, []string{"compose", "-p", project, "down", "--remove-orphans"})
 }
 
-// composeFilePath returns the compose file to pass to -f: the stack's
-// resolved ComposeFile when absolute (the config loader resolves it),
-// otherwise ComposeFile joined below stackDir.
-func composeFilePath(stack config.Stack, stackDir string) string {
-	if stack.ComposeFile == "" || filepath.IsAbs(stack.ComposeFile) {
-		return stack.ComposeFile
+// composeFileArgs returns the -f arguments for every compose file of the
+// stack, in order: the effective file list (multi-file compose_files
+// configuration, resolved absolute by the config loader) or the single
+// ComposeFile, each joined below stackDir when relative (hand-constructed
+// stacks may carry relative paths).
+func composeFileArgs(stack config.Stack, stackDir string) []string {
+	files := stack.EffectiveComposeFiles()
+	args := make([]string, 0, len(files)*2)
+	for _, f := range files {
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(stackDir, f)
+		}
+		args = append(args, "-f", f)
 	}
-	return filepath.Join(stackDir, stack.ComposeFile)
+	return args
+}
+
+// upServices returns the positional service arguments for compose up:
+// docker compose has no native exclude flag, so ignore_services is
+// materialized as a set difference here.
+//
+//	services set       → services minus ignore_services
+//	services unset, no ignore → nil (deploy every service)
+//	services unset, ignore set → every service name of the compose files
+//	                           minus ignore_services
+//
+// A result that would deploy nothing is an error — passing no positional
+// argument would silently deploy everything, the exact opposite of the
+// configured filter.
+func upServices(stack config.Stack, stackDir string) ([]string, error) {
+	if len(stack.Services) > 0 {
+		effective := config.ExcludeServices(stack.Services, stack.IgnoreServices)
+		if len(effective) == 0 {
+			return nil, fmt.Errorf("stack %s: every configured service is in ignore_services: %v", stack.Name, stack.Services)
+		}
+		return effective, nil
+	}
+	if len(stack.IgnoreServices) == 0 {
+		return nil, nil
+	}
+	all, err := composeServiceNames(stack, stackDir)
+	if err != nil {
+		return nil, fmt.Errorf("stack %s: resolve ignore_services: %w", stack.Name, err)
+	}
+	effective := config.ExcludeServices(all, stack.IgnoreServices)
+	if len(effective) == 0 {
+		return nil, fmt.Errorf("stack %s: ignore_services covers every service of the compose files: %v", stack.Name, all)
+	}
+	return effective, nil
+}
+
+// composeServiceNames parses the top-level services mapping of every
+// compose file and returns the union of the service names, sorted. docker
+// compose itself merges the files; only the names are needed here.
+//
+// Conservative decisions: "all services" means every top-level services key
+// across all files — whether a service actually starts also depends on its
+// profiles, which stays compose's business — and a file whose parsing fails
+// is an error (docker compose would reject it too, with a worse message).
+func composeServiceNames(stack config.Stack, stackDir string) ([]string, error) {
+	seen := make(map[string]struct{})
+	var names []string
+	for _, f := range stack.EffectiveComposeFiles() {
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(stackDir, f)
+		}
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", f, err)
+		}
+		var doc struct {
+			Services map[string]any `yaml:"services"`
+		}
+		// Non-strict decoding on purpose: only the top-level service names
+		// are of interest, the rest of the document is compose's to parse.
+		if err := yaml.Unmarshal(raw, &doc); err != nil {
+			return nil, fmt.Errorf("parse %s: %w", f, err)
+		}
+		for name := range doc.Services {
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 // run executes the composed command line, logs it with its combined output
