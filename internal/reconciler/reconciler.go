@@ -248,7 +248,9 @@ func New(deps Deps) *Reconciler {
 //  2. clone-or-update every configured remote,
 //  3. load the full configuration (local discovery + import merge),
 //  4. deploy every enabled stack whose hash changed (secrets, env file,
-//     pre_deploy hooks, compose up, post_deploy hooks, state),
+//     pre_deploy hooks, compose up, post_deploy hooks, state — persisted
+//     per stack immediately, so an interrupted pass cannot leave deployed
+//     stacks unrecorded),
 //  5. prune stacks that disappeared from the configuration, and
 //  6. persist the state file.
 //
@@ -359,8 +361,10 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		errs = append(errs, r.prune(ctx, cfg)...)
 	}
 
-	// 6. Persist all recorded state changes (deployed, failed, pruned) in
-	// one atomic write; a failure to persist is itself a pass error.
+	// 6. Persist the state. Deployments and failures are already saved per
+	// stack the moment they are recorded (see deployStack and markFailed),
+	// so this write persists the prunes and any stragglers; a failure to
+	// persist is itself a pass error.
 	if err := r.state.Save(); err != nil {
 		errs = append(errs, fmt.Errorf("reconciler: save state: %w", err))
 	}
@@ -476,13 +480,23 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	}); err != nil {
 		return fmt.Errorf("stack %s: record state: %w", stack.Name, err)
 	}
+	// Persist immediately instead of waiting for the end-of-pass save: a
+	// pass that dies before it (crash, kill, failing disk) must not leave
+	// the state file without the deployments that already happened. The
+	// next pass would otherwise redeploy unchanged stacks ("Recreate"
+	// despite an identical hash) and forget stacks that were since removed
+	// from the configuration — no prune, no compose down (phase-6c bugs).
+	if err := r.state.Save(); err != nil {
+		return errors.Join(postErr, fmt.Errorf("stack %s: persist state: %w", stack.Name, err))
+	}
 	return postErr
 }
 
 // markFailed records a failed deployment attempt so the next pass retries
 // the stack even when its hash is unchanged (state.Changed treats every
-// non-deployed status as changed). The bookkeeping itself must never mask
-// the original failure, so a Set error is only logged.
+// non-deployed status as changed), and persists the record immediately (see
+// the per-stack save in deployStack). The bookkeeping itself must never mask
+// the original failure, so Set and Save errors are only logged.
 func (r *Reconciler) markFailed(stack config.Stack, newHash string) {
 	if err := r.state.Set(stack.Name, state.State{
 		Hash:         newHash,
@@ -492,6 +506,10 @@ func (r *Reconciler) markFailed(stack config.Stack, newHash string) {
 		ComposeFiles: stack.ComposeFiles,
 	}); err != nil {
 		r.logger.Error("cannot record failed state", "stack", stack.Name, "error", err)
+		return
+	}
+	if err := r.state.Save(); err != nil {
+		r.logger.Error("cannot persist failed state", "stack", stack.Name, "error", err)
 	}
 }
 
@@ -521,17 +539,31 @@ func (r *Reconciler) prune(ctx context.Context, cfg *config.Config) []error {
 	return errs
 }
 
-// pruneStack tears one removed stack down. When the persisted compose files
-// all still exist, the full Down command line runs — with every -f the
-// stack was deployed from, so the merged configuration matches the one the
-// services were created with. An empty env file stands in for the secrets,
-// which are gone with the stack definition; down only interpolates, it does
-// not need the values. Otherwise (the checkout directory vanished with the
-// stack, or any compose file is missing) the briefing's fallback runs:
-// docker compose -p <name> down --remove-orphans without -f, which may fail
-// depending on the docker compose version; the failure is returned to the
-// caller for logging and retry.
+// pruneStack tears one removed stack down, covering every shape a state
+// entry can have (phase 6c: none of the cases may abort the pass):
+//
+//   - compose files all on disk → the full Down command line runs, with
+//     every -f the stack was deployed from, so the merged configuration
+//     matches the one the services were created with. An empty env file
+//     stands in for the secrets, which are gone with the stack definition;
+//     down only interpolates, it does not need the values.
+//   - compose file recorded but gone (the checkout directory vanished with
+//     the stack, or any file is missing) → the briefing's fallback runs:
+//     docker compose -p <name> down --remove-orphans without -f, which may
+//     fail depending on the docker compose version; the failure is returned
+//     to the caller for logging and retry.
+//   - no compose file recorded at all ("ohne jegliche Spur", e.g. a state
+//     file written before those fields existed) → there is no evidence the
+//     project ever existed; shelling out would either do nothing or — on
+//     docker compose versions that insist on -f — fail forever and keep the
+//     entry in an endless retry loop. The entry is dropped with a warning
+//     instead.
 func (r *Reconciler) pruneStack(ctx context.Context, name string, st state.State) error {
+	if len(st.ComposeFiles) == 0 && st.ComposeFile == "" {
+		r.logger.Warn("state entry without compose file traces; removing entry without teardown",
+			"stack", name, "hint", "if containers of this stack are still running, remove them manually")
+		return nil
+	}
 	if len(st.ComposeFiles) > 0 {
 		if st.StackDir == "" || !allRegularFiles(st.ComposeFiles) {
 			return r.compose.DownProject(ctx, name)

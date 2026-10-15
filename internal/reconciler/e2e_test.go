@@ -546,6 +546,18 @@ hooks:
 	host.remove("hookfail")
 	host.write("stacks.yaml", rootYAML(false))
 	host.commit("remove web, hookfail and the import")
+	// Phase 6c: delete the stack folders completely — all files, the
+	// generated .env, the directory itself — as the livetest run showed it
+	// (reset --hard + clean -fd leave nothing behind). Prune must tear the
+	// stacks down by project name alone.
+	for _, dir := range []string{
+		filepath.Join(workDir, "host", "web"),
+		filepath.Join(workDir, "host", "hookfail"),
+	} {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatalf("remove checkout stack dir %s: %v", dir, err)
+		}
+	}
 
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("pass 5 Reconcile() error = %v", err)

@@ -31,7 +31,17 @@ Syntax `env.RenderVaultTemplate` für `${VAULT:path#key}`/`${VAULT:path:key}`
 mit neuem Stack-Feld `vault_env_templates` (gleiche Prioritätsstufe wie
 vault_paths, Import-Merge concat+dedup, Hash Schema v3) und
 `secrets.VaultReader`; Image `cmd/sops-sidecar/Dockerfile.sidecar`, sops-
-Profil in der `compose.yaml`, README-Abschnitt „SOPS decryption“.
+Profil in der `compose.yaml`, README-Abschnitt „SOPS decryption“. Phase 6c:
+Bugfixes aus dem devbox-Livetest — State-Persistenz jetzt pro Stack sofort
+nach jeder Aufzeichnung (`deployStack`/`markFailed` sichern per `state.Save`
+ab, nicht erst am Pass-Ende: ein abgebrochener Durchlauf kann deployte
+Stacks nicht mehr „vergessen“, sonst Recreate bei identischem Hash und
+vergessener Prune), Prune robuster in `pruneStack` (Compose-Files da →
+`down` mit allen `-f`; File(s) weg → `DownProject` nur `-p`; Eintrag ohne
+Compose-Spuren → State-Remove mit Warnung, ohne compose-Aufruf), Regressions-
+Tests in `internal/reconciler/phase6c_test.go` (Prune-Fälle a/b/c,
+Skip-über-Prune-Pass, unterbrochener Pass mit Restart) und E2E-Pass 5 löscht
+die Stack-Ordner im Checkout komplett.
 
 ## Umgebung
 
@@ -103,16 +113,27 @@ Profil in der `compose.yaml`, README-Abschnitt „SOPS decryption“.
   vault_paths ODER vault_env_templates hat), env, hooks und compose zu
   einem idempotenten Durchlauf mit Prune und `errors.Join`; schreibt vor
   jedem compose-Aufruf die generierte `<stackDir>/.env` (Rollback nur bei
-  Up-Fehler); Git/Compose/Hooks/Sops/Vault als injizierbare Interfaces für
-  Tests, `Deps.SopsSidecarURL` schaltet die sops_files-Dekryptierung auf
-  den Sidecar um (injiziertes Sops gewinnt)
+  Up-Fehler); State-Aufzeichnungen (deployed/failed) werden pro Stack
+  SOFORT persistiert (`state.Save` direkt nach jedem `Set`, Final-Save am
+  Pass-Ende deckt die Prunes ab — Phase 6c); `pruneStack` unterscheidet
+  drei Fälle: Compose-Files vorhanden → `down` mit allen `-f`, Files weg →
+  `DownProject` nur mit `-p`, Eintrag ohne Compose-Spuren → State-Remove
+  mit Warnung ohne compose-Aufruf; Git/Compose/Hooks/Sops/Vault als
+  injizierbare Interfaces für Tests, `Deps.SopsSidecarURL` schaltet die
+  sops_files-Dekryptierung auf den Sidecar um (injiziertes Sops gewinnt)
+- `internal/reconciler/phase6c_test.go` — Phase-6c-Regressionstests: die
+  drei Prune-Fälle (a/b/c), Skip-über-Prune-Pass (identischer Hash deployt
+  nicht neu) und der unterbrochene Pass (State-Dir wird mid-Pass read-only,
+  Restart aus der Datei — ohne per-Stack-Persistenz Recreate + vergessener
+  Prune, danach grün)
 - `internal/webhook/` — Webhook-HTTP-Handler: `POST /webhook` mit
   GitHub-HMAC-SHA256 (`X-Hub-Signature-256`) oder GitLab-Token
   (`X-Gitlab-Token`), konstante Vergleiche, `GET /healthz`
 - `internal/reconciler/e2e_test.go` — E2E-Integrationstest: komplette
   Reconcile-Durchläufe gegen Bare-Repos (Host + Shared-Remote), Fake-
   `docker`/`sops`-Skripte via PATH-Override, Fake-Vault via
-  `httptest.Server`
+  `httptest.Server`; Pass 5 löscht die Stack-Ordner im Checkout komplett
+  (Prune muss per `DownProject` funktionieren)
 - `Dockerfile` — Multi-Stage-Build (statisches Binary, alpine-Runtime mit
   docker-cli + compose-Plugin, git, openssh-client, CA-Certs; bewusst KEIN
   sops — Decrypt-Last trägt der Sidecar)
@@ -134,6 +155,7 @@ Profil in der `compose.yaml`, README-Abschnitt „SOPS decryption“.
 - `PHASE4_TASK.md` — Aufgabenstellung (nicht ändern)
 - `PHASE6A_TASK.md` — Aufgabenstellung (nicht ändern)
 - `PHASE6B_TASK.md` — Aufgabenstellung (nicht ändern)
+- `PHASE6C_TASK.md` — Aufgabenstellung (nicht ändern)
 
 ## Konventionen
 

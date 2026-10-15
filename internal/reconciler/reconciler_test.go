@@ -73,9 +73,16 @@ type fakeCompose struct {
 	failUpFor         string
 	failDownFor       string
 	failDownProjectAt string
+	// onUp, when set, runs synchronously at the start of every Up with the
+	// stack name — tests use it to inject mid-pass effects (e.g. making
+	// the state directory unwritable to simulate an interrupted pass).
+	onUp func(name string)
 }
 
 func (f *fakeCompose) Up(_ context.Context, stack config.Stack, stackDir, envFile string) error {
+	if f.onUp != nil {
+		f.onUp(stack.Name)
+	}
 	call := upCall{stack: stack, stackDir: stackDir, envFile: envFile}
 	if info, err := os.Stat(envFile); err == nil && info.Mode().IsRegular() {
 		call.envExists = true
