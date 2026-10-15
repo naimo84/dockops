@@ -206,8 +206,10 @@ gemergte Umgebung des Stacks (inkl. Secrets) sowie `STACK_NAME`,
 ## Ablauf eines Reconcile-Durchlaufs
 
 1. **Host-Repo aktualisieren**: clone-or-update von `-repo`/`-branch` nach
-   `<work_dir>/host` (`git fetch` + `reset --hard` + `clean -fd` — der
-   Checkout ist maschinell verwalteter Zustand).
+   `<work_dir>/host` — bei vorhandenem Checkout werden lokale Änderungen
+   zuerst als WIP-Stash gesichert (siehe [WIP-Auto-Stash](#wip-auto-stash)),
+   dann `git fetch` + `reset --hard` + `clean -fd` (der Checkout ist
+   maschinell verwalteter Zustand).
 2. **Root-Config lesen** (`stacks.yaml` im Host-Repo) und alle
    **Shared-Remotes** nach `<work_dir>/<remote>` clone-odern/updaten.
 3. **Komplette Config laden**: lokale Stacks via Include-Globs entdecken,
@@ -236,6 +238,36 @@ gemergte Umgebung des Stacks (inkl. Secrets) sowie `STACK_NAME`,
 6. **State atomar persistieren**; alle aufgetretenen Fehler werden
    gesammelt und als ein Fehler zurückgegeben (`errors.Join`) — ein
    kaputter Stack verhindert die Reconciliation der anderen nie.
+
+## WIP-Auto-Stash
+
+Nutzer editieren gelegentlich direkt auf dem Host im Checkout des Host-Repos
+(z.B. `/var/lib/dockops/repos/host`). Der deterministische Update-Pfad
+(`fetch` + `reset --hard` + `clean -fd`) würde diese Änderungen
+kommentarlos vernichten — deshalb legt dockops sie vorher auf das
+Stash-Regal. Das gilt für jeden von dockops verwalteten Checkout (Host-Repo
+und Shared-Remotes):
+
+- Vor dem Update prüft `EnsureRepo` den Worktree per `git status --porcelain`.
+- Ist er dirty (modifiziert ODER untracked), läuft vorher
+  `git stash push --include-untracked -m "dockops-wip: <RFC3339-Timestamp>"`
+  plus ein INFO-Log mit Hinweis auf die Wiederherstellung.
+- Der Stash wird bewusst **nie automatisch angewendet** — `git stash pop` ist
+  Handarbeit: Merge-Konflikte dürfen einen Deploy niemals blockieren.
+- Schlägt das Stash fehl, gibt es nur ein WARN-Log und es wird wie bisher
+  zurückgesetzt (gleiches Verhalten wie vor der Absicherung).
+
+Wiederherstellen der Änderungen:
+
+    cd <work_dir>/<repo>
+    git stash list   # Einträge "dockops-wip: <Timestamp>" suchen
+    git stash pop    # oder drop, wenn die Änderungen verworfen werden sollen
+
+Hinweis: Die von dockops generierten `<stackDir>/.env`-Dateien sind untracked
+und landen daher ebenfalls im Stash, bevor sie der Reset entfernt. Das ist
+harmlos — die `.env` wird vor jedem Deploy neu geschrieben —, bedeutet aber,
+dass pro dirty Durchlauf ein Stash-Eintrag entsteht. Nicht benötigte Einträge
+lassen sich per `git stash drop` / `git stash clear` aufräumen.
 
 ## Secret-Auflösung & Priorität
 

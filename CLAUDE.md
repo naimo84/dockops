@@ -41,7 +41,13 @@ vergessener Prune), Prune robuster in `pruneStack` (Compose-Files da →
 Compose-Spuren → State-Remove mit Warnung, ohne compose-Aufruf), Regressions-
 Tests in `internal/reconciler/phase6c_test.go` (Prune-Fälle a/b/c,
 Skip-über-Prune-Pass, unterbrochener Pass mit Restart) und E2E-Pass 5 löscht
-die Stack-Ordner im Checkout komplett.
+die Stack-Ordner im Checkout komplett. Phase 7: WIP-Auto-Stash — `internal/git`
+sichert lokale (Host-seitige) Änderungen vor dem deterministischen Reset:
+`stashWIP` prüft im Update-Pfad von `EnsureRepo` vor fetch/reset/clean den
+Worktree per `git status --porcelain` und stasht Dirty-State inkl. untracked
+als `dockops-wip: <RFC3339>` (INFO-Log mit Restore-Hint; Stash-Fehler nur
+WARN ohne Abbruch; bewusst kein Auto-Pop — Restore per `git stash list`/`pop`
+ist Handarbeit, Konflikte dürfen Deploys nie blockieren).
 
 ## Umgebung
 
@@ -69,7 +75,14 @@ die Stack-Ordner im Checkout komplett.
   relativ zum Stack-Dir, Auflösung im Env-Merge);
   Helper `EffectiveComposeFiles`/`EffectiveServices`/`ExcludeServices`
 - `internal/git/` — Git-Manager: Clone-or-Update der Remote-Checkouts über
-  die lokal installierte git-Binary (`os/exec`, keine Git-Library)
+  die lokal installierte git-Binary (`os/exec`, keine Git-Library); im
+  Update-Pfad sichert `stashWIP` dirty Worktrees (inkl. untracked) vor
+  `reset --hard`/`clean -fd` als `dockops-wip:`-Stash (Fehler nur WARN,
+  kein Abbruch, kein Auto-Pop)
+- `internal/git/phase7_test.go` — Phase-7-Regressionstests: WIP-Auto-Stash
+  (dirty tracked File im Stash + Reset + INFO-Log, untracked File per
+  `stash pop` verifiziert, clean Worktree ohne Stash-Eintrag, Stash-Failure
+  via git-PATH-Wrapper ohne EnsureRepo-Fehler)
 - `internal/hash/` — Deterministisches Stack-Hashing (Package `stackhash`,
   Schema-Version 3): kanonische Serialisierung von Stack (inkl. Compose-
   File-Liste, effective Services, ignore_services und

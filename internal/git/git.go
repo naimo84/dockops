@@ -19,11 +19,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // gitBinary is the name of the git executable used for every command. It is
 // resolved through PATH once, when a Manager is created.
 const gitBinary = "git"
+
+// wipStashPrefix marks the stash entries dockops creates automatically before
+// resetting a dirty checkout, so operators can tell them apart from manual
+// stashes. The remainder of the message is an RFC3339 timestamp.
+const wipStashPrefix = "dockops-wip: "
 
 // maxErrorOutput bounds how much command output is embedded into an error
 // message so failures stay readable while still carrying the essential git
@@ -66,9 +72,13 @@ func New(workDir string, logger *slog.Logger) (*Manager, error) {
 //
 // Clone when the directory does not exist or is empty; otherwise the
 // checkout is made deterministic with exactly the sequence prescribed by the
-// briefing: git fetch origin <branch>, git reset --hard origin/<branch>,
-// git clean -fd. Local modifications and untracked files are discarded on
-// purpose — the checkout is machine-managed state.
+// briefing: WIP auto-stash if dirty (see stashWIP), git fetch origin
+// <branch>, git reset --hard origin/<branch>, git clean -fd. Local
+// modifications and untracked files are pushed onto the git stash before the
+// reset discards them from the working tree — host-side edits survive on the
+// stash shelf but are never re-applied automatically (conflicts must never
+// block a deploy). With a clean worktree the update is identical to
+// fetch + reset + clean alone.
 //
 // A non-empty directory without a .git entry is refused instead of
 // overwritten (conservative choice: never destroy data we did not create).
@@ -104,6 +114,7 @@ func (m *Manager) EnsureRepo(name, url, branch string) (string, error) {
 			return "", err
 		}
 		m.logger.Info("updating repository", "name", name, "branch", branch, "path", path)
+		m.stashWIP(path, name)
 		if _, err := m.runGit(path, "fetch", "origin", branch); err != nil {
 			return "", err
 		}
@@ -137,6 +148,39 @@ func (m *Manager) HeadCommit(repoPath string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// stashWIP protects host-side edits in the checkout at path from the
+// deterministic reset that follows: if the working tree is dirty (modified
+// or untracked files), all changes are pushed onto the git stash with a
+// "dockops-wip: <RFC3339>" message before fetch/reset/clean run.
+//
+// Failures never propagate: a broken status check or a failing stash is
+// logged as a warning and the update continues exactly as it did before the
+// stash existed (reset --hard then behaves like today). The stash is also
+// deliberately never applied or popped again — restore is a manual
+// operator action (`git stash list` / `git stash pop`) so merge conflicts
+// can never block a deploy.
+func (m *Manager) stashWIP(path, name string) {
+	out, err := m.runGit(path, "status", "--porcelain")
+	if err != nil {
+		// A repository this broken fails again, with context, in fetch or
+		// reset below; skipping the stash preserves today's error behavior.
+		m.logger.Warn("checking for local changes failed, skipping WIP stash", "name", name, "path", path, "error", err)
+		return
+	}
+	if strings.TrimSpace(string(out)) == "" {
+		m.logger.Debug("worktree clean, no WIP stash needed", "name", name, "path", path)
+		return
+	}
+	message := wipStashPrefix + time.Now().Format(time.RFC3339)
+	if _, err := m.runGit(path, "stash", "push", "--include-untracked", "-m", message); err != nil {
+		m.logger.Warn("WIP stash failed, resetting anyway (local changes may be lost)", "name", name, "path", path, "error", err)
+		return
+	}
+	m.logger.Info("stashed local changes before reset",
+		"name", name, "path", path, "stash_message", message,
+		"restore_hint", "git stash list / git stash pop in the checkout")
 }
 
 // validateName rejects repository names that would escape the work directory
