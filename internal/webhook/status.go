@@ -5,15 +5,20 @@
 //
 // Robustness beats precision here: a broken docker command degrades exactly
 // the affected part of the payload (a stack's drift becomes "unknown", the
-// unmanaged listing becomes a top-level error field) while the endpoint
-// keeps answering 200 — monitoring must not lose every stack because one
-// stack's ps failed.
+// unmanaged listing becomes a top-level error field) while the report
+// keeps answering — monitoring must not lose every stack because one
+// stack's ps failed. The document assembly lives in the exported
+// BuildStatus so the HTTP handler and the CLI's -print-status mode share
+// one implementation.
 package webhook
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -39,45 +44,64 @@ const (
 // is set.
 const bearerPrefix = "Bearer "
 
-// statusDeps carries the /status collaborators extracted from Deps.
-type statusDeps struct {
-	state       *state.Store
-	compose     ComposeLister
-	repoURL     string
-	branch      string
-	headCommit  func() (string, error)
-	selfProject string
-	token       string
+// StatusDeps carries the /status collaborators: the status subset of Deps,
+// extractable so the CLI's one-shot mode (-print-status) builds the same
+// document without a server. State and Compose are required (BuildStatus
+// rejects nil); every other field degrades as documented.
+type StatusDeps struct {
+	// State is the deployment state store — the desired side of the report.
+	State *state.Store
+
+	// Compose lists the running containers — the actual side of the report.
+	Compose ComposeLister
+
+	// RepoURL and Branch identify the host repository; the report carries
+	// them under host_repo.
+	RepoURL string
+	Branch  string
+
+	// HeadCommit returns the commit currently checked out in the host
+	// repository (host_repo.commit). Nil or an error degrades the commit to
+	// "" — missing git metadata must not fail the report.
+	HeadCommit func() (string, error)
+
+	// SelfProject is the compose project the agent itself runs under; it is
+	// never reported as unmanaged (see Deps.SelfProject).
+	SelfProject string
+
+	// Logger receives the degradation warnings (failed docker queries); nil
+	// falls back to slog.Default().
+	Logger *slog.Logger
 }
 
-// statusResponse is the JSON document of GET /status. Stacks and unmanaged
-// are always JSON arrays (never null) so consumers need no null handling;
-// both are sorted by name for deterministic output.
-type statusResponse struct {
+// StatusResponse is the JSON document of GET /status and -print-status.
+// Stacks and unmanaged are always JSON arrays (never null) so consumers
+// need no null handling; both are sorted by name for deterministic output.
+type StatusResponse struct {
 	// GeneratedAt is the RFC3339 timestamp of the snapshot.
 	GeneratedAt string `json:"generated_at"`
 	// HostRepo describes the host repository the agent reconciles from.
-	HostRepo hostRepo `json:"host_repo"`
+	HostRepo HostRepo `json:"host_repo"`
 	// Stacks holds one entry per state.json stack, sorted by name.
-	Stacks []stackStatus `json:"stacks"`
+	Stacks []StackStatus `json:"stacks"`
 	// Unmanaged holds running compose projects without a state entry,
 	// sorted by project.
-	Unmanaged []unmanagedProject `json:"unmanaged"`
+	Unmanaged []UnmanagedProject `json:"unmanaged"`
 	// Error names a failed unmanaged listing (top level); per-stack
 	// failures live on the stack entries instead.
 	Error string `json:"error,omitempty"`
 }
 
-// hostRepo identifies the host repository: configured URL and branch, plus
+// HostRepo identifies the host repository: configured URL and branch, plus
 // the commit the host checkout currently points at ("" when unknown).
-type hostRepo struct {
+type HostRepo struct {
 	URL    string `json:"url"`
 	Branch string `json:"branch"`
 	Commit string `json:"commit"`
 }
 
-// stackStatus is the desired-vs-actual report of one managed stack.
-type stackStatus struct {
+// StackStatus is the desired-vs-actual report of one managed stack.
+type StackStatus struct {
 	// Name is the stack (and compose project) name.
 	Name string `json:"name"`
 	// DeployedHash is the stack hash of the last recorded deploy.
@@ -94,72 +118,89 @@ type stackStatus struct {
 	Error string `json:"error,omitempty"`
 }
 
-// unmanagedProject is a running compose project without a state entry.
-type unmanagedProject struct {
+// UnmanagedProject is a running compose project without a state entry.
+type UnmanagedProject struct {
 	// Project is the compose project name (com.docker.compose.project).
 	Project string `json:"project"`
 	// Containers lists the project's running container names.
 	Containers []string `json:"containers"`
 }
 
-// handleStatus serves GET /status: optional Bearer authentication, then the
-// full snapshot. It answers 200 whenever the endpoint is configured, even
-// when individual docker queries fail (see the package comment); only the
-// missing configuration itself is an error (503, so miswiring surfaces
-// loudly instead of yielding an empty-but-green report).
-func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
-	if !h.statusAuthorized(r) {
-		w.Header().Set("WWW-Authenticate", "Bearer")
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+// BuildStatus assembles the complete status document — the shared source of
+// GET /status and the CLI's -print-status mode, which is why it lives here
+// and not inside the handler. Docker failures degrade into the document per
+// the package contract (a stack's drift becomes "unknown" with an error
+// field, the unmanaged listing becomes the top-level error) and never fail
+// the call; the only error is missing configuration (nil State or Compose).
+func BuildStatus(ctx context.Context, deps StatusDeps) (StatusResponse, error) {
+	if deps.State == nil || deps.Compose == nil {
+		return StatusResponse{}, errors.New("status requires a state store and a compose runner")
 	}
-	if h.status.state == nil || h.status.compose == nil {
-		http.Error(w, "status endpoint not configured (state store and compose runner required)", http.StatusServiceUnavailable)
-		return
+	logger := deps.Logger
+	if logger == nil {
+		logger = slog.Default()
 	}
-
-	resp := statusResponse{
+	resp := StatusResponse{
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
-		HostRepo: hostRepo{
-			URL:    h.status.repoURL,
-			Branch: h.status.branch,
-			Commit: h.hostCommit(),
+		HostRepo: HostRepo{
+			URL:    deps.RepoURL,
+			Branch: deps.Branch,
+			Commit: resolveHeadCommit(logger, deps.HeadCommit),
 		},
-		Stacks:    make([]stackStatus, 0), // JSON [], not null
-		Unmanaged: make([]unmanagedProject, 0),
+		Stacks:    make([]StackStatus, 0), // JSON [], not null
+		Unmanaged: make([]UnmanagedProject, 0),
 	}
 
-	// Managed stacks: state.Names() is sorted, so the response is, too.
+	// Managed stacks: State.Names() is sorted, so the report is, too.
 	managed := make(map[string]struct{})
-	for _, name := range h.status.state.Names() {
+	for _, name := range deps.State.Names() {
 		managed[name] = struct{}{}
-		st, _ := h.status.state.Get(name)
-		resp.Stacks = append(resp.Stacks, h.stackStatus(r, name, st))
+		st, _ := deps.State.Get(name)
+		resp.Stacks = append(resp.Stacks, buildStackStatus(ctx, logger, deps.Compose, name, st))
 	}
 
 	// Unmanaged: running compose projects without a state entry; the
 	// agent's own project never counts (it is managed by the operator's
 	// compose invocation, not by itself). A failed listing degrades to the
 	// top-level error field — the stacks part stays usable.
-	refs, err := h.status.compose.PsAllProjects(r.Context())
+	refs, err := deps.Compose.PsAllProjects(ctx)
 	if err != nil {
-		h.logger.Warn("status: listing running compose projects failed", "error", err)
+		logger.Warn("status: listing running compose projects failed", "error", err)
 		resp.Error = fmt.Sprintf("list running projects: %v", err)
 	} else {
 		for _, ref := range refs {
 			if _, ok := managed[ref.Project]; ok {
 				continue
 			}
-			if h.status.selfProject != "" && ref.Project == h.status.selfProject {
+			if deps.SelfProject != "" && ref.Project == deps.SelfProject {
 				continue
 			}
-			resp.Unmanaged = append(resp.Unmanaged, unmanagedProject{
+			resp.Unmanaged = append(resp.Unmanaged, UnmanagedProject{
 				Project:    ref.Project,
 				Containers: ref.Containers,
 			})
 		}
 	}
+	return resp, nil
+}
 
+// handleStatus serves GET /status: optional Bearer authentication, then the
+// snapshot from the shared BuildStatus. It answers 200 whenever the
+// endpoint is configured, even when individual docker queries fail (see the
+// package comment); only the missing configuration itself is an error (503,
+// so miswiring surfaces loudly instead of yielding an empty-but-green
+// report).
+func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if !h.statusAuthorized(r) {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	resp, err := BuildStatus(r.Context(), h.status)
+	if err != nil {
+		http.Error(w, "status endpoint not configured (state store and compose runner required)", http.StatusServiceUnavailable)
+		return
+	}
 	h.logger.Debug("status served", "stacks", len(resp.Stacks), "unmanaged", len(resp.Unmanaged))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -168,12 +209,12 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// stackStatus builds the report of one managed stack: recorded hash and
-// timestamp from the state entry, live containers from compose ps, drift
-// from the matrix below. A failed ps degrades to drift "unknown" with the
-// error message on the entry — the endpoint keeps answering 200.
-func (h *Handler) stackStatus(r *http.Request, name string, st state.State) stackStatus {
-	entry := stackStatus{
+// buildStackStatus builds the report of one managed stack: recorded hash
+// and timestamp from the state entry, live containers from compose ps,
+// drift from the matrix below. A failed ps degrades to drift "unknown" with
+// the error message on the entry — the report keeps going.
+func buildStackStatus(ctx context.Context, logger *slog.Logger, lister ComposeLister, name string, st state.State) StackStatus {
+	entry := StackStatus{
 		Name:         name,
 		DeployedHash: st.Hash,
 		Containers:   make([]compose.Container, 0),
@@ -181,9 +222,9 @@ func (h *Handler) stackStatus(r *http.Request, name string, st state.State) stac
 	if !st.UpdatedAt.IsZero() {
 		entry.LastDeployed = st.UpdatedAt.UTC().Format(time.RFC3339)
 	}
-	containers, err := h.status.compose.PsProject(r.Context(), name)
+	containers, err := lister.PsProject(ctx, name)
 	if err != nil {
-		h.logger.Warn("status: listing containers failed", "stack", name, "error", err)
+		logger.Warn("status: listing containers failed", "stack", name, "error", err)
 		entry.Drift = driftUnknown
 		entry.Error = err.Error()
 		return entry
@@ -236,25 +277,25 @@ func sortContainers(containers []compose.Container) []compose.Container {
 	return sorted
 }
 
-// hostCommit resolves host_repo.commit; every failure degrades to "" (the
-// endpoint never fails over missing git metadata).
-func (h *Handler) hostCommit() string {
-	if h.status.headCommit == nil {
+// resolveHeadCommit resolves host_repo.commit; every failure degrades to ""
+// (the report never fails over missing git metadata).
+func resolveHeadCommit(logger *slog.Logger, headCommit func() (string, error)) string {
+	if headCommit == nil {
 		return ""
 	}
-	commit, err := h.status.headCommit()
+	commit, err := headCommit()
 	if err != nil {
-		h.logger.Warn("status: resolving host commit failed", "error", err)
+		logger.Warn("status: resolving host commit failed", "error", err)
 		return ""
 	}
 	return commit
 }
 
-// statusAuthorized guards GET /status when Deps.Token is set: the request
-// must carry "Authorization: Bearer <token>", compared in constant time.
-// Without a token the endpoint is open, like /healthz.
+// statusAuthorized guards GET /status when a status token is set: the
+// request must carry "Authorization: Bearer <token>", compared in constant
+// time. Without a token the endpoint is open, like /healthz.
 func (h *Handler) statusAuthorized(r *http.Request) bool {
-	if h.status.token == "" {
+	if h.statusToken == "" {
 		return true
 	}
 	header := r.Header.Get("Authorization")
@@ -262,5 +303,5 @@ func (h *Handler) statusAuthorized(r *http.Request) bool {
 	if !ok {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(rest), []byte(h.status.token)) == 1
+	return subtle.ConstantTimeCompare([]byte(rest), []byte(h.statusToken)) == 1
 }

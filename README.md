@@ -341,8 +341,8 @@ explizit aktiviert werden, inkl. der URL-Variable:
 
 ## Monitoring (`/status` Endpoint)
 
-`GET /status` (nur Daemon-Modus) stellt den Ist-Zustand der verwalteten
-Stacks dem Soll-Zustand aus `state.json` gegenüber — Grundlage für externes
+`GET /status` (Daemon-Modus) stellt den Ist-Zustand der verwalteten Stacks
+dem Soll-Zustand aus `state.json` gegenüber — Grundlage für externes
 Monitoring (Gatus, curl, Telegram-Bot), ohne dass der Abfrager selbst
 Docker-Zugriff bräuchte:
 
@@ -397,15 +397,65 @@ Endpoint `Authorization: Bearer <token>` (konstanter Zeitvergleich), sonst
 **401**. Ohne die Variable ist er offen wie `/healthz` — dann sollte der Port
 nicht öffentlich erreichbar sein.
 
+### Ohne Server: `-print-status`
+
+Dasselbe Dokument (gemeinsame `BuildStatus`-Funktion, keine zweite Logik)
+erzeugt der Agent auch als One-Shot auf stdout — für Cron-Monitoring und
+Umgebungen ohne freigegebenen Port:
+
+    dockops -print-status -state /var/lib/dockops/state.json
+
+Der Aufruf braucht **kein `-repo`** und startet weder Reconcile-Pass noch
+Server (`-print-status` gewinnt über `-once`/Daemon-Modus). Die Ausgabe ist
+mit 2 Spaces eingerückt, Diagnose-Logs gehen auf stderr — stdout lässt sich
+also direkt weiterpipen:
+
+    dockops -print-status | jq '.stacks[] | select(.drift != "ok")'
+
+Auszug der Ausgabe:
+
+```json
+{
+  "generated_at": "2026-10-15T09:32:11Z",
+  "host_repo": {
+    "url": "git@github.com:example/homelab-stacks.git",
+    "branch": "main",
+    "commit": "abc123def456"
+  },
+  "stacks": [
+    {
+      "name": "immich",
+      "deployed_hash": "abc123…",
+      "last_deployed": "2026-10-14T12:00:00Z",
+      "containers": [
+        {
+          "name": "immich-server",
+          "state": "running",
+          "health": "healthy"
+        }
+      ],
+      "drift": "ok"
+    }
+  ],
+  "unmanaged": []
+}
+```
+
+Fehler-Toleranz wie beim Endpoint: Docker-Probleme landen im Dokument
+(drift `unknown` plus `"error"` pro Stack, top-level `"error"` für die
+Projekt-Listung) und der Aufruf endet mit **exit 0**. Nur eine nicht
+lesbare State-Datei schlägt fehl — Fehler auf stderr, **exit 1**. Eine
+fehlende State-Datei gilt wie beim Endpoint als leerer Snapshot.
+
 ## CLI
 
     dockops [-repo URL] [-branch NAME] [-state PFAD] [-addr HOST:PORT]
             [-webhook-secret GEHEIMNIS] [-sops-sidecar URL]
-            [-interval DAUER] [-once]
+            [-interval DAUER] [-once] [-print-status]
 
 | Flag | Env-Variable | Default | Bedeutung |
 |---|---|---|---|
-| `-repo` | `DOCKOPS_REPO_URL` | — (Pflicht) | URL des Host-Repos (HTTPS/SSH/lokal) |
+| `-repo` | `DOCKOPS_REPO_URL` | — (Pflicht, außer bei `-print-status`) | URL des Host-Repos (HTTPS/SSH/lokal) |
 | `-branch` | `DOCKOPS_BRANCH` | `main` | Branch des Host-Repos |
 | `-state` | — | `/var/lib/dockops/state.json` | Pfad der JSON-State-Datei |
 | `-webhook-secret` | `DOCKOPS_WEBHOOK_SECRET` | leer | Shared Secret für `POST /webhook`; leer ⇒ Webhooks ohne Auth (Warnung im Log) |
@@ -413,6 +463,7 @@ nicht öffentlich erreichbar sein.
 | `-sops-sidecar` | `DOCKOPS_SOPS_SIDECAR_URL` | leer | URL des SOPS-Sidecar (z. B. `http://sops-sidecar:8081`); leer ⇒ lokales `sops -d` |
 | `-interval` | — | `global.poll_interval` (Default 5m) | Poll-Intervall-Override, z. B. `90s` |
 | `-once` | — | `false` | Ein einzelner Reconcile-Durchlauf, dann Exit |
+| `-print-status` | `DOCKOPS_PRINT_STATUS` | `false` | `/status`-JSON auf stdout ausgeben und exiten (kein `-repo` nötig; gewinnt über `-once` und Daemon) |
 
 Dazu die Vault-Variablen (Namen in `global.vault` konfigurierbar):
 `VAULT_ADDR` (Fallback für `global.vault.address`), `VAULT_TOKEN`
@@ -425,7 +476,9 @@ Dazu die Vault-Variablen (Namen in `global.vault` konfigurierbar):
 Durchlauf, danach Poll-Timer (`-interval` überschreibt
 `global.poll_interval`) plus Webhook-Trigger, die entprellt und gemerged
 werden; ein laufender Durchlauf wird nie unterbrochen. SIGINT/SIGTERM
-beendet ihn kontrolliert.
+beendet ihn kontrolliert. `-print-status` schaltet auf den One-Shot-
+Statusmodus (siehe „Ohne Server: `-print-status`“) und gewinnt über beide
+anderen Modi.
 
 **HTTP-Endpunkte**:
 

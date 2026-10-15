@@ -63,7 +63,16 @@ injizierbarem `ComposeLister`, optionaler Bearer-Schutz via
 `DOCKOPS_STATUS_TOKEN` (constant-time); `state.Store` jetzt RWMutex-gesichert
 (HTTP-Goroutines lesen parallel zum Poll-Loop); CLI teilt compose-executor und
 git-manager zwischen Reconciler und /status, `reconciler.HostRepoName`
-exportiert.
+exportiert. Phase 8b: One-Shot-Status ohne Server — die JSON-Erzeugung von
+/status in die geteilte Funktion `webhook.BuildStatus(ctx, StatusDeps)`
+gezogen (exportierte Response-Typen `StatusResponse`/`StackStatus`/
+`UnmanagedProject`/`HostRepo`; nil State/Compose = einziger Fehler,
+Docker-Fehler degradieren weiter ins Dokument); CLI-Flag `-print-status`
+(env `DOCKOPS_PRINT_STATUS`) lädt den State und schreibt dasselbe JSON via
+`writeStatus` mit 2-Spaces-Indent nach stdout — Logs/Fehler auf stderr
+(stdout bleibt reines JSON), kein `-repo` nötig, gewinnt über
+`-once`/Daemon-Modus (Hinweis-Log), exit 0 auch bei Docker-Problemen, nur
+State-Ladefehler → stderr + exit 1.
 
 ## Umgebung
 
@@ -77,8 +86,10 @@ exportiert.
   `-branch`, `-webhook-secret`, `-sops-sidecar`, `-interval`), `-once`- und
   Daemon-Modus (Webhook-Server + Poll-Timer, debounced Trigger, Graceful
   Shutdown), slog-JSON auf stdout; teilt compose-executor und git-manager
-  zwischen Reconciler und /status (Env ohne Flag: `DOCKOPS_STATUS_TOKEN`,
-  `DOCKOPS_SELF_PROJECT`)
+  zwischen Reconciler und /status; `-print-status` (env
+  `DOCKOPS_PRINT_STATUS`) gibt das /status-JSON als One-Shot nach stdout
+  (Diagnose auf stderr, kein `-repo`, gewinnt über `-once`/Daemon) (Env ohne
+  Flag: `DOCKOPS_STATUS_TOKEN`, `DOCKOPS_SELF_PROJECT`)
 - `cmd/sops-sidecar/` — Mini-Programm des Decrypt-Sidecars: Startet den
   Handler aus `internal/sops` hinter `net/http` mit Graceful Shutdown;
   Wurzeln aus `SOPS_SIDECAR_ALLOWED_ROOTS` (doppelpunkt-separiert, absolut,
@@ -165,7 +176,15 @@ exportiert.
   Projekte ohne State-Eintrag minus Eigenprojekt, `host_repo` mit HEAD-Commit
   via injizierter Callback-Funktion, Bearer-Schutz (`DOCKOPS_STATUS_TOKEN`,
   constant-time, leer = offen wie `/healthz`), Stacks/Unmanaged immer
-  sortierte JSON-Arrays
+  sortierte JSON-Arrays; Dokument-Bau seit Phase 8b in exportierter
+  `BuildStatus(ctx, StatusDeps)` (Handler und `-print-status` teilen sie)
+- `internal/webhook/phase8b_test.go` — Phase-8b-Regressionstest:
+  `BuildStatus` mit identischen Kollaborateuren wie der Endpoint liefert
+  dasselbe Dokument (inkl. beider Fehler-Modi), fehlende Konfiguration ist
+  der einzige Fehler
+- `cmd/dockops/phase8b_test.go` — Phase-8b-CLI-Tests: `-print-status`
+  (Default/Env/Flag/ungültiges Env, `-repo`-Befreiung) und `writeStatus`
+  (2-Spaces-Indent, Newline, Docker-Fehler im Dokument statt Fehler)
 - `internal/reconciler/phase6c_test.go` — Phase-6c-Regressionstests: die
   drei Prune-Fälle (a/b/c), Skip-über-Prune-Pass (identischer Hash deployt
   nicht neu) und der unterbrochene Pass (State-Dir wird mid-Pass read-only,

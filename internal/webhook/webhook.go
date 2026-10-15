@@ -114,7 +114,11 @@ type Handler struct {
 	secret  string
 	trigger func()
 	logger  *slog.Logger
-	status  statusDeps
+	// status feeds BuildStatus for GET /status (Logger pinned to the
+	// handler's logger).
+	status StatusDeps
+	// statusToken optionally guards GET /status (Bearer); see Deps.Token.
+	statusToken string
 }
 
 // New creates a Handler from deps, applying the defaults documented on Deps.
@@ -127,15 +131,16 @@ func New(deps Deps) *Handler {
 		secret:  deps.Secret,
 		trigger: deps.Trigger,
 		logger:  logger,
-		status: statusDeps{
-			state:       deps.State,
-			compose:     deps.Compose,
-			repoURL:     deps.RepoURL,
-			branch:      deps.Branch,
-			headCommit:  deps.HeadCommit,
-			selfProject: deps.SelfProject,
-			token:       deps.Token,
+		status: StatusDeps{
+			State:       deps.State,
+			Compose:     deps.Compose,
+			RepoURL:     deps.RepoURL,
+			Branch:      deps.Branch,
+			HeadCommit:  deps.HeadCommit,
+			SelfProject: deps.SelfProject,
+			Logger:      logger,
 		},
+		statusToken: deps.Token,
 	}
 }
 

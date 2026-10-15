@@ -7,15 +7,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -28,13 +31,15 @@ import (
 	"github.com/local/dockops/internal/webhook"
 )
 
-// Environment variables backing the flags; see parseFlags. The two status
-// variables have no flag of their own (briefing phase 8 names the env only).
+// Environment variables backing the flags; see parseFlags. The status
+// token and self project variables have no flag of their own (briefing
+// phase 8 names the env only).
 const (
 	envRepoURL        = "DOCKOPS_REPO_URL"
 	envBranch         = "DOCKOPS_BRANCH"
 	envWebhookSecret  = "DOCKOPS_WEBHOOK_SECRET"
 	envSopsSidecarURL = "DOCKOPS_SOPS_SIDECAR_URL"
+	envPrintStatus    = "DOCKOPS_PRINT_STATUS"
 	envStatusToken    = "DOCKOPS_STATUS_TOKEN"
 	envSelfProject    = "DOCKOPS_SELF_PROJECT"
 )
@@ -72,19 +77,45 @@ type options struct {
 	Addr           string
 	SopsSidecarURL string
 	Once           bool
+	// PrintStatus selects the one-shot status mode (-print-status): write
+	// the /status JSON document to stdout and exit — no repository, no
+	// reconcile pass, no server. It wins over Once.
+	PrintStatus bool
 	// Interval is the -interval override; 0 means unset, in which case
 	// global.poll_interval from the loaded config applies.
 	Interval time.Duration
+}
+
+// boolFromEnv parses an optional boolean environment variable: empty counts
+// as unset (false), anything strconv.ParseBool understands is honored, every
+// other value is a configuration error naming the variable.
+func boolFromEnv(getenv func(string) string, name string) (bool, error) {
+	v := getenv(name)
+	if v == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("env %s: %w", name, err)
+	}
+	return b, nil
 }
 
 // parseFlags parses args (without the program name) with environment
 // fallbacks from getenv. It is a separate function so tests can exercise it
 // with a fake environment instead of the process environment. -repo wins
 // over DOCKOPS_REPO_URL, -branch over DOCKOPS_BRANCH (which wins over
-// "main"), -webhook-secret over DOCKOPS_WEBHOOK_SECRET.
+// "main"), -webhook-secret over DOCKOPS_WEBHOOK_SECRET. -print-status is
+// the one exception to the -repo requirement: the status document is built
+// from the state file and docker alone.
 func parseFlags(args []string, getenv func(string) string) (options, error) {
 	var opts options
 	var interval string
+
+	printStatus, err := boolFromEnv(getenv, envPrintStatus)
+	if err != nil {
+		return opts, err
+	}
 
 	fs := flag.NewFlagSet("dockops", flag.ContinueOnError)
 	fs.StringVar(&opts.RepoURL, "repo", getenv(envRepoURL), "host repository URL (env "+envRepoURL+")")
@@ -95,12 +126,14 @@ func parseFlags(args []string, getenv func(string) string) (options, error) {
 	fs.StringVar(&opts.SopsSidecarURL, "sops-sidecar", getenv(envSopsSidecarURL),
 		"URL of the sops decrypt sidecar, e.g. http://sops-sidecar:8081 (env "+envSopsSidecarURL+"; empty: decrypt via the local sops binary)")
 	fs.BoolVar(&opts.Once, "once", false, "run a single reconcile pass and exit")
+	fs.BoolVar(&opts.PrintStatus, "print-status", printStatus,
+		"write the /status JSON document to stdout and exit (env "+envPrintStatus+"; no -repo needed; wins over -once and server mode)")
 	fs.StringVar(&interval, "interval", "", "poll interval override like \"5m\" (default: global.poll_interval from the config)")
 
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
-	if opts.RepoURL == "" {
+	if !opts.PrintStatus && opts.RepoURL == "" {
 		return opts, fmt.Errorf("no host repository configured: set -repo or %s", envRepoURL)
 	}
 	if opts.Branch == "" {
@@ -161,9 +194,22 @@ func main() {
 		fmt.Fprintln(os.Stderr, "dockops:", err)
 		os.Exit(2)
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// -print-status carries the JSON document on stdout; its diagnostics
+	// (slog included) move to stderr so pipes and jq see nothing but the
+	// document.
+	logOut := io.Writer(os.Stdout)
+	if opts.PrintStatus {
+		logOut = os.Stderr
+	}
+	logger := slog.New(slog.NewJSONHandler(logOut, nil))
 	if err := run(opts, logger); err != nil {
-		logger.Error("dockops exiting", "error", err)
+		if opts.PrintStatus {
+			// Same contract as the flag errors: plain stderr, stdout stays
+			// reserved for the document that never got written.
+			fmt.Fprintln(os.Stderr, "dockops:", err)
+		} else {
+			logger.Error("dockops exiting", "error", err)
+		}
 		os.Exit(1)
 	}
 }
@@ -175,6 +221,35 @@ func main() {
 func run(opts options, logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// -print-status wins over every other mode: no reconcile pass, no
+	// server, just the one-shot document. -repo is not required here (see
+	// parseFlags); an unreadable state file is the only fatal error — docker
+	// problems degrade into the document exactly like the endpoint.
+	if opts.PrintStatus {
+		if opts.Once {
+			logger.Info("-print-status wins over -once; printing the status without a reconcile pass")
+		}
+		store, err := state.New(opts.StatePath, logger)
+		if err != nil {
+			return err
+		}
+		composeExec := compose.New(logger, "")
+		gitMgr, gitErr := git.New(config.DefaultWorkDir, logger)
+		if gitErr != nil {
+			logger.Warn("git manager unavailable; the status reports an empty host commit",
+				"error", gitErr)
+		}
+		return writeStatus(ctx, webhook.StatusDeps{
+			State:       store,
+			Compose:     composeExec,
+			RepoURL:     opts.RepoURL,
+			Branch:      opts.Branch,
+			HeadCommit:  hostCommitFn(gitMgr),
+			SelfProject: selfProject(),
+			Logger:      logger,
+		}, os.Stdout)
+	}
 
 	store, err := state.New(opts.StatePath, logger)
 	if err != nil {
@@ -237,6 +312,40 @@ func selfProject() string {
 	return defaultSelfProject
 }
 
+// hostCommitFn wires the host_repo.commit callback of GET /status and
+// -print-status over the shared bootstrap checkout: with a git manager it
+// resolves the host repo's HEAD, without one it always fails (BuildStatus
+// degrades both cases to an empty commit).
+func hostCommitFn(gitMgr *git.Manager) func() (string, error) {
+	if gitMgr == nil { // nil *git.Manager would be a non-nil interface and panic on use
+		return func() (string, error) { return "", errors.New("git manager unavailable (see startup log)") }
+	}
+	return func() (string, error) {
+		return gitMgr.HeadCommit(filepath.Join(config.DefaultWorkDir, reconciler.HostRepoName))
+	}
+}
+
+// writeStatus builds the status document via the shared webhook function of
+// GET /status and writes it to w as JSON indented with two spaces plus a
+// trailing newline. Docker failures already live inside the document (drift
+// "unknown", error fields) and do not fail the call — the one-shot mode
+// mirrors the endpoint, which keeps answering 200.
+func writeStatus(ctx context.Context, deps webhook.StatusDeps, w io.Writer) error {
+	resp, err := webhook.BuildStatus(ctx, deps)
+	if err != nil {
+		return fmt.Errorf("build status: %w", err)
+	}
+	raw, err := json.MarshalIndent(resp, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode status: %w", err)
+	}
+	raw = append(raw, '\n')
+	if _, err := w.Write(raw); err != nil {
+		return fmt.Errorf("write status: %w", err)
+	}
+	return nil
+}
+
 // serve runs the daemon: the webhook server plus the poll loop, until the
 // context is cancelled. Webhook triggers are debounced and merged — the
 // loop is single-goroutine, a running pass is never interrupted, and any
@@ -260,19 +369,14 @@ func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconcil
 	server := &http.Server{
 		Addr: opts.Addr,
 		Handler: webhook.New(webhook.Deps{
-			Secret:  opts.WebhookSecret,
-			Trigger: notify,
-			Logger:  logger,
-			State:   collab.store,
-			Compose: collab.compose,
-			RepoURL: opts.RepoURL,
-			Branch:  opts.Branch,
-			HeadCommit: func() (string, error) {
-				if collab.git == nil {
-					return "", errors.New("git manager unavailable (see startup log)")
-				}
-				return collab.git.HeadCommit(filepath.Join(config.DefaultWorkDir, reconciler.HostRepoName))
-			},
+			Secret:      opts.WebhookSecret,
+			Trigger:     notify,
+			Logger:      logger,
+			State:       collab.store,
+			Compose:     collab.compose,
+			RepoURL:     opts.RepoURL,
+			Branch:      opts.Branch,
+			HeadCommit:  hostCommitFn(collab.git),
 			SelfProject: selfProject(),
 			Token:       os.Getenv(envStatusToken),
 		}),
