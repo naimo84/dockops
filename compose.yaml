@@ -7,7 +7,7 @@
 #   DOCKOPS_WEBHOOK_SECRET  shared secret for POST /webhook
 #   VAULT_TOKEN             token for global.vault auth_method "token"
 #
-# Build the image first (see Dockerfile):
+# Build the images first (see Dockerfile):
 #   docker compose build
 
 services:
@@ -23,6 +23,14 @@ services:
       DOCKOPS_BRANCH: "main"
       # Shared secret of POST /webhook (GitHub HMAC / GitLab token).
       DOCKOPS_WEBHOOK_SECRET: "${DOCKOPS_WEBHOOK_SECRET:?set DOCKOPS_WEBHOOK_SECRET}"
+      # SOPS sidecar mode (flag -sops-sidecar). Compose cannot switch an
+      # environment value by profile, so the URL is substituted from the
+      # shell/.env: activate it together with the profile, e.g.
+      #   DOCKOPS_SOPS_SIDECAR_URL=http://sops-sidecar:8081 \
+      #     docker compose --profile sops up -d
+      # Empty (default) = dockops decrypts sops_files via the local sops
+      # binary inside its own container.
+      DOCKOPS_SOPS_SIDECAR_URL: "${DOCKOPS_SOPS_SIDECAR_URL:-}"
       # Vault: VAULT_ADDR is the fallback for an unset global.vault.address;
       # VAULT_TOKEN is read at login time (token auth method).
       VAULT_ADDR: "https://vault.example.com"
@@ -41,6 +49,30 @@ services:
       - ~/.ssh/known_hosts:/root/.ssh/known_hosts:ro
     ports:
       - "8080:8080" # POST /webhook (CI webhooks), GET /healthz (liveness)
+
+  # Optional sops decrypt sidecar — starts only with `--profile sops`. The
+  # sops binary, .sops.yaml rules and Vault-Transit credentials live HERE,
+  # not in the dockops image; dockops hands it the encrypted stack files
+  # over HTTP (see README "SOPS decryption"). Both services share the
+  # default compose network; the sidecar publishes no port of its own.
+  sops-sidecar:
+    profiles: ["sops"]
+    build:
+      context: .
+      dockerfile: cmd/sops-sidecar/Dockerfile.sidecar
+    image: dockops-sops-sidecar:latest
+    restart: unless-stopped
+    environment:
+      # Only files below these roots (colon-separated) may be decrypted —
+      # the service's security boundary. The stack checkouts arrive via the
+      # shared volume below.
+      SOPS_SIDECAR_ALLOWED_ROOTS: /var/lib/dockops/repos
+      # Vault-Transit for .sops.yaml rules using hc_vault_transit_uri.
+      VAULT_ADDR: "https://vault.example.com"
+      VAULT_TOKEN: "${VAULT_TOKEN:?set VAULT_TOKEN}"
+    volumes:
+      # Same checkout volume as dockops, read-only: decrypting never writes.
+      - dockops-data:/var/lib/dockops:ro
 
 volumes:
   dockops-data:

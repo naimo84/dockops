@@ -11,7 +11,7 @@
 // decisions follow the project convention for open points and are documented
 // at the decision sites below; phase 6a extended the field list to the
 // compose file list (compose_files), the effective service filter and
-// ignore_services.
+// ignore_services, and phase 6b added vault_env_templates.
 package stackhash
 
 import (
@@ -33,28 +33,31 @@ import (
 // Version 2 replaced the single compose_file with the compose file list
 // (compose_files), switched Services to the effective service filter result
 // (services minus ignore_services) and added the sorted ignore_services
-// list — all changes that affect what a deployment runs. A state file
-// written against version 1 therefore mismatches once and every stack
-// redeploys a single time, which is the safe direction.
-const schemaVersion = 2
+// list — all changes that affect what a deployment runs. Version 3 added
+// vault_env_templates (paths, like env_files: template contents are
+// deployment artifacts, a changed secret value must not redeploy). A state
+// file written against an older version therefore mismatches once and every
+// stack redeploys a single time, which is the safe direction.
+const schemaVersion = 3
 
 // canonicalStack is the fixed, JSON-serializable projection of a
 // config.Stack that enters the hash. Field order is irrelevant for the hash
 // (encoding/json emits struct fields in declaration order, which is stable),
 // but kept aligned with the briefing's field list for readability.
 type canonicalStack struct {
-	SchemaVersion  int                 `json:"schema_version"`
-	Name           string              `json:"name"`
-	Enabled        bool                `json:"enabled"`
-	ComposeFiles   []string            `json:"compose_files"`
-	Profiles       []string            `json:"profiles"`
-	Services       []string            `json:"services"`
-	IgnoreServices []string            `json:"ignore_services"`
-	EnvFiles       []string            `json:"env_files"`
-	SopsFiles      []canonicalSopsFile `json:"sops_files"`
-	VaultPaths     []string            `json:"vault_paths"`
-	Hooks          canonicalHooks      `json:"hooks"`
-	Compose        []any               `json:"compose"`
+	SchemaVersion     int                 `json:"schema_version"`
+	Name              string              `json:"name"`
+	Enabled           bool                `json:"enabled"`
+	ComposeFiles      []string            `json:"compose_files"`
+	Profiles          []string            `json:"profiles"`
+	Services          []string            `json:"services"`
+	IgnoreServices    []string            `json:"ignore_services"`
+	EnvFiles          []string            `json:"env_files"`
+	SopsFiles         []canonicalSopsFile `json:"sops_files"`
+	VaultPaths        []string            `json:"vault_paths"`
+	VaultEnvTemplates []string            `json:"vault_env_templates"`
+	Hooks             canonicalHooks      `json:"hooks"`
+	Compose           []any               `json:"compose"`
 }
 
 // canonicalSopsFile is the hash-relevant projection of config.SopsFile.
@@ -84,8 +87,9 @@ type canonicalHooks struct {
 //     different deployment.
 //   - profiles and services are sorted, per the briefing; ignore_services
 //     is sorted for the same set-like reason. The other list fields keep
-//     their order because it is semantically relevant (env_files and
-//     vault_paths override in sequence, hooks run in sequence).
+//     their order because it is semantically relevant (env_files,
+//     vault_paths and vault_env_templates override in sequence, hooks run
+//     in sequence).
 //   - services enter the hash as the effective filter result
 //     (stack.EffectiveServices, i.e. services minus ignore_services). With
 //     no configured services the deployed set is "everything the compose
@@ -119,16 +123,17 @@ func Compute(stack config.Stack, composeContents ...[]byte) (string, error) {
 	}
 
 	canon := canonicalStack{
-		SchemaVersion:  schemaVersion,
-		Name:           stack.Name,
-		Enabled:        stack.Enabled,
-		ComposeFiles:   nilIfEmpty(files),
-		Profiles:       sorted(stack.Profiles),
-		Services:       sorted(stack.EffectiveServices()),
-		IgnoreServices: sorted(stack.IgnoreServices),
-		EnvFiles:       nilIfEmpty(stack.EnvFiles),
-		SopsFiles:      canonicalSopsFiles(stack.SopsFiles),
-		VaultPaths:     nilIfEmpty(stack.VaultPaths),
+		SchemaVersion:     schemaVersion,
+		Name:              stack.Name,
+		Enabled:           stack.Enabled,
+		ComposeFiles:      nilIfEmpty(files),
+		Profiles:          sorted(stack.Profiles),
+		Services:          sorted(stack.EffectiveServices()),
+		IgnoreServices:    sorted(stack.IgnoreServices),
+		EnvFiles:          nilIfEmpty(stack.EnvFiles),
+		SopsFiles:         canonicalSopsFiles(stack.SopsFiles),
+		VaultPaths:        nilIfEmpty(stack.VaultPaths),
+		VaultEnvTemplates: nilIfEmpty(stack.VaultEnvTemplates),
 		Hooks: canonicalHooks{
 			PreDeploy:  nilIfEmpty(stack.Hooks.PreDeploy),
 			PostDeploy: nilIfEmpty(stack.Hooks.PostDeploy),

@@ -1,7 +1,12 @@
 // Package sops decrypts environment files with the sops CLI
 // (github.com/getsops/sops). Like internal/git it deliberately shells out to
-// the locally installed binary via os/exec instead of reimplementing the
-// crypto formats.
+// a locally installed binary via os/exec instead of reimplementing the
+// crypto formats — either directly (the classic mode, used when the sops
+// binary and its credentials live next to dockops) or through the decrypt
+// sidecar service defined in this package (SidecarResolver on the client
+// side, NewSidecarHandler plus cmd/sops-sidecar on the server side), which
+// keeps the sops binary and the Vault-Transit credentials out of the
+// dockops image entirely.
 package sops
 
 import (
@@ -81,6 +86,18 @@ func DecryptFileKeyfile(ctx context.Context, path, ageKeyfile string) (map[strin
 // decrypt runs the sops CLI on path with extraEnv appended to the child
 // environment and parses its stdout as dotenv.
 func decrypt(ctx context.Context, path string, extraEnv []string) (map[string]string, error) {
+	out, err := decryptContent(ctx, path, extraEnv)
+	if err != nil {
+		return nil, err
+	}
+	return dotenv.Parse(out), nil
+}
+
+// decryptContent runs the sops CLI on path with extraEnv appended to the
+// child environment and returns its raw stdout — the decrypted dotenv
+// plaintext. The sidecar handler serves exactly these bytes as the response
+// content, so formatting and comments survive the HTTP hop.
+func decryptContent(ctx context.Context, path string, extraEnv []string) ([]byte, error) {
 	if _, err := exec.LookPath(binary); err != nil {
 		return nil, fmt.Errorf("sops: decrypt %s: sops binary not found in PATH", path)
 	}
@@ -93,7 +110,7 @@ func decrypt(ctx context.Context, path string, extraEnv []string) (map[string]st
 	if err != nil {
 		return nil, fmt.Errorf("sops: decrypt %s: %w%s", path, err, stderrSnippet(err))
 	}
-	return dotenv.Parse(out), nil
+	return out, nil
 }
 
 // stderrSnippet extracts a bounded excerpt of the stderr of a failed

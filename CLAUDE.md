@@ -22,6 +22,16 @@ triggert keinen Deploy), Service-Filter für lokale Stacks (`services` jetzt
 wirksam auch für Basis-Stacks, neu `ignore_services` mit Komodo-Semantik,
 beide im Hash als effective Services) und Compose-Override-Files (neu
 `compose_files`, Multi-`-f` in Listenreihenfolge, Hash über alle Inhalte).
+Phase 6b: SOPS-Sidecar — zweiter Resolver `sops.SidecarResolver` (HTTP-
+Client mit 60s-Timeout/10MB-Limit) plus Server-Handler
+`sops.NewSidecarHandler` (Pfad-Allow-List, `..`-Traversal-Block) und
+Mini-Programm `cmd/sops-sidecar`; CLI-Flag `-sops-sidecar`
+(`DOCKOPS_SOPS_SIDECAR_URL`, leer = lokaler `sops`-Exec); Vault-Template-
+Syntax `env.RenderVaultTemplate` für `${VAULT:path#key}`/`${VAULT:path:key}`
+mit neuem Stack-Feld `vault_env_templates` (gleiche Prioritätsstufe wie
+vault_paths, Import-Merge concat+dedup, Hash Schema v3) und
+`secrets.VaultReader`; Image `cmd/sops-sidecar/Dockerfile.sidecar`, sops-
+Profil in der `compose.yaml`, README-Abschnitt „SOPS decryption“.
 
 ## Umgebung
 
@@ -31,37 +41,55 @@ beide im Hash als effective Services) und Compose-Override-Files (neu
 
 ## Struktur
 
-- `cmd/dockops/` — CLI-Entry-Point: Flags mit Env-Fallbacks, `-once`- und
+- `cmd/dockops/` — CLI-Entry-Point: Flags mit Env-Fallbacks (`-repo`,
+  `-branch`, `-webhook-secret`, `-sops-sidecar`, `-interval`), `-once`- und
   Daemon-Modus (Webhook-Server + Poll-Timer, debounced Trigger, Graceful
   Shutdown), slog-JSON auf stdout
+- `cmd/sops-sidecar/` — Mini-Programm des Decrypt-Sidecars: Startet den
+  Handler aus `internal/sops` hinter `net/http` mit Graceful Shutdown;
+  Wurzeln aus `SOPS_SIDECAR_ALLOWED_ROOTS` (doppelpunkt-separiert, absolut,
+  Pflicht), Adresse aus `-addr`/`SOPS_SIDECAR_ADDR` (Default `:8081`)
 - `internal/config/` — Config-Loader: Root-Config, Stack-Discovery über
   Include-Globs, Compose-Auto-Detection, Import-Merge, Validierung;
   Stack-Felder: `services` (auch Basis-Stacks), `ignore_services`
   (Schnittmenge mit `services` = Validierungsfehler; Import-Merge:
   services ersetzt, ignore concat+dedup), `compose_files`
-  (Multi-`-f`, exklusiv zu `compose_file`, alle Dateien müssen existieren);
+  (Multi-`-f`, exklusiv zu `compose_file`, alle Dateien müssen existieren),
+  `vault_env_templates` (Import-Merge concat+dedup wie vault_paths, Pfade
+  relativ zum Stack-Dir, Auflösung im Env-Merge);
   Helper `EffectiveComposeFiles`/`EffectiveServices`/`ExcludeServices`
 - `internal/git/` — Git-Manager: Clone-or-Update der Remote-Checkouts über
   die lokal installierte git-Binary (`os/exec`, keine Git-Library)
 - `internal/hash/` — Deterministisches Stack-Hashing (Package `stackhash`,
-  Schema-Version 2): kanonische Serialisierung von Stack (inkl. Compose-
-  File-Liste, effective Services und ignore_services) + normalisierten
-  Compose-Inhalten (einer pro Datei, in `-f`-Reihenfolge)
+  Schema-Version 3): kanonische Serialisierung von Stack (inkl. Compose-
+  File-Liste, effective Services, ignore_services und
+  vault_env_templates) + normalisierten Compose-Inhalten (einer pro Datei,
+  in `-f`-Reihenfolge)
 - `internal/state/` — State-Store: Deployment-Zustand pro Stack (JSON-Datei,
   atomar geschrieben; `compose_files` für Multi-File-Prune aufgezeichnet)
 - `internal/dotenv/` — Minimaler dotenv-Dialekt (Parse/Format), geteilt von
-  SOPS-Output, env_files und der erzeugten `--env-file`/Stack-`.env`
-- `internal/secrets/` — `Resolver`-Interface: abstrahiert SOPS-Dateien und
-  Vault-Pfade für den Env-Merge
+  SOPS-Output, env_files, Vault-Templates und der erzeugten
+  `--env-file`/Stack-`.env`
+- `internal/secrets/` — `Resolver`-Interface (abstrahiert SOPS-Dateien und
+  Vault-Pfade für den Env-Merge) und `VaultReader` (ReadKV-Teilmenge für
+  `env.RenderVaultTemplate`)
 - `internal/vault/` — Vault-Client für KV v2 über net/http (keine
   Vault-Library): Token/AppRole-Login, ReadKV
-- `internal/sops/` — Entschlüsseln via `sops`-Binary (os/exec), Auflösung
-  von age-Keyfiles über SOPS_AGE_KEY_FILE im Child-Prozess
-- `internal/env/` — Env-Merge (env_files < sops < vault < Systemvars;
-  `<stackDir>/.env` wird als Quelle übersprungen, weil dockops sie selbst
-  generiert), WriteShm (0600-Env-Datei in /dev/shm mit idempotentem
-  Cleanup) und WriteStackEnv (atomare 0600-`<stackDir>/.env` mit Rollback:
-  restore-or-remove; bewusst nicht im Stack-Hash)
+- `internal/sops/` — Zwei Resolver: lokales Entschlüsseln via `sops`-Binary
+  (os/exec, age-Keyfiles über SOPS_AGE_KEY_FILE im Child-Prozess) und
+  `SidecarResolver` via HTTP (`NewSidecar`; 60s-Request-Timeout,
+  10MB-Response-Limit, age_keyfile = Fehler); `NewSidecarHandler` dient den
+  Endpunkte `POST /decrypt` (JSON `{"path"}` → `{"content"}` bzw.
+  `{"error"}`) und `GET /healthz` mit Pfad-Allow-List
+  (`filepath.Clean` + Prefix-Check blockt `..`-Traversal)
+- `internal/env/` — Env-Merge (env_files < sops < vault_paths ≈
+  vault_env_templates < Systemvars; `<stackDir>/.env` wird als Quelle
+  übersprungen, weil dockops sie selbst generiert), RenderVaultTemplate
+  (`${VAULT:path#key}`/`${VAULT:path:key}`, zeilenweises Ersetzen, Fehler
+  mit Zeilennummer + Referenz, per Template gecachte KV-Reads), WriteShm
+  (0600-Env-Datei in /dev/shm mit idempotentem Cleanup) und WriteStackEnv
+  (atomare 0600-`<stackDir>/.env` mit Rollback: restore-or-remove;
+  bewusst nicht im Stack-Hash)
 - `internal/hooks/` — Hook-Engine: sequenzielle `sh -c`-Ausführung mit
   Per-Kommando-Timeout (Prozessgruppen-Kill) und slog-Output
 - `internal/compose/` — Compose-Executor: `docker compose up/down` mit
@@ -71,11 +99,13 @@ beide im Hash als effective Services) und Compose-Override-Files (neu
   der Compose-Dateien minus ignore, "alles ignoriert" = Fehler), plus
   `DownProject` (Prune ohne Compose-Datei)
 - `internal/reconciler/` — Reconciliation-Loop: verdrahtet git, config,
-  hash, state, secrets (Vault-Login einmal pro Durchlauf), env, hooks und
-  compose zu einem idempotenten Durchlauf mit Prune und `errors.Join`;
-  schreibt vor jedem compose-Aufruf die generierte `<stackDir>/.env`
-  (Rollback nur bei Up-Fehler); Git/Compose/Hooks/Sops/Vault als
-  injizierbare Interfaces für Tests
+  hash, state, secrets (Vault-Login einmal pro Durchlauf, sobald ein Stack
+  vault_paths ODER vault_env_templates hat), env, hooks und compose zu
+  einem idempotenten Durchlauf mit Prune und `errors.Join`; schreibt vor
+  jedem compose-Aufruf die generierte `<stackDir>/.env` (Rollback nur bei
+  Up-Fehler); Git/Compose/Hooks/Sops/Vault als injizierbare Interfaces für
+  Tests, `Deps.SopsSidecarURL` schaltet die sops_files-Dekryptierung auf
+  den Sidecar um (injiziertes Sops gewinnt)
 - `internal/webhook/` — Webhook-HTTP-Handler: `POST /webhook` mit
   GitHub-HMAC-SHA256 (`X-Hub-Signature-256`) oder GitLab-Token
   (`X-Gitlab-Token`), konstante Vergleiche, `GET /healthz`
@@ -84,17 +114,26 @@ beide im Hash als effective Services) und Compose-Override-Files (neu
   `docker`/`sops`-Skripte via PATH-Override, Fake-Vault via
   `httptest.Server`
 - `Dockerfile` — Multi-Stage-Build (statisches Binary, alpine-Runtime mit
-  docker-cli + compose-Plugin, git, openssh-client, CA-Certs)
+  docker-cli + compose-Plugin, git, openssh-client, CA-Certs; bewusst KEIN
+  sops — Decrypt-Last trägt der Sidecar)
+- `cmd/sops-sidecar/Dockerfile.sidecar` — Sidecar-Image: Build-Stage
+  kompiliert das Binary statisch, Runtime alpine + sops + CA-Certs (mehr
+  nicht — Credentials/Vault-Transit leben hier, nicht im dockops-Image)
 - `compose.yaml` — dockops selbst als Container: docker.sock-Mount,
-  SSH-Key-Mount (ro), `DOCKOPS_*`-Env, Vault-Env, Port 8080
+  SSH-Key-Mount (ro), `DOCKOPS_*`-Env (inkl. `DOCKOPS_SOPS_SIDECAR_URL`,
+  per Shell/.env substituiert), Vault-Env, Port 8080; optionaler
+  `sops-sidecar`-Service hinter Profil `sops` (gemeinsames Volume read-
+  only, kein published Port)
 - `README.md` — Dokumentation: Architektur, Config-Beispiele (Root +
-  immich-Stack, beide Import-Varianten), Reconcile-Ablauf, Secret-Priorität,
-  CLI-Referenz, Docker-Deployment, Development
+  immich-Stack, beide Import-Varianten, vault.env-Template), Reconcile-
+  Ablauf, Secret-Priorität, SOPS decryption (lokal vs. Sidecar inkl.
+  HTTP-Vertrag), CLI-Referenz, Docker-Deployment, Development
 - `PHASE1_TASK.md` — Aufgabenstellung (nicht ändern)
 - `PHASE2_TASK.md` — Aufgabenstellung (nicht ändern)
 - `PHASE3_TASK.md` — Aufgabenstellung (nicht ändern)
 - `PHASE4_TASK.md` — Aufgabenstellung (nicht ändern)
 - `PHASE6A_TASK.md` — Aufgabenstellung (nicht ändern)
+- `PHASE6B_TASK.md` — Aufgabenstellung (nicht ändern)
 
 ## Konventionen
 

@@ -367,8 +367,7 @@ func TestComputeComposeErrors(t *testing.T) {
 // TestComputeGoldenVector pins the exact hash of a fixed input. It must only
 // change together with a schemaVersion bump; otherwise the canonical form
 // changed unintentionally and persisted hashes would silently lose meaning.
-// The current vector is the schema-2 form (compose file list, effective
-// services, ignore_services).
+// The current vector is the schema-3 form (schema 2 plus vault_env_templates).
 func TestComputeGoldenVector(t *testing.T) {
 	stack := config.Stack{
 		Name:        "web",
@@ -381,7 +380,8 @@ func TestComputeGoldenVector(t *testing.T) {
 			{Path: "db-password.enc", AgeKeyfile: "/etc/dockops/age.key"},
 			{Path: "api-token.enc"},
 		},
-		VaultPaths: []string{"secret/web/tls", "secret/web/api"},
+		VaultPaths:        []string{"secret/web/tls", "secret/web/api"},
+		VaultEnvTemplates: []string{"vault.env"},
 		Hooks: config.Hooks{
 			PreDeploy:  []string{"echo pre1", "echo pre2"},
 			PostDeploy: []string{"echo post"},
@@ -391,8 +391,44 @@ func TestComputeGoldenVector(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Compute() error = %v", err)
 	}
-	const want = "05294051bb498074c0e77559aa505d28e3d17afb9a1e6f74848fb5586a08ccd5"
+	const want = "8c7e04c406b8c7a704d75f24d610cb5f295182160bc488e8381018259f646cab"
 	if got != want {
 		t.Errorf("golden vector hash = %s, want %s (schemaVersion changed?)", got, want)
+	}
+}
+
+// TestComputeVaultEnvTemplatesAffectHash pins that the template list is
+// hash-relevant: adding, removing or reordering vault_env_templates changes
+// what a deployment resolves and must therefore change the hash.
+func TestComputeVaultEnvTemplatesAffectHash(t *testing.T) {
+	base := baseStack()
+	base.ComposeFile = "/srv/stacks/web/compose.yaml"
+
+	without, err := Compute(base, []byte(baseCompose))
+	if err != nil {
+		t.Fatalf("Compute() without templates error = %v", err)
+	}
+	withOne := base
+	withOne.VaultEnvTemplates = []string{"vault.env"}
+	one, err := Compute(withOne, []byte(baseCompose))
+	if err != nil {
+		t.Fatalf("Compute() with one template error = %v", err)
+	}
+	withTwo := base
+	withTwo.VaultEnvTemplates = []string{"vault.env", "extra.env"}
+	two, err := Compute(withTwo, []byte(baseCompose))
+	if err != nil {
+		t.Fatalf("Compute() with two templates error = %v", err)
+	}
+	flipped := base
+	flipped.VaultEnvTemplates = []string{"extra.env", "vault.env"}
+	swapped, err := Compute(flipped, []byte(baseCompose))
+	if err != nil {
+		t.Fatalf("Compute() with swapped templates error = %v", err)
+	}
+
+	if one == without || two == one || swapped == two {
+		t.Errorf("hashes without=%s one=%s two=%s swapped=%s; templates must change the hash (order included)",
+			without[:12], one[:12], two[:12], swapped[:12])
 	}
 }

@@ -46,19 +46,24 @@ type SystemVars struct {
 }
 
 // MergeStackEnv assembles the environment of stack: all env_files are
-// parsed, all sops files decrypted and all Vault paths read via secrets,
-// then the system variables are set. baseDir is the directory relative
-// env_files and sops paths resolve against (typically stack.Dir, passed
-// separately so callers and tests control it).
+// parsed, all sops files decrypted, all Vault paths read and all vault
+// templates rendered via secrets, then the system variables are set. baseDir
+// is the directory relative env_files, sops and vault template paths resolve
+// against (typically stack.Dir, passed separately so callers and tests
+// control it).
 //
-// Merge priority, low to high: env_files < sops_files < vault_paths <
-// system variables — and within each group, later list entries win. The
-// config loader (internal/config) already concatenates the base stack's
-// lists with the import's ("base first, then import"), so the required
-// "base before import" priority falls out of the plain list order; nothing
-// here re-derives the base/import origin. The system variables are set last
-// and therefore cannot be overridden by any secret source — a stack cannot
-// lie about its own identity.
+// Merge priority, low to high: env_files < sops_files < vault_paths and
+// vault_env_templates < system variables — and within each group, later
+// list entries win. The vault templates sit on the same level as
+// vault_paths (the briefing groups them there for compatibility with
+// existing vault.env files) and are applied after them, so on a key
+// collision the template wins — a deterministic, documented choice among
+// the open points. The config loader (internal/config) already concatenates
+// the base stack's lists with the import's ("base first, then import"), so
+// the required "base before import" priority falls out of the plain list
+// order; nothing here re-derives the base/import origin. The system
+// variables are set last and therefore cannot be overridden by any secret
+// source — a stack cannot lie about its own identity.
 func MergeStackEnv(ctx context.Context, stack config.Stack, secrets secrets.Resolver, baseDir string, sys SystemVars) (map[string]string, error) {
 	env := make(map[string]string)
 
@@ -103,6 +108,31 @@ func MergeStackEnv(ctx context.Context, stack config.Stack, secrets secrets.Reso
 		kv, err := secrets.ResolveVault(ctx, p)
 		if err != nil {
 			return nil, fmt.Errorf("stack %s: vault_paths[%d] %s: %w", stack.Name, i, p, err)
+		}
+		for k, v := range kv {
+			env[k] = v
+		}
+	}
+
+	// Vault templates render on the same priority level as vault_paths
+	// (applied after them; see the merge priority note above). The same
+	// generated-<stackDir>/.env skip as for env_files applies: a template
+	// pointing at dockops' own output would freeze stale resolved values.
+	for i, rel := range stack.VaultEnvTemplates {
+		path := rel
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(baseDir, path)
+		}
+		if filepath.Clean(path) == generatedEnv {
+			continue
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("stack %s: vault_env_templates[%d] %s: %w", stack.Name, i, path, err)
+		}
+		kv, err := RenderVaultTemplate(ctx, string(raw), resolverVaultReader{resolver: secrets})
+		if err != nil {
+			return nil, fmt.Errorf("stack %s: vault_env_templates[%d] %s: %w", stack.Name, i, path, err)
 		}
 		for k, v := range kv {
 			env[k] = v

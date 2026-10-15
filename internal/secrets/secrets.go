@@ -14,6 +14,16 @@ import (
 	"github.com/local/dockops/internal/config"
 )
 
+// VaultReader reads the key/value pairs stored at a single Vault KV v2 path
+// (for example "stacks/web") below the configured mount. It is the ReadKV
+// half of vault.Client, factored out so consumers like the vault template
+// rendering (internal/env) depend on reading Vault alone — without pulling in
+// the sops half of Resolver.
+type VaultReader interface {
+	// ReadKV reads the KV v2 secret at path below the configured mount.
+	ReadKV(ctx context.Context, path string) (map[string]string, error)
+}
+
 // Resolver resolves the secret references of a stack into key/value pairs
 // that are merged into the stack environment. Implementations only need to
 // be safe for sequential use; the deployment loop resolves secrets one stack

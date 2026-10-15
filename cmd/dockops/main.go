@@ -27,9 +27,10 @@ import (
 
 // Environment variables backing the flags; see parseFlags.
 const (
-	envRepoURL       = "DOCKOPS_REPO_URL"
-	envBranch        = "DOCKOPS_BRANCH"
-	envWebhookSecret = "DOCKOPS_WEBHOOK_SECRET"
+	envRepoURL        = "DOCKOPS_REPO_URL"
+	envBranch         = "DOCKOPS_BRANCH"
+	envWebhookSecret  = "DOCKOPS_WEBHOOK_SECRET"
+	envSopsSidecarURL = "DOCKOPS_SOPS_SIDECAR_URL"
 )
 
 // Defaults for the flags and the poll loop.
@@ -43,12 +44,13 @@ const (
 
 // options is the parsed command line (with environment fallbacks).
 type options struct {
-	RepoURL       string
-	Branch        string
-	StatePath     string
-	WebhookSecret string
-	Addr          string
-	Once          bool
+	RepoURL        string
+	Branch         string
+	StatePath      string
+	WebhookSecret  string
+	Addr           string
+	SopsSidecarURL string
+	Once           bool
 	// Interval is the -interval override; 0 means unset, in which case
 	// global.poll_interval from the loaded config applies.
 	Interval time.Duration
@@ -69,6 +71,8 @@ func parseFlags(args []string, getenv func(string) string) (options, error) {
 	fs.StringVar(&opts.StatePath, "state", defaultStatePath, "path of the JSON state file")
 	fs.StringVar(&opts.WebhookSecret, "webhook-secret", getenv(envWebhookSecret), "shared secret for webhook authentication (env "+envWebhookSecret+")")
 	fs.StringVar(&opts.Addr, "addr", defaultAddr, "listen address of the webhook server")
+	fs.StringVar(&opts.SopsSidecarURL, "sops-sidecar", getenv(envSopsSidecarURL),
+		"URL of the sops decrypt sidecar, e.g. http://sops-sidecar:8081 (env "+envSopsSidecarURL+"; empty: decrypt via the local sops binary)")
 	fs.BoolVar(&opts.Once, "once", false, "run a single reconcile pass and exit")
 	fs.StringVar(&interval, "interval", "", "poll interval override like \"5m\" (default: global.poll_interval from the config)")
 
@@ -160,10 +164,11 @@ func run(opts options, logger *slog.Logger) error {
 	// host repository; the callback hands it over to the poll loop.
 	intervals := &intervalSource{}
 	rec := reconciler.New(reconciler.Deps{
-		RepoURL: opts.RepoURL,
-		Branch:  opts.Branch,
-		State:   store,
-		Logger:  logger,
+		RepoURL:        opts.RepoURL,
+		Branch:         opts.Branch,
+		State:          store,
+		Logger:         logger,
+		SopsSidecarURL: opts.SopsSidecarURL,
 		OnConfigLoaded: func(cfg *config.Config) {
 			intervals.set(time.Duration(cfg.Global.PollInterval))
 		},

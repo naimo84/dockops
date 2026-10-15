@@ -1,0 +1,29 @@
+# sops-sidecar image: the decrypt service dockops talks to in sidecar mode
+# (dockops flag -sops-sidecar / DOCKOPS_SOPS_SIDECAR_URL). Multi-stage like
+# the main Dockerfile: a static, stripped binary from the Go builder, then a
+# slim alpine runtime carrying ONLY what decryption needs — the sops CLI
+# (alpine community repository) plus CA roots for the Vault-Transit HTTPS
+# calls. The sops credentials (.sops.yaml with hc_vault_transit_uri,
+# VAULT_TOKEN, age keys) live in THIS container and deliberately never in
+# the dockops image.
+#
+# Build context is the repository root:
+#   docker build -f cmd/sops-sidecar/Dockerfile.sidecar -t dockops-sops-sidecar .
+
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/sops-sidecar ./cmd/sops-sidecar
+
+FROM alpine:3.20
+RUN apk add --no-cache sops ca-certificates
+COPY --from=build /out/sops-sidecar /usr/local/bin/sops-sidecar
+# Runtime configuration via environment:
+#   SOPS_SIDECAR_ALLOWED_ROOTS  colon-separated absolute directories that may
+#                               be decrypted (required; the security boundary)
+#   SOPS_SIDECAR_ADDR           listen address (default :8081)
+#   VAULT_ADDR / VAULT_TOKEN    Vault-Transit access for .sops.yaml rules
+# Stack directories arrive through a shared (read-only) volume mount.
+ENTRYPOINT ["/usr/local/bin/sops-sidecar"]

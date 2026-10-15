@@ -156,11 +156,20 @@ type Deps struct {
 	// Hooks, nil → hooks.Engine.
 	Hooks HookRunner
 
-	// Sops, nil → sops.DecryptFileKeyfile.
+	// Sops, nil → sops.DecryptFileKeyfile when SopsSidecarURL is also
+	// empty, else the sidecar resolver's decrypt function. An explicitly
+	// injected Sops wins over the sidecar URL (tests control the decrypt
+	// path that way).
 	Sops SopsDecryptFunc
 
+	// SopsSidecarURL switches sops_files decryption from the local sops
+	// binary to the decrypt sidecar at this URL (flag -sops-sidecar, env
+	// DOCKOPS_SOPS_SIDECAR_URL). Empty keeps the local exec fallback. It
+	// has no effect while Sops is injected.
+	SopsSidecarURL string
+
 	// NewVault, nil → vault.New. Called at most once per pass, and only
-	// when a stack actually has vault paths.
+	// when a stack actually has vault paths or vault templates.
 	NewVault VaultFactory
 }
 
@@ -203,7 +212,14 @@ func New(deps Deps) *Reconciler {
 	}
 	sopsFn := deps.Sops
 	if sopsFn == nil {
-		sopsFn = sops.DecryptFileKeyfile
+		if deps.SopsSidecarURL != "" {
+			// Sidecar mode: decrypt via the HTTP service instead of the
+			// local sops binary (fleet reality: the sops credentials live in
+			// the sidecar container, not in the dockops image).
+			sopsFn = sops.NewSidecar(deps.SopsSidecarURL, nil).DecryptFileKeyfile
+		} else {
+			sopsFn = sops.DecryptFileKeyfile
+		}
 	}
 	vaultFactory := deps.NewVault
 	if vaultFactory == nil {
@@ -384,9 +400,10 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	r.logger.Info("deploying stack", "stack", stack.Name, "hash", newHash)
 
 	// Secrets: the Vault client is built and logged in lazily, at most once
-	// per pass, and only when a stack actually carries vault paths.
+	// per pass, and only when a stack actually carries vault paths or vault
+	// templates (the templates resolve through the same KV v2 read).
 	var vaultClient VaultClient
-	if len(stack.VaultPaths) > 0 {
+	if len(stack.VaultPaths) > 0 || len(stack.VaultEnvTemplates) > 0 {
 		vaultClient, err = vaultSess.get(ctx)
 		if err != nil {
 			r.markFailed(stack, newHash)
@@ -567,8 +584,8 @@ func (r *Reconciler) validate() error {
 // vaultSession builds and logs in the Vault client at most once per
 // reconcile pass (briefing: "Login einmal pro Reconcile-Durchlauf") and
 // caches the outcome: a failed construction or login is replayed for every
-// later stack with vault paths instead of hammering an unreachable server.
-// The next pass starts fresh with a new session.
+// later stack with vault paths or vault templates instead of hammering an
+// unreachable server. The next pass starts fresh with a new session.
 type vaultSession struct {
 	factory VaultFactory
 	cfg     config.Vault

@@ -80,6 +80,39 @@ func TestParseFlagsArgsOverrideEnv(t *testing.T) {
 	}
 }
 
+func TestParseFlagsSopsSidecar(t *testing.T) {
+	// Empty default: dockops decrypts with the local sops binary.
+	opts, err := parseFlags([]string{"-repo", "u"}, fakeEnv(nil))
+	if err != nil {
+		t.Fatalf("parseFlags() error = %v", err)
+	}
+	if opts.SopsSidecarURL != "" {
+		t.Errorf("SopsSidecarURL = %q, want empty default (local sops mode)", opts.SopsSidecarURL)
+	}
+
+	// Env fallback.
+	opts, err = parseFlags([]string{"-repo", "u"}, fakeEnv(map[string]string{
+		envSopsSidecarURL: "http://sops-sidecar:8081",
+	}))
+	if err != nil {
+		t.Fatalf("parseFlags() error = %v", err)
+	}
+	if opts.SopsSidecarURL != "http://sops-sidecar:8081" {
+		t.Errorf("SopsSidecarURL = %q, want env value", opts.SopsSidecarURL)
+	}
+
+	// Flag wins over env.
+	opts, err = parseFlags([]string{"-repo", "u", "-sops-sidecar", "http://elsewhere:9999"}, fakeEnv(map[string]string{
+		envSopsSidecarURL: "http://sops-sidecar:8081",
+	}))
+	if err != nil {
+		t.Fatalf("parseFlags() error = %v", err)
+	}
+	if opts.SopsSidecarURL != "http://elsewhere:9999" {
+		t.Errorf("SopsSidecarURL = %q, want flag value", opts.SopsSidecarURL)
+	}
+}
+
 func TestParseFlagsMissingRepo(t *testing.T) {
 	_, err := parseFlags(nil, fakeEnv(nil))
 	if err == nil || !strings.Contains(err.Error(), envRepoURL) {

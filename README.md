@@ -44,9 +44,10 @@ Poll-Timer, Webhook (GitHub/GitLab) oder einmalig mit `-once`.
 - **Imports**: Referenzieren einen Stack aus einem Shared-Remote und mergen
   Overrides darüber (eigener Name, Profile, Secrets, Hooks — oder nur eine
   Teilmenge der Container).
-- Der Agent selbst ist ein einzelnes statisches Go-Binary, das `git`,
-  `docker compose` und `sops` als CLI-Aufrufe nutzt und Vault per HTTP
-  (KV v2) liest.
+- Der Agent selbst ist ein einzelnes statisches Go-Binary, das `git` und
+  `docker compose` als CLI-Aufrufe nutzt, SOPS-Dateien lokal per `sops`-CLI
+  oder über einen Sidecar-HTTP-Dienst entschlüsselt (siehe „SOPS
+  decryption“) und Vault per HTTP (KV v2) liest.
 
 ## Root-`stacks.yaml`
 
@@ -151,6 +152,12 @@ sops_files:
 vault_paths:
   - homelab/immich
 
+# Vault-Templates: dotenv-Dateien mit ${VAULT:<path>#<key>}-Referenzen
+# (Kompatibilität zu bestehenden vault.env-Files); gleiche Prioritätsstufe
+# wie vault_paths, Pfad relativ zum Stack-Verzeichnis
+vault_env_templates:
+  - vault.env
+
 hooks:
   pre_deploy:
     - mkdir -p /srv/immich/library /srv/immich/upload
@@ -175,6 +182,21 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD}
   # …
 ```
+
+Dazu passend `media/immich/vault.env` (das Template):
+
+```dotenv
+DB_PASSWORD=${VAULT:hosts/host-01/traefik#db_password}
+IMMICH_API_KEY=${VAULT:hosts/host-01/traefik:api_key}
+```
+
+`${VAULT:<path>#<key>}` (alternativ `:` statt `#`) löst `key` aus dem KV-v2-
+Secret `path` unter `global.vault.mount_path` auf — `path` ist derselbe
+Pfad wie in `vault_paths`. Alles andere in der Zeile bleibt literal, auch
+mehrere Referenzen pro Zeile; die KEY-Namen links vom `=` stehen im
+Template. Fehlt der Pfad oder Key in Vault, scheitert der Deploy mit
+Datei- und Referenz-Kontext. Bei mehreren Templates gewinnt das spätere in
+Listenreihenfolge.
 
 Hooks laufen als `sh -c` im Stack-Verzeichnis, sequenziell mit
 Per-Kommando-Timeout (Default 5 Minuten), und erhalten die komplette
@@ -224,8 +246,10 @@ Imports gilt Basis vor Import):
 | Priorität | Quelle |
 |---|---|
 | 1 | `env_files` (Klartext-dotenv) |
-| 2 | `sops_files` (via `sops -d --input-type dotenv`) |
-| 3 | `vault_paths` (KV v2, `GET /v1/<mount>/data/<path>`) |
+| 2 | `sops_files` (via `sops -d --input-type dotenv`, lokal oder Sidecar) |
+| 3 | `vault_paths` (KV v2, `GET /v1/<mount>/data/<path>`) und
+    `vault_env_templates` (gleich danach angewendet; bei Kollision gewinnt
+    das Template) |
 | 4 | Systemvariablen: `STACK_NAME`, `STACK_DIR`, `GIT_COMMIT` — immer
     zuletzt, von keinem Secret überschreibbar |
 
@@ -235,10 +259,59 @@ der Compose-Datei) und als Umgebung an Hooks. Die Datei liegt in
 überschrieben und gelöscht; Secrets erscheinen nie in Logs oder
 Fehlermeldungen.
 
+## SOPS decryption
+
+dockops kennt zwei Modi, `sops_files` zu entschlüsseln:
+
+### Modus 1: lokales `sops`-CLI (Default)
+
+dockops führt `sops -d --input-type dotenv --output-type dotenv <path>` selbst
+aus. Voraussetzung: `sops`-Binary, `.sops.yaml`-Regeln und die Credentials
+(age-Keyfiles via `SOPS_AGE_KEY_FILE` an den Child-Prozess, Vault-Transit via
+`VAULT_ADDR`/`VAULT_TOKEN`) liegen im dockops-Container. Passend für
+Einzel-Host-Betrieb und Tests (`-once` mit Fake-Binaries auf dem PATH).
+
+### Modus 2: SOPS-Sidecar (Fleet-Realität)
+
+SOPS-Binary und Credentials kommen NICHT ins dockops-Image. Stattdessen
+läuft `cmd/sops-sidecar` als eigener Container im selben Compose-Netz,
+teilt sich die Stack-Checkouts per Read-only-Volume und hält `sops` +
+`.sops.yaml` + Vault-Transit-Zugang. dockops bekommt die URL über
+`-sops-sidecar`/`DOCKOPS_SOPS_SIDECAR_URL` (z. B.
+`http://sops-sidecar:8081`) und löst damit ALLE `sops_files` auf.
+
+HTTP-Vertrag (`POST /decrypt`):
+
+    Anfrage:   {"path": "/abs/path/file.env"}
+    Antwort:   200 {"content": "<dotenv-klartext>"}
+           oder 4xx/5xx {"error": "..."} — 400 malformed Body/Pfad,
+             403 Pfad außerhalb der erlaubten Wurzeln, 500 Decrypt-Fehler
+
+    GET /healthz → 200 {"status":"ok"}
+
+Sicherheit: keine Auth (Netz-Isolation — der Sidecar veröffentlicht keinen
+Port, nur dockops im gemeinsamen Netz erreicht ihn), dafür Client-seitig
+ein 60-s-Request-Timeout und ein 10-MB-Response-Limit sowie Server-seitig
+die Pfad-Allow-List `SOPS_SIDECAR_ALLOWED_ROOTS` (doppelpunkt-separiert;
+`filepath.Clean` + Prefix-Check blockt `..`-Traversal, bevor `sops` je
+läuft). `age_keyfile` ist im Sidecar-Modus nicht transportierbar und wird
+als Fehler gemeldet — age-Keys gehören in den Sidecar-Container, per
+`SOPS_AGE_KEY_FILE` dort.
+
+Deployment im eigenen `compose.yaml` des Repos (siehe auch
+„Docker-Deployment“): der Sidecar-Service trägt das Profil `sops` und muss
+explizit aktiviert werden, inkl. der URL-Variable:
+
+    DOCKOPS_SOPS_SIDECAR_URL=http://sops-sidecar:8081 \
+      docker compose --profile sops up -d
+
+(Build des Images: `docker compose --profile sops build`.)
+
 ## CLI
 
     dockops [-repo URL] [-branch NAME] [-state PFAD] [-addr HOST:PORT]
-            [-webhook-secret GEHEIMNIS] [-interval DAUER] [-once]
+            [-webhook-secret GEHEIMNIS] [-sops-sidecar URL]
+            [-interval DAUER] [-once]
 
 | Flag | Env-Variable | Default | Bedeutung |
 |---|---|---|---|
@@ -247,6 +320,7 @@ Fehlermeldungen.
 | `-state` | — | `/var/lib/dockops/state.json` | Pfad der JSON-State-Datei |
 | `-webhook-secret` | `DOCKOPS_WEBHOOK_SECRET` | leer | Shared Secret für `POST /webhook`; leer ⇒ Webhooks ohne Auth (Warnung im Log) |
 | `-addr` | — | `:8080` | Listen-Adresse des Webhook-Servers |
+| `-sops-sidecar` | `DOCKOPS_SOPS_SIDECAR_URL` | leer | URL des SOPS-Sidecar (z. B. `http://sops-sidecar:8081`); leer ⇒ lokales `sops -d` |
 | `-interval` | — | `global.poll_interval` (Default 5m) | Poll-Intervall-Override, z. B. `90s` |
 | `-once` | — | `false` | Ein einzelner Reconcile-Durchlauf, dann Exit |
 
@@ -295,9 +369,19 @@ zum Laufen, den er verwaltet (`docker compose build && docker compose up -d`):
   `state.json` (flag `-state`) und die Checkouts unter
   `/var/lib/dockops/repos` (Default `global.work_dir`).
 - **Port** `8080:8080` für Webhooks und `/healthz`.
-- age-Keyfiles für `sops_files[].age_keyfile` müssen im Container erreichbar
-  sein — analog zum SSH-Key mounten und in der Stack-Definition auf den
-  Container-Pfad zeigen lassen.
+- **SOPS-Sidecar** (optional, Profil `sops`): `sops-sidecar` baut aus
+  `cmd/sops-sidecar/Dockerfile.sidecar` (alpine + sops + CA-Certs, mehr
+  nicht) und mountet `dockops-data` read-only — die Checkouts sind lesbar,
+  Decrypt schreibt nie. Er veröffentlicht keinen Port; dockops erreicht ihn
+  über das gemeinsame Compose-Netz. Aktivieren mitsamt der URL-Variable:
+
+      DOCKOPS_SOPS_SIDECAR_URL=http://sops-sidecar:8081 \
+        docker compose --profile sops up -d
+
+  Ohne Profil und Variable bleibt der lokale `sops`-Modus aktiv — age-
+  Keyfiles für `sops_files[].age_keyfile` müssen dann im dockops-Container
+  erreichbar sein (analog zum SSH-Key mounten und in der Stack-Definition
+  auf den Container-Pfad zeigen lassen). Details: „SOPS decryption“.
 
 Einmal-Alternativen: `command: ["-once"]` in der `compose.yaml` oder
 `docker compose run --rm dockops -once`.
@@ -311,4 +395,6 @@ Der E2E-Test (`internal/reconciler/e2e_test.go`) fährt vollständige
 Reconcile-Durchläufe gegen echte Git-Repos auf `t.TempDir()`;
 `docker`/`sops` sind Fake-Binaries auf dem PATH, Vault ein
 `httptest.Server`. Benötigt werden nur `git` und `sh` auf der Maschine.
+Der SOPS-Sidecar ist ein eigenes Binary (`go build ./cmd/sops-sidecar`,
+Image via `cmd/sops-sidecar/Dockerfile.sidecar`).
 Externe Abhängigkeit ist allein `gopkg.in/yaml.v3`.

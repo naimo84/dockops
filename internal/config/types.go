@@ -69,16 +69,17 @@ type Remote struct {
 // Import references a stack definition inside a remote checkout plus
 // overrides that are merged on top of the loaded base stack.
 type Import struct {
-	Remote         string   `yaml:"remote"`
-	Path           string   `yaml:"path"`
-	Name           string   `yaml:"name"`
-	Profiles       []string `yaml:"profiles"`
-	Services       []string `yaml:"services"`
-	IgnoreServices []string `yaml:"ignore_services"`
-	EnvFiles       []string `yaml:"env_files"`
-	SopsFiles      []string `yaml:"sops_files"`
-	VaultPaths     []string `yaml:"vault_paths"`
-	Hooks          Hooks    `yaml:"hooks"`
+	Remote            string   `yaml:"remote"`
+	Path              string   `yaml:"path"`
+	Name              string   `yaml:"name"`
+	Profiles          []string `yaml:"profiles"`
+	Services          []string `yaml:"services"`
+	IgnoreServices    []string `yaml:"ignore_services"`
+	EnvFiles          []string `yaml:"env_files"`
+	SopsFiles         []string `yaml:"sops_files"`
+	VaultPaths        []string `yaml:"vault_paths"`
+	VaultEnvTemplates []string `yaml:"vault_env_templates"`
+	Hooks             Hooks    `yaml:"hooks"`
 }
 
 // Hooks holds shell commands that run before and after a stack deployment.
@@ -110,7 +111,12 @@ type Stack struct {
 	EnvFiles       []string   `yaml:"env_files"`
 	SopsFiles      []SopsFile `yaml:"sops_files"`
 	VaultPaths     []string   `yaml:"vault_paths"`
-	Hooks          Hooks      `yaml:"hooks"`
+	// VaultEnvTemplates lists dotenv template files (relative to Dir) whose
+	// ${VAULT:<path>#<key>} references are resolved against Vault and merged
+	// into the stack environment at the same priority as vault_paths —
+	// compatibility with existing vault.env files (see env.RenderVaultTemplate).
+	VaultEnvTemplates []string `yaml:"vault_env_templates"`
+	Hooks             Hooks    `yaml:"hooks"`
 
 	// Load metadata, not part of the YAML schema. Dir is the directory
 	// containing the definition, File the YAML file it was loaded from, and

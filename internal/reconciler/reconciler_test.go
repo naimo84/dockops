@@ -2,9 +2,12 @@ package reconciler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -638,6 +641,160 @@ func TestReconcileHookEnvAndSecrets(t *testing.T) {
 	// The sops file was resolved against the stack dir.
 	if len(f.sops.calls) != 1 || f.sops.calls[0].path != filepath.Join(stackDir, "enc.env") {
 		t.Errorf("sops calls = %+v, want one resolved path", f.sops.calls)
+	}
+}
+
+func TestReconcileVaultEnvTemplates(t *testing.T) {
+	f := newFixture(t, defaultRoot)
+	f.git.commits = map[string]string{filepath.Join(f.workDir, "host"): "abc123def"}
+	f.vault.client.kv = map[string]map[string]string{
+		"hosts/host-01/traefik": {"db_password": "pg-secret", "spare": "unused"},
+	}
+	stackDir := filepath.Join(f.workDir, "host", "web")
+	f.addLocalStack("web", "name: web\nvault_env_templates: [tpl.env]\nhooks:\n  post_deploy: [true]\n")
+	// Both separator spellings; the KEY names live in the template.
+	writeFile(t, filepath.Join(stackDir, "tpl.env"),
+		"DB_PASSWORD=${VAULT:hosts/host-01/traefik#db_password}\nAPI_KEY=${VAULT:hosts/host-01/traefik:spare}\n")
+
+	if err := f.reconciler().Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	if len(f.compose.ups) != 1 {
+		t.Fatalf("Ups = %d, want 1", len(f.compose.ups))
+	}
+	upEnv := f.compose.ups[0].env
+	for k, want := range map[string]string{
+		"DB_PASSWORD": "pg-secret",
+		"API_KEY":     "unused",
+	} {
+		if got := upEnv[k]; got != want {
+			t.Errorf("env file[%s] = %q, want %q (template rendered into the stack environment)", k, got, want)
+		}
+	}
+	// The vault login happened although the stack has no vault_paths — the
+	// templates resolve through the same client — and each distinct path
+	// was read exactly once.
+	if f.vault.client.logins != 1 {
+		t.Errorf("vault logins = %d, want 1", f.vault.client.logins)
+	}
+	if !reflect.DeepEqual(f.vault.client.reads, []string{"hosts/host-01/traefik"}) {
+		t.Errorf("vault reads = %v, want [hosts/host-01/traefik]", f.vault.client.reads)
+	}
+}
+
+func TestReconcileVaultEnvTemplateFailureFailsStack(t *testing.T) {
+	f := newFixture(t, defaultRoot)
+	f.vault.client.kv = map[string]map[string]string{
+		"hosts/host-01/traefik": {"db_password": "pg-secret"},
+	}
+	stackDir := filepath.Join(f.workDir, "host", "web")
+	f.addLocalStack("web", "name: web\nvault_env_templates: [tpl.env]\n")
+	writeFile(t, filepath.Join(stackDir, "tpl.env"), "MY_VAR=${VAULT:hosts/host-01/traefik#missing}\n")
+
+	err := f.reconciler().Reconcile(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "vault_env_templates[0]") || !strings.Contains(err.Error(), "tpl.env") {
+		t.Fatalf("Reconcile() error = %v, want template failure with file context", err)
+	}
+	if got := f.upNames(); len(got) != 0 {
+		t.Errorf("Ups = %v, want none (unresolvable template must not deploy)", got)
+	}
+	if st, _ := f.state.Get("web"); st.Status != state.StatusFailed {
+		t.Errorf("state[web] = %+v, want failed", st)
+	}
+}
+
+// TestReconcileSopsSidecar drives sops_files through the sidecar resolver:
+// Deps.SopsSidecarURL set and no injected Sops → decryption goes over HTTP
+// against the fake sidecar, which must receive the resolved absolute path.
+func TestReconcileSopsSidecar(t *testing.T) {
+	f := newFixture(t, defaultRoot)
+	stackDir := filepath.Join(f.workDir, "host", "web")
+
+	var gotPaths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/decrypt" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		var req struct {
+			Path string `json:"path"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		gotPaths = append(gotPaths, req.Path)
+		w.Write([]byte(`{"content":"SECRET=sidecar-value\n"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	f.addLocalStack("web", "name: web\nsops_files:\n  - path: secrets.env.sops\n")
+	writeFile(t, filepath.Join(stackDir, "secrets.env.sops"), "ENCRYPTED\n")
+
+	r := New(Deps{
+		RepoURL:        "https://example.invalid/host.git",
+		Branch:         "main",
+		WorkDir:        f.workDir,
+		State:          f.state,
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Git:            f.git,
+		Compose:        f.compose,
+		Hooks:          f.hooks,
+		SopsSidecarURL: srv.URL,
+		NewVault:       f.vault.make,
+	})
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	if want := []string{filepath.Join(stackDir, "secrets.env.sops")}; !reflect.DeepEqual(gotPaths, want) {
+		t.Errorf("sidecar received paths = %v, want %v (resolved absolute path)", gotPaths, want)
+	}
+	if len(f.compose.ups) != 1 {
+		t.Fatalf("Ups = %d, want 1", len(f.compose.ups))
+	}
+	if got := f.compose.ups[0].env["SECRET"]; got != "sidecar-value" {
+		t.Errorf("env file[SECRET] = %q, want sidecar-value (decrypted via the sidecar)", got)
+	}
+}
+
+// TestReconcileInjectedSopsWinsOverSidecarURL pins the Deps precedence: an
+// injected Sops function (tests, special hosts) is never re-routed through
+// the sidecar URL.
+func TestReconcileInjectedSopsWinsOverSidecarURL(t *testing.T) {
+	f := newFixture(t, defaultRoot)
+	stackDir := filepath.Join(f.workDir, "host", "web")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("sidecar was contacted although Sops was injected")
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	f.sops.kv = map[string]map[string]string{
+		filepath.Join(stackDir, "enc.env"): {"SECRET": "local-value"},
+	}
+	f.addLocalStack("web", "name: web\nsops_files:\n  - path: enc.env\n")
+
+	r := New(Deps{
+		RepoURL:        "https://example.invalid/host.git",
+		Branch:         "main",
+		WorkDir:        f.workDir,
+		State:          f.state,
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Git:            f.git,
+		Compose:        f.compose,
+		Hooks:          f.hooks,
+		Sops:           f.sops.decrypt,
+		SopsSidecarURL: srv.URL,
+		NewVault:       f.vault.make,
+	})
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if got := f.compose.ups[0].env["SECRET"]; got != "local-value" {
+		t.Errorf("env file[SECRET] = %q, want local-value (injected decrypt wins)", got)
 	}
 }
 

@@ -386,6 +386,23 @@ func TestEmptyStackYAMLDefaultsEnabled(t *testing.T) {
 	}
 }
 
+func TestLocalStackVaultEnvTemplates(t *testing.T) {
+	rootFile, hostDir, workDir := newRepo(t)
+	writeFile(t, rootFile, fmt.Sprintf("global:\n  work_dir: %q\n", workDir))
+	writeFile(t, filepath.Join(hostDir, "app", "stack.yaml"),
+		"name: app\nvault_env_templates: [vault.env, more.env]\n")
+	writeFile(t, filepath.Join(hostDir, "app", "compose.yaml"), "services: {}\n")
+
+	cfg, err := Load(rootFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v (vault_env_templates must be a known field)", err)
+	}
+	want := []string{"vault.env", "more.env"}
+	if got := cfg.Stacks[0].VaultEnvTemplates; !reflect.DeepEqual(got, want) {
+		t.Errorf("VaultEnvTemplates = %v, want %v (relative, resolved at merge time)", got, want)
+	}
+}
+
 func TestImportMerge(t *testing.T) {
 	rootFile, _, workDir := newRepo(t)
 	writeRemoteStack(t, workDir, "stacks/immich", `name: immich
@@ -394,6 +411,7 @@ profiles: [base]
 services: [server, worker]
 env_files: [base.env]
 vault_paths: [secret/base]
+vault_env_templates: [tpl-base.env]
 sops_files:
   - path: base.sops
     age_keyfile: /keys/base.txt
@@ -410,6 +428,7 @@ hooks:
     env_files: [base.env, extra.env]
     sops_files: [extra.sops]
     vault_paths: [secret/base, secret/extra]
+    vault_env_templates: [tpl-base.env, tpl-extra.env]
     hooks:
       pre_deploy: [echo base-pre, echo imp-pre]
 `))
@@ -446,6 +465,9 @@ hooks:
 	}
 	if want := []string{"secret/base", "secret/extra"}; !reflect.DeepEqual(s.VaultPaths, want) {
 		t.Errorf("VaultPaths = %v, want %v", s.VaultPaths, want)
+	}
+	if want := []string{"tpl-base.env", "tpl-extra.env"}; !reflect.DeepEqual(s.VaultEnvTemplates, want) {
+		t.Errorf("VaultEnvTemplates = %v, want %v (concat like vault_paths, deduplicated)", s.VaultEnvTemplates, want)
 	}
 	wantSops := []SopsFile{{Path: "base.sops", AgeKeyfile: "/keys/base.txt"}, {Path: "extra.sops"}}
 	if !reflect.DeepEqual(s.SopsFiles, wantSops) {
