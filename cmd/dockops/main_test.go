@@ -1,10 +1,14 @@
 package main
 
 import (
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/local/dockops/internal/config"
+	"github.com/local/dockops/internal/reconciler"
 )
 
 // fakeEnv adapts a map to the getenv callback of parseFlags.
@@ -138,6 +142,22 @@ func TestParseFlagsZeroIntervalMeansUnset(t *testing.T) {
 	}
 	if opts.Interval != 0 {
 		t.Errorf("Interval = %v, want 0 (unset; config poll_interval applies)", opts.Interval)
+	}
+}
+
+// TestHostCheckoutPath pins the host commit source of the status callbacks:
+// DOCKOPS_HOST_CHECKOUT (global.host_checkout's env fallback) wins over the
+// bootstrap default — the status modes load no configuration, so the env is
+// the only override they can see.
+func TestHostCheckoutPath(t *testing.T) {
+	t.Setenv(config.EnvHostCheckout, "")
+	if got, want := hostCheckoutPath(), filepath.Join(config.DefaultWorkDir, reconciler.HostRepoName); got != want {
+		t.Errorf("hostCheckoutPath() = %q, want bootstrap default %q", got, want)
+	}
+
+	t.Setenv(config.EnvHostCheckout, "/home/docker/apps")
+	if got, want := hostCheckoutPath(), "/home/docker/apps"; got != want {
+		t.Errorf("hostCheckoutPath() = %q, want %q", got, want)
 	}
 }
 

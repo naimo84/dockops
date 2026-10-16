@@ -37,10 +37,12 @@ Poll-Timer, Webhook (GitHub/GitLab) oder einmalig mit `-once`.
 
 - **Host-Repo**: die Wurzel. Enthält die Root-`stacks.yaml` und lokale
   Stacks, die über Include-Globs entdeckt werden. Auschecken nach
-  `<work_dir>/host`.
+  `<work_dir>/host` — oder in-place am konfigurierten
+  `global.host_checkout` (siehe „Konfigurierbare Checkout-Pfade“).
 - **Shared-Remotes**: beliebige weitere Git-Repos (z. B. eine Bibliothek
   wiederverwendbarer Stack-Definitionen). Auschecken nach
-  `<work_dir>/<remote-name>`.
+  `<work_dir>/<remote-name>` — oder in-place am konfigurierten
+  `remotes.<name>.checkout`.
 - **Imports**: Referenzieren einen Stack aus einem Shared-Remote und mergen
   Overrides darüber (eigener Name, Profile, Secrets, Hooks — oder nur eine
   Teilmenge der Container).
@@ -56,6 +58,10 @@ global:
   # Wo Host- und Remote-Checkouts liegen
   # (Default: /var/lib/dockops/repos; relative Angaben: relativ zum Host-Repo-Root)
   work_dir: /var/lib/dockops/repos
+  # Absoluter Pfad des Host-Repo-Checkouts (Default: <work_dir>/host;
+  # Env-Fallback DOCKOPS_HOST_CHECKOUT, ein YAML-Wert gewinnt) —
+  # siehe „Konfigurierbare Checkout-Pfade“
+  # host_checkout: /home/docker/apps
   # Poll-Intervall des Daemon-Modus (Default: 5m)
   poll_interval: 5m
   # Stacks, die aus der Config verschwinden, mit `compose down` entfernen
@@ -85,6 +91,8 @@ remotes:
   shared:
     url: git@github.com:example/docker-stacks.git
     branch: main              # Default
+    # Absoluter Pfad dieses Remote-Checkouts (Default: <work_dir>/<name>)
+    # checkout: /home/docker/infrastructure
 
 imports:
   # Variante 1: kompletter Stack-Import — alle Services, eigener Name,
@@ -114,6 +122,57 @@ Merge-Regeln für Imports: `profiles`, `env_files`, `sops_files`,
 `vault_paths` und `hooks.*` werden angehängt (base zuerst, Dubletten
 entfallen); `services` ersetzt die Basis-Liste, wenn gesetzt (leer =
 alle); `name` überschreibt den Basis-Namen.
+
+## Konfigurierbare Checkout-Pfade
+
+Auf Fleet-Hosts existieren die „echten“ Clones oft schon an festen Pfaden
+(`/home/docker/apps` = Host-Repo, `/home/docker/infrastructure` =
+Shared-Remote). Statt sie per Bind-Mount-Gymnastik unter den Default zu
+zwingen, konfiguriert dockops die Pfade direkt in der Root-`stacks.yaml`
+und arbeitet **in place** auf den bestehenden Clones (Adopt-or-Clone):
+
+```yaml
+global:
+  work_dir: /var/lib/dockops/repos
+  # Absoluter Pfad des Host-Repo-Checkouts (Default: <work_dir>/host).
+  # Env-Fallback: DOCKOPS_HOST_CHECKOUT — ein YAML-Wert gewinnt.
+  host_checkout: /home/docker/apps
+
+remotes:
+  infrastructure:
+    url: git@github.com:example/infrastructure.git
+    branch: main
+    # Absoluter Pfad dieses Remote-Checkouts (Default: <work_dir>/<name>)
+    checkout: /home/docker/infrastructure
+```
+
+Regeln:
+
+- Beide Felder müssen, wenn gesetzt, absolut sein und dürfen nur die
+  Zeichen `A-Z a-z 0-9 . _ - /` enthalten (kein Whitespace, keine Quotes,
+  keine Shell-Metazeichen); Validierungsfehler nennen Datei und Feld.
+- **Adopt-or-Clone**: Existiert am Pfad bereits ein Checkout mit zum
+  konfigurierten `url` passendem `origin`, wird er übernommen und wie jeder
+  dockops-Checkout deterministisch aktualisiert (WIP-Stash → `fetch` →
+  `reset --hard` → `clean -fd`, siehe [WIP-Auto-Stash](#wip-auto-stash)).
+  **Der `origin` muss zur konfigurierten URL passen** — ein abweichender
+  Origin ist ein Fehler statt eines stillen Fetch von der alten Quelle.
+  Ein fremdes, nicht-leeres Verzeichnis ohne `.git` wird ebenso verweigert
+  (nie Daten überschreiben, die dockops nicht selbst angelegt hat); fehlt
+  der Pfad, wird ganz normal geklont.
+- Henne-Ei beim Host-Repo: die Root-`stacks.yaml` liegt im Host-Repo und
+  muss erst unter dem Bootstrap-Pfad `<work_dir>/host` lesbar sein, bevor
+  irgendein konfigurierter Pfad greifen kann. `host_checkout` wird deshalb
+  erst **nach** dem Config-Load angewendet: der Bootstrap-Checkout bleibt
+  bestehen und ist dann nur noch Träger der Root-Config; die volle Config
+  (lokale Stacks inklusive) liest dockops aus dem konfigurierten Checkout.
+- Imports lösen entsprechend im konfigurierten Remote-Checkout auf
+  (`<checkout>/<path>` statt `<work_dir>/<name>/<path>`) — exakt dort, wo
+  der Reconciler das Remote klont bzw. adoptiert.
+- Das Hash-Schema bleibt unberührt (v3): Ein Checkout-Umzug ändert zwar die
+  absoluten Compose-Dateipfade im Stack-Hash und löst damit **einmalig**
+  Re-Deploys der betroffenen Stacks aus — danach ist der Zustand wieder
+  stabil.
 
 ## Lokale `stack.yaml` (Beispiel immich)
 
@@ -209,9 +268,14 @@ gemergte Umgebung des Stacks (inkl. Secrets) sowie `STACK_NAME`,
    `<work_dir>/host` — bei vorhandenem Checkout werden lokale Änderungen
    zuerst als WIP-Stash gesichert (siehe [WIP-Auto-Stash](#wip-auto-stash)),
    dann `git fetch` + `reset --hard` + `clean -fd` (der Checkout ist
-   maschinell verwalteter Zustand).
+   maschinell verwalteter Zustand). Dies ist der Bootstrap; ist
+   `global.host_checkout` gesetzt, übernimmt dockops danach den konfigurierten
+   Checkout in-place (Adopt-or-Clone, siehe
+   [Konfigurierbare Checkout-Pfade](#konfigurierbare-checkout-pfade)) und
+   liest die weitere Config von dort.
 2. **Root-Config lesen** (`stacks.yaml` im Host-Repo) und alle
-   **Shared-Remotes** nach `<work_dir>/<remote>` clone-odern/updaten.
+   **Shared-Remotes** nach `<work_dir>/<remote>` bzw. dem konfigurierten
+   `remotes.<remote>.checkout` clone-odern/updaten.
 3. **Komplette Config laden**: lokale Stacks via Include-Globs entdecken,
    Imports laden und mergen, Validierung (u. a. doppelne Stack-Namen).
 4. **Pro aktivem Stack deployen**, wenn sich sein deterministischer Hash
@@ -471,6 +535,9 @@ Dazu die Vault-Variablen (Namen in `global.vault` konfigurierbar):
 (`auth_method: approle`). Ohne eigenes Flag: `DOCKOPS_STATUS_TOKEN`
 (Bearer-Schutz für `GET /status`, leer = offen) und `DOCKOPS_SELF_PROJECT`
 (eigenes Compose-Projekt für die Unmanaged-Erkennung, default `dockops`).
+`DOCKOPS_HOST_CHECKOUT` füllt ein leeres `global.host_checkout` (YAML
+gewinnt; `-print-status` und `/status` folgen der Variable auch ohne
+Config, siehe „Konfigurierbare Checkout-Pfade“).
 
 **Betriebsmodi**: Ohne `-once` läuft dockops als Daemon — sofortiger erster
 Durchlauf, danach Poll-Timer (`-interval` überschreibt

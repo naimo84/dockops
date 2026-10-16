@@ -282,3 +282,149 @@ func TestEnsureRepoValidation(t *testing.T) {
 		}
 	}
 }
+
+// ---- configurable checkout paths (EnsureRepoAt) ----
+
+// TestEnsureRepoAtCloneOutsideWorkDir: (a) a configured path outside the
+// manager's work directory is cloned into directly.
+func TestEnsureRepoAtCloneOutsideWorkDir(t *testing.T) {
+	origin := newOrigin(t, "main", map[string]string{"stack.yaml": "name: infra-stack\n"})
+	m, workDir := newManager(t)
+	path := filepath.Join(t.TempDir(), "home-docker", "infrastructure")
+
+	got, err := m.EnsureRepoAt(path, origin, "main")
+	if err != nil {
+		t.Fatalf("EnsureRepoAt() error = %v", err)
+	}
+	if got != path {
+		t.Errorf("path = %q, want %q", got, path)
+	}
+	if data, err := os.ReadFile(filepath.Join(path, "stack.yaml")); err != nil || string(data) != "name: infra-stack\n" {
+		t.Errorf("stack.yaml = %q, %v; want cloned content", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, "infrastructure")); !os.IsNotExist(err) {
+		t.Errorf("the work dir was used although the checkout path is configured (err = %v)", err)
+	}
+}
+
+// TestEnsureRepoAtAdoptsExistingCheckout: (b) an existing checkout with a
+// matching origin is adopted in place and runs the full deterministic update
+// sequence — dirty worktree included (WIP stash, fetch, reset, clean).
+func TestEnsureRepoAtAdoptsExistingCheckout(t *testing.T) {
+	origin := newOrigin(t, "main", map[string]string{"stack.yaml": "version: 1\n"})
+	m, _ := newManager(t)
+	// The fleet's existing clone, created without the manager's help.
+	path := filepath.Join(t.TempDir(), "infra")
+	runGit(t, filepath.Dir(path), "clone", "--branch", "main", "--single-branch", origin, path)
+
+	// Host-side edit plus upstream bump: adoption must update, not skip.
+	writeFile(t, filepath.Join(path, "stack.yaml"), "version: 1-local\n")
+	writeFile(t, filepath.Join(origin, "stack.yaml"), "version: 2\n")
+	commitAll(t, origin, "bump")
+
+	got, err := m.EnsureRepoAt(path, origin, "main")
+	if err != nil {
+		t.Fatalf("EnsureRepoAt() error = %v", err)
+	}
+	if got != path {
+		t.Errorf("path = %q, want %q", got, path)
+	}
+	if data, _ := os.ReadFile(filepath.Join(path, "stack.yaml")); string(data) != "version: 2\n" {
+		t.Errorf("stack.yaml = %q after adoption, want upstream version 2", data)
+	}
+	if status := runGit(t, path, "status", "--porcelain"); strings.TrimSpace(status) != "" {
+		t.Errorf("working tree not clean after adoption:\n%s", status)
+	}
+	// The local edit was stashed, not destroyed.
+	if entries := stashEntries(t, path); len(entries) != 1 {
+		t.Errorf("git stash list = %q, want exactly the dockops-wip entry", entries)
+	}
+}
+
+// TestEnsureRepoAtRejectsOriginMismatch: (c) adopting a checkout cloned from
+// a different origin is refused — a path collision must not silently serve
+// the wrong repository.
+func TestEnsureRepoAtRejectsOriginMismatch(t *testing.T) {
+	origin := newOrigin(t, "main", map[string]string{"stack.yaml": "name: infra-stack\n"})
+	otherOrigin := newOrigin(t, "main", map[string]string{"stack.yaml": "name: other\n"})
+	m, _ := newManager(t)
+	path := filepath.Join(t.TempDir(), "infra")
+	if _, err := m.EnsureRepoAt(path, origin, "main"); err != nil {
+		t.Fatalf("first EnsureRepoAt() error = %v", err)
+	}
+
+	_, err := m.EnsureRepoAt(path, otherOrigin, "main")
+	if err == nil || !strings.Contains(err.Error(), "was cloned from") {
+		t.Errorf("EnsureRepoAt() with different url error = %v, want origin mismatch error", err)
+	}
+}
+
+// TestEnsureRepoAtRefusesForeignDirectory: (d) a non-empty directory without
+// .git is refused instead of overwritten.
+func TestEnsureRepoAtRefusesForeignDirectory(t *testing.T) {
+	m, _ := newManager(t)
+	foreign := filepath.Join(t.TempDir(), "precious")
+	writeFile(t, filepath.Join(foreign, "precious.txt"), "not a repo\n")
+
+	_, err := m.EnsureRepoAt(foreign, t.TempDir(), "main")
+	if err == nil || !strings.Contains(err.Error(), "not a git repository") {
+		t.Errorf("EnsureRepoAt() on non-repo directory error = %v, want refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(foreign, "precious.txt")); err != nil {
+		t.Errorf("foreign directory was modified: %v", err)
+	}
+}
+
+// TestEnsureRepoAtValidation: (e) non-absolute paths and paths outside the
+// conservative character set are rejected before any git command runs.
+func TestEnsureRepoAtValidation(t *testing.T) {
+	origin := newOrigin(t, "main", map[string]string{"stack.yaml": "name: infra-stack\n"})
+	m, _ := newManager(t)
+
+	cases := []struct{ path, wantErr string }{
+		{"", "checkout path must not be empty"},
+		{"relative/path", "must be absolute"},
+		{"relative", "must be absolute"},
+		{"/tmp/with space", "must only contain"},
+		{"/tmp/with'quote", "must only contain"},
+		{"/tmp/with\"dquote", "must only contain"},
+		{"/tmp/semi;colon", "must only contain"},
+		{"/tmp/dollar$sign", "must only contain"},
+		{"/tmp/infrâstructure", "must only contain"},
+	}
+	for _, tc := range cases {
+		_, err := m.EnsureRepoAt(tc.path, origin, "main")
+		if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Errorf("EnsureRepoAt(%q) error = %v, want containing %q", tc.path, err, tc.wantErr)
+		}
+	}
+
+	// url and branch requirements are unchanged.
+	if _, err := m.EnsureRepoAt("/tmp/checkout", "", "main"); err == nil || !strings.Contains(err.Error(), "url must not be empty") {
+		t.Errorf("EnsureRepoAt() without url error = %v, want url-required error", err)
+	}
+	if _, err := m.EnsureRepoAt("/tmp/checkout", origin, ""); err == nil || !strings.Contains(err.Error(), "branch must not be empty") {
+		t.Errorf("EnsureRepoAt() without branch error = %v, want branch-required error", err)
+	}
+}
+
+// TestHeadCommitOutsideWorkDir pins the relaxed HeadCommit: a configured
+// checkout outside the work directory is answered, not refused — GIT_COMMIT
+// must keep working for adopted clones.
+func TestHeadCommitOutsideWorkDir(t *testing.T) {
+	origin := newOrigin(t, "main", map[string]string{"stack.yaml": "name: infra-stack\n"})
+	m, _ := newManager(t)
+	path := filepath.Join(t.TempDir(), "elsewhere", "infra")
+	if _, err := m.EnsureRepoAt(path, origin, "main"); err != nil {
+		t.Fatalf("EnsureRepoAt() error = %v", err)
+	}
+	want := strings.TrimSpace(runGit(t, path, "rev-parse", "HEAD"))
+
+	got, err := m.HeadCommit(path)
+	if err != nil {
+		t.Fatalf("HeadCommit() outside the work dir error = %v", err)
+	}
+	if got != want {
+		t.Errorf("HeadCommit() = %q, want %q", got, want)
+	}
+}
