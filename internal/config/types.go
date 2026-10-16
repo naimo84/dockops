@@ -42,6 +42,14 @@ type Global struct {
 	PollInterval        Duration `yaml:"poll_interval"`
 	PruneRemovedStacks  bool     `yaml:"prune_removed_stacks"`
 	WorkDir             string   `yaml:"work_dir"`
+	// HostCheckout is the absolute path of the host repository checkout.
+	// Empty (the default) checks the host repo out at <WorkDir>/host as
+	// before; a set value makes dockops work in place on the clone at that
+	// path (adopt-or-clone) — fleet hosts where the real clone already
+	// exists (e.g. /home/docker/apps) need no bind-mount gymnastics. The
+	// env variable EnvHostCheckout fills the gap when the YAML leaves the
+	// field unset (the YAML value wins, like VAULT_ADDR).
+	HostCheckout string `yaml:"host_checkout"`
 	Include             []string `yaml:"include"`
 	ComposeFilePatterns []string `yaml:"compose_file_patterns"`
 	Vault               Vault    `yaml:"vault"`
@@ -60,10 +68,15 @@ type Vault struct {
 }
 
 // Remote describes a git remote. Its checkout is expected at
-// <global.work_dir>/<remote name>/.
+// <global.work_dir>/<remote name>/ unless Checkout overrides the location.
 type Remote struct {
 	URL    string `yaml:"url"`
 	Branch string `yaml:"branch"`
+	// Checkout is the absolute path of this remote's checkout. Empty uses
+	// <global.work_dir>/<remote name>; a set value makes dockops work in
+	// place on the clone at that path (adopt-or-clone, the recorded origin
+	// must match url — see git.Manager.EnsureRepoAt).
+	Checkout string `yaml:"checkout"`
 }
 
 // Import references a stack definition inside a remote checkout plus

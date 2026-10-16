@@ -1021,3 +1021,203 @@ func TestImportComposeFiles(t *testing.T) {
 		t.Errorf("EffectiveComposeFiles() = %v, want %v (import stacks resolve compose_files against the remote checkout)", got, want)
 	}
 }
+
+// ---- configurable checkout paths (host_checkout, remotes.<name>.checkout) ----
+
+func TestHostCheckoutDefaultAndExplicit(t *testing.T) {
+	rootFile, _, _ := newRepo(t)
+
+	// Unset stays empty: the reconciler then uses the bootstrap path
+	// (<work_dir>/host).
+	t.Setenv(EnvHostCheckout, "")
+	writeFile(t, rootFile, "global: {}\n")
+	cfg, err := Load(rootFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Global.HostCheckout != "" {
+		t.Errorf("host_checkout = %q, want empty default", cfg.Global.HostCheckout)
+	}
+
+	writeFile(t, rootFile, "global:\n  host_checkout: /home/docker/apps\n")
+	cfg, err = Load(rootFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Global.HostCheckout != "/home/docker/apps" {
+		t.Errorf("host_checkout = %q, want the configured path", cfg.Global.HostCheckout)
+	}
+}
+
+func TestHostCheckoutEnvFallback(t *testing.T) {
+	rootFile, _, _ := newRepo(t)
+
+	t.Run("env fills a missing field", func(t *testing.T) {
+		t.Setenv(EnvHostCheckout, "/home/docker/apps")
+		writeFile(t, rootFile, "global: {}\n")
+
+		cfg, err := Load(rootFile)
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.Global.HostCheckout != "/home/docker/apps" {
+			t.Errorf("host_checkout = %q, want env value", cfg.Global.HostCheckout)
+		}
+	})
+
+	t.Run("explicit YAML wins over env", func(t *testing.T) {
+		t.Setenv(EnvHostCheckout, "/from/env")
+		writeFile(t, rootFile, "global:\n  host_checkout: /from/yaml\n")
+
+		cfg, err := Load(rootFile)
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.Global.HostCheckout != "/from/yaml" {
+			t.Errorf("host_checkout = %q, want explicit YAML value", cfg.Global.HostCheckout)
+		}
+	})
+
+	t.Run("invalid env value fails validation like an invalid YAML value", func(t *testing.T) {
+		t.Setenv(EnvHostCheckout, "relative/from-env")
+		writeFile(t, rootFile, "global: {}\n")
+
+		_, err := Load(rootFile)
+		if err == nil || !strings.Contains(err.Error(), "global.host_checkout") || !strings.Contains(err.Error(), "must be absolute") {
+			t.Errorf("Load() with relative env error = %v, want global.host_checkout must-be-absolute error", err)
+		}
+	})
+}
+
+func TestRemoteCheckoutField(t *testing.T) {
+	rootFile, _, _ := newRepo(t)
+	writeFile(t, rootFile, `remotes:
+  configured:
+    url: https://example.com/c.git
+    checkout: /home/docker/infrastructure
+  plain:
+    url: https://example.com/p.git
+`)
+
+	cfg, err := Load(rootFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.Remotes["configured"].Checkout; got != "/home/docker/infrastructure" {
+		t.Errorf("remotes[configured].checkout = %q, want the configured path", got)
+	}
+	if got := cfg.Remotes["plain"].Checkout; got != "" {
+		t.Errorf("remotes[plain].checkout = %q, want empty default (<work_dir>/plain)", got)
+	}
+}
+
+func TestCheckoutPathValidation(t *testing.T) {
+	cases := []struct {
+		name       string
+		rootYAML   string
+		wantErr    string
+		wantReason string
+	}{
+		{
+			name:       "relative host_checkout",
+			rootYAML:   "global:\n  host_checkout: apps\n",
+			wantErr:    "global.host_checkout",
+			wantReason: "must be absolute",
+		},
+		{
+			name:       "host_checkout with whitespace",
+			rootYAML:   "global:\n  host_checkout: /home/docker/my apps\n",
+			wantErr:    "global.host_checkout",
+			wantReason: "must only contain",
+		},
+		{
+			name:       "host_checkout with quote",
+			rootYAML:   "global:\n  host_checkout: \"/home/x';touch pwned\"\n",
+			wantErr:    "global.host_checkout",
+			wantReason: "must only contain",
+		},
+		{
+			name:       "relative remote checkout",
+			rootYAML:   "remotes:\n  infra:\n    url: https://example.com/i.git\n    checkout: infrastructure\n",
+			wantErr:    "remotes[infra].checkout",
+			wantReason: "must be absolute",
+		},
+		{
+			name:       "remote checkout with shell metacharacter",
+			rootYAML:   "remotes:\n  infra:\n    url: https://example.com/i.git\n    checkout: /home/docker/infra;rm -rf\n",
+			wantErr:    "remotes[infra].checkout",
+			wantReason: "must only contain",
+		},
+		{
+			name:       "remote checkout with non-ASCII characters",
+			rootYAML:   "remotes:\n  infra:\n    url: https://example.com/i.git\n    checkout: /home/docker/infrâstructure\n",
+			wantErr:    "remotes[infra].checkout",
+			wantReason: "must only contain",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(EnvHostCheckout, "")
+			rootFile, _, _ := newRepo(t)
+			writeFile(t, rootFile, tc.rootYAML)
+
+			_, err := Load(rootFile)
+			if err == nil {
+				t.Fatal("Load() error = nil, want validation error")
+			}
+			for _, want := range []string{rootFile, tc.wantErr, tc.wantReason} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckoutPathCharsetAllowsCommonPaths(t *testing.T) {
+	rootFile, _, _ := newRepo(t)
+	t.Setenv(EnvHostCheckout, "")
+	writeFile(t, rootFile, "global:\n  host_checkout: /srv/my_apps.v2/github-com\n")
+
+	cfg, err := Load(rootFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil (dots, underscores and dashes are allowed)", err)
+	}
+	if cfg.Global.HostCheckout != "/srv/my_apps.v2/github-com" {
+		t.Errorf("host_checkout = %q, want the value as configured", cfg.Global.HostCheckout)
+	}
+}
+
+// TestImportFromConfiguredRemoteCheckout: with remotes.<name>.checkout set,
+// imports resolve inside the configured checkout — exactly where the
+// reconciler clones the remote — instead of below <work_dir>/<name>.
+func TestImportFromConfiguredRemoteCheckout(t *testing.T) {
+	rootFile, _, workDir := newRepo(t)
+	checkout := filepath.Join(t.TempDir(), "infrastructure")
+	writeFile(t, filepath.Join(checkout, "stacks", "immich", "stack.yaml"), "name: immich\n")
+	writeFile(t, filepath.Join(checkout, "stacks", "immich", "compose.yaml"), "services: {}\n")
+	writeFile(t, rootFile, fmt.Sprintf(`global:
+  work_dir: %q
+remotes:
+  infra:
+    url: https://example.com/infra.git
+    checkout: %q
+imports:
+  - remote: infra
+    path: stacks/immich
+`, workDir, checkout))
+
+	cfg, err := Load(rootFile)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.Stacks) != 1 {
+		t.Fatalf("len(stacks) = %d, want 1: %+v", len(cfg.Stacks), cfg.Stacks)
+	}
+	if want := filepath.Join(checkout, "stacks", "immich", "compose.yaml"); cfg.Stacks[0].ComposeFile != want {
+		t.Errorf("ComposeFile = %q, want %q (resolved inside the configured checkout)", cfg.Stacks[0].ComposeFile, want)
+	}
+	if want := filepath.Join(checkout, "stacks", "immich"); cfg.Stacks[0].Dir != want {
+		t.Errorf("Dir = %q, want %q", cfg.Stacks[0].Dir, want)
+	}
+}

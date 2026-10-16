@@ -17,7 +17,12 @@
 //     default when unset), while the remotes live below global.work_dir,
 //     resolved exactly the way config.Load resolves it. With the default
 //     configuration both are the same directory, so host and remotes share
-//     one checkout root as the briefing describes.
+//     one checkout root as the briefing describes. Configurable checkout
+//     paths (global.host_checkout, remotes.<name>.checkout) then move the
+//     effective checkouts: the bootstrap host checkout below the work dir
+//     only carries the root config, and dockops adopts the existing clones
+//     at their configured locations in place (adopt-or-clone via
+//     git.Manager.EnsureRepoAt).
 //   - Post-deploy hook failures are logged AND collected in the pass error
 //     ("errors.Join aller aufgetretenen Fehler"), but the stack still
 //     counts as deployed, exactly as the briefing prescribes.
@@ -65,11 +70,17 @@ const (
 )
 
 // GitManager is the subset of git.Manager the reconciler needs: guaranteed
-// checkouts and the commit they point at.
+// checkouts — by name below the manager's work dir, or at an absolute
+// configured path — and the commit they point at.
 type GitManager interface {
 	// EnsureRepo guarantees that <work dir>/<name> is a checkout of url at
 	// the latest commit of branch and returns the local path.
 	EnsureRepo(name, url, branch string) (string, error)
+
+	// EnsureRepoAt guarantees that the checkout at the absolute path is a
+	// checkout of url at the latest commit of branch (adopt-or-clone, also
+	// outside the work directory) and returns the path.
+	EnsureRepoAt(path, url, branch string) (string, error)
 
 	// HeadCommit returns the commit currently checked out at repoPath.
 	HeadCommit(repoPath string) (string, error)
@@ -269,7 +280,10 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	}
 	var errs []error
 
-	// 1. Primary host repository.
+	// 1. Primary host repository. The bootstrap is deliberately path-fixed
+	// (Henne-Ei): the root configuration that may declare global.
+	// host_checkout lives in this very checkout, so it must be readable
+	// before any configured path can take effect.
 	gitMgr := r.git
 	if gitMgr == nil {
 		m, err := git.New(r.workDir, r.logger)
@@ -288,36 +302,44 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		return fmt.Errorf("reconciler: %w", err)
 	}
 
-	// 2. Remotes. They live below global.work_dir, resolved the same way
-	// config.Load resolves it (relative against the host repository root),
-	// so the imports are found exactly where the loader looks for them.
-	// With the default configuration this equals the bootstrap work dir,
-	// so host and remotes share one manager.
-	remotesGit := gitMgr
-	remotesDir := resolveWorkDir(rootFile, root.Global.WorkDir)
-	if remotesDir != r.workDir {
-		if r.git == nil {
-			m, err := git.New(remotesDir, r.logger)
-			if err != nil {
-				return fmt.Errorf("reconciler: git manager for work dir %s: %w", remotesDir, err)
-			}
-			remotesGit = m
-		} else {
-			// Injected managers (tests) control their checkout placement
-			// themselves; the configured work_dir is expected to match.
-			r.logger.Warn("global.work_dir differs from the bootstrap work dir; using the injected git manager unchanged",
-				"config_work_dir", remotesDir, "bootstrap_work_dir", r.workDir)
+	// global.host_checkout relocates the effective host checkout away from
+	// the bootstrap path: dockops adopts (or clones) the checkout at the
+	// configured path in place and reads the full configuration — local
+	// stacks included — from there. The bootstrap checkout below the work
+	// dir then only carries the root config; it stays where it is (it may
+	// even be an empty or stale clone — that hurts nothing) and is updated
+	// again on the next pass. When host_checkout equals the bootstrap path
+	// the ensure above already did the identical work.
+	if hc := root.Global.HostCheckout; hc != "" && filepath.Clean(hc) != filepath.Clean(hostPath) {
+		hostPath, err = gitMgr.EnsureRepoAt(hc, r.repoURL, r.branch)
+		if err != nil {
+			return fmt.Errorf("reconciler: host repo: %w", err)
 		}
+		rootFile = filepath.Join(hostPath, rootConfigFile)
 	}
+
+	// 2. Remotes: each at its configured checkout path
+	// (remotes.<name>.checkout) or below global.work_dir, resolved the same
+	// way config.Load resolves it (relative against the effective host
+	// repository root), so the imports are found exactly where the loader
+	// looks for them. The git manager deliberately stays on the bootstrap
+	// work dir (it owns it, MkdirAll etc.); EnsureRepoAt accepts absolute
+	// paths anywhere on the host, so neither a differing work_dir nor
+	// configured checkouts need a second manager.
+	remotesDir := resolveWorkDir(rootFile, root.Global.WorkDir)
 	remotePaths := make(map[string]string, len(root.Remotes))
 	for _, name := range sortedKeys(root.Remotes) {
 		rem := root.Remotes[name]
-		path, err := remotesGit.EnsureRepo(name, rem.URL, rem.Branch)
+		path := rem.Checkout
+		if path == "" {
+			path = filepath.Join(remotesDir, name)
+		}
+		p, err := gitMgr.EnsureRepoAt(path, rem.URL, rem.Branch)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("remote %s: %w", name, err))
 			continue
 		}
-		remotePaths[name] = path
+		remotePaths[name] = p
 	}
 
 	// 3. Full configuration: local stack discovery plus import merge.
@@ -337,7 +359,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	commits := make(map[string]string, 1+len(remotePaths))
 	recordCommit(gitMgr, commits, hostPath, r.logger)
 	for _, name := range sortedKeys(remotePaths) {
-		recordCommit(remotesGit, commits, remotePaths[name], r.logger)
+		recordCommit(gitMgr, commits, remotePaths[name], r.logger)
 	}
 
 	// 4. Deploy every enabled stack; a failing stack is skipped while the

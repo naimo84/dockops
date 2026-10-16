@@ -68,11 +68,23 @@ func New(workDir string, logger *slog.Logger) (*Manager, error) {
 }
 
 // EnsureRepo guarantees that <workDir>/<name> is a checkout of url at the
-// latest commit of branch (clone-or-update) and returns the local path.
+// latest commit of branch (clone-or-update) and returns the local path. It
+// is the name-based shorthand for EnsureRepoAt; every guarantee of the
+// clone-or-update semantics lives there.
+func (m *Manager) EnsureRepo(name, url, branch string) (string, error) {
+	if err := validateName(name); err != nil {
+		return "", err
+	}
+	return m.EnsureRepoAt(filepath.Join(m.workDir, name), url, branch)
+}
+
+// EnsureRepoAt guarantees that the checkout at the absolute path is a
+// checkout of url at the latest commit of branch (adopt-or-clone) and
+// returns path.
 //
-// Clone when the directory does not exist or is empty; otherwise the
-// checkout is made deterministic with exactly the sequence prescribed by the
-// briefing: WIP auto-stash if dirty (see stashWIP), git fetch origin
+// Clone when the directory does not exist or is empty; an existing checkout
+// is adopted and made deterministic with exactly the sequence prescribed by
+// the briefing: WIP auto-stash if dirty (see stashWIP), git fetch origin
 // <branch>, git reset --hard origin/<branch>, git clean -fd. Local
 // modifications and untracked files are pushed onto the git stash before the
 // reset discards them from the working tree — host-side edits survive on the
@@ -83,18 +95,23 @@ func New(workDir string, logger *slog.Logger) (*Manager, error) {
 // A non-empty directory without a .git entry is refused instead of
 // overwritten (conservative choice: never destroy data we did not create).
 // A checkout whose recorded origin differs from url is rejected as well, so
-// a name collision cannot silently serve the wrong repository.
-func (m *Manager) EnsureRepo(name, url, branch string) (string, error) {
-	if err := validateName(name); err != nil {
+// a path collision cannot silently serve the wrong repository.
+//
+// path is host configuration (global.host_checkout, remotes.<name>.
+// checkout), not client input: it must be absolute and limited to a
+// conservative path character set (see validateCheckoutPath), but unlike
+// import paths it carries no prefix jail — it may name a clone anywhere on
+// the host, so dockops can adopt the fleet's existing checkouts in place.
+func (m *Manager) EnsureRepoAt(path, url, branch string) (string, error) {
+	if err := validateCheckoutPath(path); err != nil {
 		return "", err
 	}
 	if url == "" {
-		return "", fmt.Errorf("git %s: url must not be empty", name)
+		return "", fmt.Errorf("git %s: url must not be empty", path)
 	}
 	if branch == "" {
-		return "", fmt.Errorf("git %s: branch must not be empty", name)
+		return "", fmt.Errorf("git %s: branch must not be empty", path)
 	}
-	path := filepath.Join(m.workDir, name)
 
 	state, err := dirState(path)
 	if err != nil {
@@ -103,18 +120,18 @@ func (m *Manager) EnsureRepo(name, url, branch string) (string, error) {
 
 	switch state {
 	case dirAbsent, dirEmpty:
-		m.logger.Info("cloning repository", "name", name, "url", url, "branch", branch, "path", path)
+		m.logger.Info("cloning repository", "url", url, "branch", branch, "path", path)
 		// exec passes arguments directly (no shell), so tokens embedded in
 		// url cannot be misinterpreted as shell syntax.
 		if _, err := m.runGit("", "clone", "--branch", branch, "--single-branch", "--", url, path); err != nil {
 			return "", err
 		}
 	case dirRepo:
-		if err := m.checkOrigin(path, name, url); err != nil {
+		if err := m.checkOrigin(path, url); err != nil {
 			return "", err
 		}
-		m.logger.Info("updating repository", "name", name, "branch", branch, "path", path)
-		m.stashWIP(path, name)
+		m.logger.Info("updating repository", "branch", branch, "path", path)
+		m.stashWIP(path)
 		if _, err := m.runGit(path, "fetch", "origin", branch); err != nil {
 			return "", err
 		}
@@ -125,23 +142,27 @@ func (m *Manager) EnsureRepo(name, url, branch string) (string, error) {
 			return "", err
 		}
 	default: // dirForeign
-		return "", fmt.Errorf("git %s: %s exists but is not a git repository (and not empty); refusing to overwrite it", name, path)
+		return "", fmt.Errorf("git %s: directory exists but is not a git repository (and not empty); refusing to overwrite it", path)
 	}
 	return path, nil
 }
 
 // HeadCommit returns the commit that the checkout at repoPath currently has
 // checked out (git rev-parse HEAD). The reconciler uses it to expose
-// GIT_COMMIT to stacks and hooks. repoPath must be a checkout below the
-// manager's work directory; anything else is refused (conservative choice:
-// the manager only answers for directories it manages).
+// GIT_COMMIT to stacks and hooks. repoPath must be absolute; since checkout
+// paths are configurable (see EnsureRepoAt) it may lie outside the manager's
+// work directory — the manager answers for every checkout it ensures, not
+// just those below workDir.
 func (m *Manager) HeadCommit(repoPath string) (string, error) {
+	if repoPath == "" {
+		return "", fmt.Errorf("git: repoPath must not be empty")
+	}
 	abs, err := filepath.Abs(repoPath)
 	if err != nil {
 		return "", fmt.Errorf("git: resolve %s: %w", repoPath, err)
 	}
-	if abs != m.workDir && !strings.HasPrefix(abs, m.workDir+string(filepath.Separator)) {
-		return "", fmt.Errorf("git: %s is not below the work directory %s", abs, m.workDir)
+	if err := validateCheckoutPath(abs); err != nil {
+		return "", err
 	}
 	out, err := m.runGit(abs, "rev-parse", "HEAD")
 	if err != nil {
@@ -161,25 +182,25 @@ func (m *Manager) HeadCommit(repoPath string) (string, error) {
 // deliberately never applied or popped again — restore is a manual
 // operator action (`git stash list` / `git stash pop`) so merge conflicts
 // can never block a deploy.
-func (m *Manager) stashWIP(path, name string) {
+func (m *Manager) stashWIP(path string) {
 	out, err := m.runGit(path, "status", "--porcelain")
 	if err != nil {
 		// A repository this broken fails again, with context, in fetch or
 		// reset below; skipping the stash preserves today's error behavior.
-		m.logger.Warn("checking for local changes failed, skipping WIP stash", "name", name, "path", path, "error", err)
+		m.logger.Warn("checking for local changes failed, skipping WIP stash", "path", path, "error", err)
 		return
 	}
 	if strings.TrimSpace(string(out)) == "" {
-		m.logger.Debug("worktree clean, no WIP stash needed", "name", name, "path", path)
+		m.logger.Debug("worktree clean, no WIP stash needed", "path", path)
 		return
 	}
 	message := wipStashPrefix + time.Now().Format(time.RFC3339)
 	if _, err := m.runGit(path, "stash", "push", "--include-untracked", "-m", message); err != nil {
-		m.logger.Warn("WIP stash failed, resetting anyway (local changes may be lost)", "name", name, "path", path, "error", err)
+		m.logger.Warn("WIP stash failed, resetting anyway (local changes may be lost)", "path", path, "error", err)
 		return
 	}
 	m.logger.Info("stashed local changes before reset",
-		"name", name, "path", path, "stash_message", message,
+		"path", path, "stash_message", message,
 		"restore_hint", "git stash list / git stash pop in the checkout")
 }
 
@@ -194,6 +215,42 @@ func validateName(name string) error {
 		return fmt.Errorf("git: invalid repository name %q (must be a single path segment below the work dir)", name)
 	}
 	return nil
+}
+
+// validateCheckoutPath rejects checkout paths that are not absolute or
+// contain characters outside a conservative whitelist (letters, digits,
+// '.', '_', '-' and '/'). The path is host configuration — global.
+// host_checkout, remotes.<name>.checkout — not client input, so it needs no
+// prefix jail confining it to the manager's work directory; but paths that
+// end up in git command lines and log output must never smuggle in
+// whitespace, quotes or shell metacharacters.
+func validateCheckoutPath(path string) error {
+	if path == "" {
+		return fmt.Errorf("git: checkout path must not be empty")
+	}
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("git: checkout path %q must be absolute", path)
+	}
+	for i := 0; i < len(path); i++ {
+		if !isCheckoutPathByte(path[i]) {
+			return fmt.Errorf("git: checkout path %q must only contain the characters A-Z a-z 0-9 . _ - /", path)
+		}
+	}
+	return nil
+}
+
+// isCheckoutPathByte reports whether c is one of the checkout path
+// characters. Byte-wise checking is safe: every allowed character is ASCII,
+// and every byte of a multi-byte UTF-8 sequence is >= 0x80 and therefore
+// rejected.
+func isCheckoutPathByte(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	case c == '.' || c == '_' || c == '-' || c == '/':
+		return true
+	}
+	return false
 }
 
 // dirKind classifies the target directory of EnsureRepo.
@@ -229,14 +286,16 @@ func dirState(path string) (dirKind, error) {
 }
 
 // checkOrigin verifies that the existing checkout at path was cloned from
-// url. A mismatch is an error instead of a silent fetch from the old origin.
-func (m *Manager) checkOrigin(path, name, url string) error {
+// url. A mismatch is an error instead of a silent fetch from the old origin
+// — adopting a checkout means trusting its history, so it must prove it is
+// the configured repository.
+func (m *Manager) checkOrigin(path, url string) error {
 	out, err := m.runGit(path, "remote", "get-url", "origin")
 	if err != nil {
 		return err
 	}
 	if got := strings.TrimSpace(string(out)); got != url {
-		return fmt.Errorf("git %s: %s was cloned from %q, not %q (remove the checkout or fix the configuration)", name, path, got, url)
+		return fmt.Errorf("git %s: checkout was cloned from %q, not %q (remove the checkout or fix the configuration)", path, got, url)
 	}
 	return nil
 }

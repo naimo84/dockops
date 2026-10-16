@@ -20,6 +20,13 @@ import (
 // configuration (which declares work_dir) is loadable.
 const DefaultWorkDir = "/var/lib/dockops/repos"
 
+// EnvHostCheckout is the environment fallback for global.host_checkout: an
+// explicit YAML value wins, the env only fills a missing field (same
+// precedence as VAULT_ADDR). Exported because the one-shot status mode
+// (cmd/dockops -print-status) follows the same variable without loading a
+// configuration.
+const EnvHostCheckout = "DOCKOPS_HOST_CHECKOUT"
+
 // Smart defaults applied when the corresponding field is unset in stacks.yaml.
 const (
 	defaultPollInterval     = 5 * time.Minute
@@ -73,7 +80,8 @@ func Load(rootFile string) (*Config, error) {
 	cfg.Stacks = append(cfg.Stacks, local...)
 
 	for _, imp := range cfg.Imports {
-		stack, err := loadImportStack(cfg.Global, imp)
+		rem := cfg.Remotes[imp.Remote] // existence validated by loadRoot
+		stack, err := loadImportStack(cfg.Global, rem, imp)
 		if err != nil {
 			return nil, fmt.Errorf("import remote=%q path=%q: %w", imp.Remote, imp.Path, err)
 		}
@@ -145,6 +153,13 @@ func applyRootDefaults(root *Root) {
 	if g.Vault.Address == "" {
 		g.Vault.Address = os.Getenv("VAULT_ADDR")
 	}
+	// Same precedence for the host checkout path (EnvHostCheckout): the YAML
+	// value wins, the env fills a missing field. Applied before validation so
+	// an invalid env value fails with the same field context as an invalid
+	// YAML value.
+	if g.HostCheckout == "" {
+		g.HostCheckout = os.Getenv(EnvHostCheckout)
+	}
 	// Map iteration is nondeterministic, but this loop only mutates in place.
 	for name, rem := range root.Remotes {
 		if rem.Branch == "" {
@@ -161,9 +176,15 @@ func validateRoot(root *Root, file string) error {
 	default:
 		return fmt.Errorf("%s: global.vault.auth_method: invalid value %q (must be \"token\" or \"approle\")", file, root.Global.Vault.AuthMethod)
 	}
+	if err := validateCheckoutPath(root.Global.HostCheckout); err != nil {
+		return fmt.Errorf("%s: global.host_checkout: %w", file, err)
+	}
 	for _, name := range sortedRemoteNames(root.Remotes) {
 		if root.Remotes[name].URL == "" {
 			return fmt.Errorf("%s: remotes[%s]: url is required", file, name)
+		}
+		if err := validateCheckoutPath(root.Remotes[name].Checkout); err != nil {
+			return fmt.Errorf("%s: remotes[%s].checkout: %w", file, name, err)
 		}
 	}
 	for i, imp := range root.Imports {
@@ -192,6 +213,42 @@ func sortedRemoteNames(remotes map[string]Remote) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// validateCheckoutPath checks a configured checkout path
+// (global.host_checkout, remotes.<name>.checkout): non-empty values must be
+// absolute and limited to [A-Za-z0-9._/-]. The charset keeps whitespace,
+// quotes and shell metacharacters out of paths that end up in git command
+// lines and log output. Unlike import paths there is deliberately no prefix
+// jail — the path is host configuration naming a clone anywhere on the host,
+// not client input confined to a checkout.
+func validateCheckoutPath(p string) error {
+	if p == "" {
+		return nil
+	}
+	if !filepath.IsAbs(p) {
+		return fmt.Errorf("path %q must be absolute", p)
+	}
+	for i := 0; i < len(p); i++ {
+		if !isCheckoutPathByte(p[i]) {
+			return fmt.Errorf("path %q must only contain the characters A-Z a-z 0-9 . _ - / (no whitespace, quotes or shell metacharacters)", p)
+		}
+	}
+	return nil
+}
+
+// isCheckoutPathByte reports whether c is one of the checkout path
+// characters [A-Za-z0-9._/-]. Byte-wise checking is safe: every allowed
+// character is ASCII, and every byte of a multi-byte UTF-8 sequence is >= 0x80
+// and therefore rejected.
+func isCheckoutPathByte(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		return true
+	case c == '.' || c == '_' || c == '-' || c == '/':
+		return true
+	}
+	return false
 }
 
 // validateImportPath rejects absolute paths and paths escaping the remote
@@ -347,10 +404,17 @@ func loadStackFile(file string, composeFilePatterns []string) (Stack, error) {
 }
 
 // loadImportStack loads the base stack referenced by imp from the remote
-// checkout at <workDir>/<remote>/<path> and merges the import overrides on
-// top of it.
-func loadImportStack(g Global, imp Import) (Stack, error) {
-	dir := filepath.Join(g.WorkDir, imp.Remote, imp.Path)
+// checkout — at rem.Checkout when the remote configures one, otherwise at
+// <workDir>/<remote>/<path> — and merges the import overrides on top of it.
+// The resolution must match where the reconciler clones the remote
+// (git.Manager.EnsureRepoAt with the same configured path), otherwise the
+// import would be looked for in a checkout dockops never touched.
+func loadImportStack(g Global, rem Remote, imp Import) (Stack, error) {
+	checkoutRoot := rem.Checkout
+	if checkoutRoot == "" {
+		checkoutRoot = filepath.Join(g.WorkDir, imp.Remote)
+	}
+	dir := filepath.Join(checkoutRoot, imp.Path)
 	file, err := findImportStackFile(dir)
 	if err != nil {
 		return Stack{}, err

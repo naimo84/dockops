@@ -313,16 +313,31 @@ func selfProject() string {
 }
 
 // hostCommitFn wires the host_repo.commit callback of GET /status and
-// -print-status over the shared bootstrap checkout: with a git manager it
-// resolves the host repo's HEAD, without one it always fails (BuildStatus
-// degrades both cases to an empty commit).
+// -print-status over the host checkout: with a git manager it resolves the
+// checkout's HEAD — at DOCKOPS_HOST_CHECKOUT when set (global.host_
+// checkout's env fallback), otherwise at the bootstrap default — without one
+// it always fails (BuildStatus degrades both cases to an empty commit). The
+// callback has no config access, so the env is the only override it can see;
+// in daemon mode the bootstrap checkout is reset to the same origin/branch
+// on every pass, so its commit equals the configured checkout's anyway.
 func hostCommitFn(gitMgr *git.Manager) func() (string, error) {
 	if gitMgr == nil { // nil *git.Manager would be a non-nil interface and panic on use
 		return func() (string, error) { return "", errors.New("git manager unavailable (see startup log)") }
 	}
 	return func() (string, error) {
-		return gitMgr.HeadCommit(filepath.Join(config.DefaultWorkDir, reconciler.HostRepoName))
+		return gitMgr.HeadCommit(hostCheckoutPath())
 	}
+}
+
+// hostCheckoutPath returns the host checkout path for the status callbacks:
+// DOCKOPS_HOST_CHECKOUT (config.EnvHostCheckout, global.host_checkout's env
+// fallback) wins over the bootstrap default <DefaultWorkDir>/host. The
+// status modes load no configuration — env fallback is all they need.
+func hostCheckoutPath() string {
+	if p := os.Getenv(config.EnvHostCheckout); p != "" {
+		return p
+	}
+	return filepath.Join(config.DefaultWorkDir, reconciler.HostRepoName)
 }
 
 // writeStatus builds the status document via the shared webhook function of

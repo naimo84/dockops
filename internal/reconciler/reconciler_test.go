@@ -23,12 +23,15 @@ import (
 
 // ---- fakes (no git/docker/sops/vault binaries needed) ----
 
-// fakeGit places every repository at <workDir>/<name> without touching git.
+// fakeGit "ensures" repositories without touching git: by name below
+// workDir (EnsureRepo, the bootstrap path) and by absolute path
+// (EnsureRepoAt, the configured checkout paths), recording both.
 type fakeGit struct {
-	workDir string
-	ensured []string          // repository names in call order
-	failAt  string            // repository name that fails
-	commits map[string]string // checkout path -> commit; unknown paths error
+	workDir   string
+	ensured   []string          // repository names in call order (EnsureRepo)
+	ensuredAt []string          // absolute checkout paths in call order (EnsureRepoAt)
+	failAt    string            // repository name that fails
+	commits   map[string]string // checkout path -> commit; unknown paths error
 }
 
 func (f *fakeGit) EnsureRepo(name, url, branch string) (string, error) {
@@ -37,6 +40,11 @@ func (f *fakeGit) EnsureRepo(name, url, branch string) (string, error) {
 		return "", fmt.Errorf("git boom: %s", name)
 	}
 	return filepath.Join(f.workDir, name), nil
+}
+
+func (f *fakeGit) EnsureRepoAt(path, url, branch string) (string, error) {
+	f.ensuredAt = append(f.ensuredAt, path)
+	return path, nil
 }
 
 func (f *fakeGit) HeadCommit(repoPath string) (string, error) {
@@ -1018,8 +1026,11 @@ imports:
 	if err := f.reconciler().Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
-	if want := []string{"host", "origin1"}; !reflect.DeepEqual(f.git.ensured, want) {
-		t.Errorf("EnsureRepo calls = %v, want %v", f.git.ensured, want)
+	if want := []string{"host"}; !reflect.DeepEqual(f.git.ensured, want) {
+		t.Errorf("EnsureRepo calls = %v, want %v (bootstrap by name)", f.git.ensured, want)
+	}
+	if want := []string{filepath.Join(f.workDir, "origin1")}; !reflect.DeepEqual(f.git.ensuredAt, want) {
+		t.Errorf("EnsureRepoAt calls = %v, want %v (remote without checkout below work_dir)", f.git.ensuredAt, want)
 	}
 	if got := f.upNames(); !reflect.DeepEqual(got, []string{"imported"}) {
 		t.Fatalf("Ups = %v, want [imported] (import name overrides base name)", got)
@@ -1033,6 +1044,116 @@ imports:
 	}
 	if !contains(env, "STACK_NAME=imported") || !contains(env, "STACK_DIR="+filepath.Join(f.workDir, "origin1", "svc")) {
 		t.Errorf("hook env %v misses stack identity of the import", env)
+	}
+}
+
+// TestReconcileConfiguredCheckoutPaths pins the configurable checkout paths
+// (global.host_checkout, remotes.<name>.checkout): the pass bootstraps below
+// the work dir by name, then ensures the configured host and remote
+// checkouts at their absolute paths, reads the full configuration from the
+// configured host checkout (local stacks included) and deploys every stack
+// where it actually lives.
+func TestReconcileConfiguredCheckoutPaths(t *testing.T) {
+	base := t.TempDir()
+	hostCheckout := filepath.Join(base, "apps")
+	infraCheckout := filepath.Join(base, "infrastructure")
+
+	// The adopted clones carry the same root config as the bootstrap
+	// checkout (in reality all of them are clones of the same repository).
+	rootYAML := fmt.Sprintf(`global:
+  work_dir: WORKDIR
+  host_checkout: %s
+remotes:
+  infra:
+    url: https://example.invalid/infra.git
+    checkout: %s
+imports:
+  - remote: infra
+    path: svc
+    name: imported
+`, hostCheckout, infraCheckout)
+	f := newFixture(t, rootYAML)
+	writeFile(t, filepath.Join(hostCheckout, rootConfigFile),
+		strings.ReplaceAll(rootYAML, "WORKDIR", f.workDir))
+
+	// Stacks live below the CONFIGURED paths, not below the work dir.
+	writeFile(t, filepath.Join(hostCheckout, "web", "stack.yaml"), "name: web\n")
+	writeFile(t, filepath.Join(hostCheckout, "web", "compose.yaml"), "services:\n  app:\n    image: nginx:latest\n")
+	writeFile(t, filepath.Join(infraCheckout, "svc", "stack.yaml"), "name: base\n")
+	writeFile(t, filepath.Join(infraCheckout, "svc", "compose.yaml"), "services:\n  app:\n    image: nginx:latest\n")
+
+	f.git.commits = map[string]string{
+		hostCheckout:  "host123",
+		infraCheckout: "remote789",
+	}
+
+	if err := f.reconciler().Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	// Bootstrap by name only; both configured paths go through EnsureRepoAt.
+	if want := []string{"host"}; !reflect.DeepEqual(f.git.ensured, want) {
+		t.Errorf("EnsureRepo calls = %v, want %v (bootstrap)", f.git.ensured, want)
+	}
+	if want := []string{hostCheckout, infraCheckout}; !reflect.DeepEqual(f.git.ensuredAt, want) {
+		t.Errorf("EnsureRepoAt calls = %v, want %v (configured host and remote paths)", f.git.ensuredAt, want)
+	}
+
+	// Local stacks are discovered in the configured host checkout, the
+	// import in the configured remote checkout.
+	if got, want := f.upNames(), []string{"web", "imported"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Ups = %v, want %v", got, want)
+	}
+	if got, want := f.compose.ups[0].stackDir, filepath.Join(hostCheckout, "web"); got != want {
+		t.Errorf("web stackDir = %q, want %q (deployed from the configured host checkout)", got, want)
+	}
+	if got := f.compose.ups[0].env["GIT_COMMIT"]; got != "host123" {
+		t.Errorf("web GIT_COMMIT = %q, want the configured host checkout's commit", got)
+	}
+	if got, want := f.compose.ups[1].stackDir, filepath.Join(infraCheckout, "svc"); got != want {
+		t.Errorf("imported stackDir = %q, want %q (deployed from the configured remote checkout)", got, want)
+	}
+	if got := f.compose.ups[1].env["GIT_COMMIT"]; got != "remote789" {
+		t.Errorf("imported GIT_COMMIT = %q, want the configured remote checkout's commit", got)
+	}
+
+	// State records the configured locations.
+	st, ok := f.state.Get("web")
+	if !ok {
+		t.Fatal("state has no entry for web")
+	}
+	if st.StackDir != filepath.Join(hostCheckout, "web") {
+		t.Errorf("state[web].StackDir = %q, want the configured host checkout", st.StackDir)
+	}
+}
+
+// TestReconcileRemotesBelowConfiguredWorkDir replaces the old warn path: a
+// global.work_dir differing from the bootstrap dir no longer needs a second
+// git manager — the remote is simply ensured at <work_dir>/<name> via
+// EnsureRepoAt on the bootstrap manager.
+func TestReconcileRemotesBelowConfiguredWorkDir(t *testing.T) {
+	otherWork := filepath.Join(t.TempDir(), "other-work")
+	f := newFixture(t, fmt.Sprintf(`global:
+  work_dir: %s
+remotes:
+  infra:
+    url: https://example.invalid/infra.git
+imports:
+  - remote: infra
+    path: svc
+    name: imported
+`, otherWork))
+	writeFile(t, filepath.Join(otherWork, "infra", "svc", "stack.yaml"), "name: base\n")
+	writeFile(t, filepath.Join(otherWork, "infra", "svc", "compose.yaml"), "services:\n  app:\n    image: nginx:latest\n")
+
+	if err := f.reconciler().Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if want := []string{filepath.Join(otherWork, "infra")}; !reflect.DeepEqual(f.git.ensuredAt, want) {
+		t.Errorf("EnsureRepoAt calls = %v, want %v (remote below the configured work dir)", f.git.ensuredAt, want)
+	}
+	if got := f.upNames(); !reflect.DeepEqual(got, []string{"imported"}) {
+		t.Errorf("Ups = %v, want the import below the configured work dir deployed", got)
 	}
 }
 
