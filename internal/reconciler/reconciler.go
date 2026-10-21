@@ -46,6 +46,7 @@ import (
 	"github.com/local/dockops/internal/hash"
 	"github.com/local/dockops/internal/hooks"
 	"github.com/local/dockops/internal/notify"
+	"github.com/local/dockops/internal/registry"
 	"github.com/local/dockops/internal/secrets"
 	"github.com/local/dockops/internal/sops"
 	"github.com/local/dockops/internal/state"
@@ -98,6 +99,15 @@ type ComposeExecutor interface {
 	// DownProject tears a project down by name only, without a compose
 	// file (compose.Executor.DownProject).
 	DownProject(ctx context.Context, project string) error
+
+	// Images returns the resolved service→image map of a stack, build-only
+	// services omitted (compose.Executor.Images; phase-10 update check).
+	Images(ctx context.Context, req compose.Request) (map[string]string, error)
+
+	// ImageDigest returns the local repository digest of an image
+	// reference, "" when it has none (built locally) — compose.Executor's
+	// ImageDigest.
+	ImageDigest(ctx context.Context, ref string) (string, error)
 }
 
 // HookRunner is the subset of hooks.Engine the reconciler needs.
@@ -195,6 +205,17 @@ type Deps struct {
 	// notify.New. It is only called when the configuration actually has a
 	// block and Notifier is unset, and again only when the block changed.
 	NewNotifier func(config.Notifications, *slog.Logger) notify.Notifier
+
+	// Registry resolves remote image digests for the phase-10 update check.
+	// When set it wins over NewRegistry and is used as-is (tests count the
+	// lookups that way).
+	Registry registry.Resolver
+
+	// NewRegistry builds the resolver for the configured registries block;
+	// nil → registry.New. Only called when Registry is unset and a pass
+	// actually has a due stack, and rebuilt only when the credentials
+	// change.
+	NewRegistry func([]config.Registry, *slog.Logger) registry.Resolver
 }
 
 // Reconciler executes reconciliation passes over the declarative
@@ -220,6 +241,15 @@ type Reconciler struct {
 	injected    bool
 	newNotifier func(config.Notifications, *slog.Logger) notify.Notifier
 	notifierKey string
+
+	// Registry collaborators of the image update check: an injected
+	// resolver wins, otherwise the registry client is built from the
+	// root configuration's registries block and rebuilt when that block
+	// changes (registryKey holds its serialised form).
+	registry    registry.Resolver
+	injectedReg bool
+	newRegistry func([]config.Registry, *slog.Logger) registry.Resolver
+	registryKey string
 }
 
 // New returns a Reconciler for deps, applying the defaults documented on
@@ -266,6 +296,12 @@ func New(deps Deps) *Reconciler {
 			return notify.New(cfg, logger, nil)
 		}
 	}
+	newRegistry := deps.NewRegistry
+	if newRegistry == nil {
+		newRegistry = func(creds []config.Registry, logger *slog.Logger) registry.Resolver {
+			return registry.New(registryCredentials(creds), logger)
+		}
+	}
 	return &Reconciler{
 		repoURL:     deps.RepoURL,
 		branch:      deps.Branch,
@@ -281,6 +317,9 @@ func New(deps Deps) *Reconciler {
 		notifier:    deps.Notifier,
 		injected:    deps.Notifier != nil,
 		newNotifier: newNotifier,
+		registry:    deps.Registry,
+		injectedReg: deps.Registry != nil,
+		newRegistry: newRegistry,
 	}
 }
 
@@ -449,7 +488,14 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		errs = append(errs, r.prune(ctx, cfg, pn)...)
 	}
 
-	// 6. Persist the state. Deployments and failures are already saved per
+	// 6. Image update check (phase 10): compare the deployed images with
+	// their registries and record the outcome. Deliberately last — it needs
+	// the state records the deployments just wrote — and it deploys
+	// nothing: the apply actor is a later phase. Its per-image failures
+	// stay in the records and never fail the pass.
+	errs = append(errs, r.checkImageUpdates(ctx, cfg, pn)...)
+
+	// 7. Persist the state. Deployments and failures are already saved per
 	// stack the moment they are recorded (see deployStack and markFailed),
 	// so this write persists the prunes and any stragglers; a failure to
 	// persist is itself a pass error.

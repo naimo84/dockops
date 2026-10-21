@@ -47,9 +47,15 @@ const (
 	NotificationDeployFailed = "deploy_failed"
 	NotificationPruneFailed  = "prune_failed"
 	NotificationRepoFailed   = "repo_failed"
+	// NotificationUpdateAvailable is the phase-10 image update event. It
+	// is valid in notifications.on but deliberately NOT part of the
+	// default set: a new image is normal operation, and nobody should be
+	// messaged about it without opting in.
+	NotificationUpdateAvailable = "update_available"
 )
 
-// defaultNotificationEvents is the `on` default: every event kind.
+// defaultNotificationEvents is the `on` default: the failure events only.
+// update_available stays out until notifications.on requests it.
 var defaultNotificationEvents = []string{
 	NotificationDeployFailed,
 	NotificationPruneFailed,
@@ -73,6 +79,9 @@ type Config struct {
 	// when the root config has none). The reconciler builds its notifier
 	// from it.
 	Notifications *Notifications
+	// Registries holds the optional registry credentials of the image
+	// update check (phase 10), expanded and validated by the loader.
+	Registries []Registry
 }
 
 // Load parses the root configuration at rootFile (stacks.yaml in the host
@@ -90,6 +99,7 @@ func Load(rootFile string) (*Config, error) {
 		Remotes:       root.Remotes,
 		Imports:       root.Imports,
 		Notifications: root.Notifications,
+		Registries:    root.Registries,
 	}
 
 	// The host repository root is the directory of the root config file.
@@ -144,6 +154,11 @@ func loadRoot(path string) (*Root, error) {
 		}
 		root.Notifications = n
 	}
+	registries, err := buildRegistries(doc.Registries, path)
+	if err != nil {
+		return nil, err
+	}
+	root.Registries = registries
 	applyRootDefaults(&root)
 	if err := validateRoot(&root, path); err != nil {
 		return nil, err
@@ -184,6 +199,12 @@ func applyRootDefaults(root *Root) {
 	if g.Vault.SecretIDFromEnv == "" {
 		g.Vault.SecretIDFromEnv = defaultVaultSecretIDEnv
 	}
+	if g.UpdateCheckInterval == nil {
+		// The key is absent: fill the default explicitly so every reader
+		// sees the effective value. An explicit 0 stays 0 (= off).
+		d := Duration(DefaultUpdateCheckInterval)
+		g.UpdateCheckInterval = &d
+	}
 	// "smartDefaultOrEnv(VAULT_ADDR)": explicit value wins, env as fallback.
 	if g.Vault.Address == "" {
 		g.Vault.Address = os.Getenv("VAULT_ADDR")
@@ -213,6 +234,11 @@ func validateRoot(root *Root, file string) error {
 	}
 	if err := validateCheckoutPath(root.Global.HostCheckout); err != nil {
 		return fmt.Errorf("%s: global.host_checkout: %w", file, err)
+	}
+	if root.Global.EffectiveUpdateCheckInterval() < 0 {
+		// 0 is the documented "off" switch; a negative interval is a
+		// configuration mistake (and would mean "always due" here).
+		return fmt.Errorf("%s: global.update_check_interval: must not be negative (0 disables the update check)", file)
 	}
 	for _, name := range sortedRemoteNames(root.Remotes) {
 		if root.Remotes[name].URL == "" {
@@ -426,6 +452,7 @@ func loadStackFile(file string, composeFilePatterns []string) (Stack, error) {
 	stack.File = file
 	stack.Dir = filepath.Dir(file)
 	stack.Source = "local"
+	applyStackDefaults(&stack)
 	if stack.Name == "" {
 		stack.Name = filepath.Base(stack.Dir)
 	}
@@ -463,6 +490,7 @@ func loadImportStack(g Global, rem Remote, imp Import) (Stack, error) {
 	base.File = file
 	base.Dir = dir
 	base.Source = fmt.Sprintf("import %s/%s", imp.Remote, imp.Path)
+	applyStackDefaults(&base)
 	if err := validateStack(&base); err != nil {
 		return Stack{}, fmt.Errorf("%s: %w", file, err)
 	}
@@ -515,9 +543,26 @@ func findImportStackFile(dir string) (string, error) {
 	}
 }
 
+// applyStackDefaults fills the stack-level defaults whose zero value is not
+// the documented default. Only update_policy has one: an absent key means
+// notify.
+func applyStackDefaults(s *Stack) {
+	if s.UpdatePolicy == "" {
+		s.UpdatePolicy = UpdatePolicyNotify
+	}
+}
+
 // validateStack checks required fields and cross-field semantics within a
 // parsed stack definition.
 func validateStack(s *Stack) error {
+	// An empty value stays valid so hand-built stacks (tests, the prune
+	// ghost) need not set a policy; EffectiveUpdatePolicy reads it as
+	// notify.
+	switch s.UpdatePolicy {
+	case "", UpdatePolicyNotify, UpdatePolicyPinned:
+	default:
+		return fmt.Errorf("update_policy: invalid value %q (must be notify or pinned)", s.UpdatePolicy)
+	}
 	for i, sf := range s.SopsFiles {
 		if sf.Path == "" {
 			return fmt.Errorf("sops_files[%d]: path is required", i)
@@ -638,6 +683,7 @@ func checkDuplicateNames(stacks []Stack) error {
 type rootYAML struct {
 	Global        Global             `yaml:"global"`
 	Notifications *notificationsYAML `yaml:"notifications"`
+	Registries    []Registry         `yaml:"registries"`
 	Remotes       map[string]Remote  `yaml:"remotes"`
 	Imports       []Import           `yaml:"imports"`
 }
@@ -769,6 +815,84 @@ func expandNotificationValue(field, value string) (string, error) {
 	return expanded, nil
 }
 
+// buildRegistries turns the decoded registries list into its validated form:
+// ${VAR} expansion of every string field (same mechanics and error texts as
+// the notification destinations), then validation. A missing list is not an
+// error — anonymous registry access is the normal case.
+func buildRegistries(doc []Registry, file string) ([]Registry, error) {
+	if len(doc) == 0 {
+		return nil, nil
+	}
+	out := make([]Registry, len(doc))
+	copy(out, doc)
+	for i := range out {
+		if err := expandRegistry(&out[i], file, i); err != nil {
+			return nil, err
+		}
+	}
+	if err := validateRegistries(out, file); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// registryField formats the field path used in error messages, e.g.
+// registries[0].password.
+func registryField(index int, name string) string {
+	return fmt.Sprintf("registries[%d].%s", index, name)
+}
+
+// expandRegistry expands ${VAR} references in every string field of one
+// registry entry (host, username, password). Failure mode as for the
+// notification destinations: a missing secret fails the load naming the field
+// and the variable, instead of silently authenticating with an empty
+// password.
+func expandRegistry(r *Registry, file string, index int) error {
+	fields := []struct {
+		name  string
+		value *string
+	}{
+		{"host", &r.Host},
+		{"username", &r.Username},
+		{"password", &r.Password},
+	}
+	for _, f := range fields {
+		expanded, err := expandNotificationValue(registryField(index, f.name), *f.value)
+		if err != nil {
+			return fmt.Errorf("%s: %w", file, err)
+		}
+		*f.value = expanded
+	}
+	return nil
+}
+
+// validateRegistries checks the registry entries: a host without scheme or
+// path, credentials as a pair, and no duplicate hosts (a silent last-wins
+// would hide a broken entry).
+func validateRegistries(regs []Registry, file string) error {
+	seen := make(map[string]int, len(regs))
+	for i, r := range regs {
+		host := strings.TrimSpace(r.Host)
+		switch {
+		case host == "":
+			return fmt.Errorf("%s: %s: is required (the registry host as it appears in an image reference)", file, registryField(i, "host"))
+		case strings.Contains(host, "://"):
+			return fmt.Errorf("%s: %s: must be a bare host without scheme (e.g. gitea.example.com:3000)", file, registryField(i, "host"))
+		case strings.ContainsAny(host, "/ \t"):
+			return fmt.Errorf("%s: %s: must be a bare host without path (e.g. gitea.example.com:3000)", file, registryField(i, "host"))
+		}
+		if (r.Username == "") != (r.Password == "") {
+			return fmt.Errorf("%s: %s: username and password must be configured together", file, registryField(i, "host"))
+		}
+		key := strings.ToLower(host)
+		if first, ok := seen[key]; ok {
+			return fmt.Errorf("%s: %s: duplicate host %q (already configured at registries[%d])", file, registryField(i, "host"), host, first)
+		}
+		seen[key] = i
+	}
+	return nil
+}
+
 // sortedHeaderNames returns the header names in deterministic order.
 func sortedHeaderNames(headers map[string]string) []string {
 	names := make([]string, 0, len(headers))
@@ -785,9 +909,9 @@ func sortedHeaderNames(headers map[string]string) []string {
 func validateNotifications(n *Notifications, file string) error {
 	for i, kind := range n.On {
 		switch kind {
-		case NotificationDeployFailed, NotificationPruneFailed, NotificationRepoFailed:
+		case NotificationDeployFailed, NotificationPruneFailed, NotificationRepoFailed, NotificationUpdateAvailable:
 		default:
-			return fmt.Errorf("%s: notifications.on[%d]: unknown event %q (must be deploy_failed, prune_failed or repo_failed)", file, i, kind)
+			return fmt.Errorf("%s: notifications.on[%d]: unknown event %q (must be deploy_failed, prune_failed, repo_failed or update_available)", file, i, kind)
 		}
 	}
 	if n.RepeatAfter < 0 {

@@ -12,12 +12,13 @@ import (
 // Stages reported with a deploy_failed / repo_failed event; they name the
 // step of the pass that failed (see notify.Event.Stage).
 const (
-	stageSecrets    = "secrets"
-	stagePreDeploy  = "pre_deploy"
-	stageComposeUp  = "compose_up"
-	stagePostDeploy = "post_deploy"
-	stageConfig     = "config"
-	stageRepo       = "repo"
+	stageSecrets     = "secrets"
+	stagePreDeploy   = "pre_deploy"
+	stageComposeUp   = "compose_up"
+	stagePostDeploy  = "post_deploy"
+	stageConfig      = "config"
+	stageRepo        = "repo"
+	stageUpdateCheck = "update_check"
 )
 
 // passNotify carries the notification calls of one reconcile pass. The
@@ -77,6 +78,23 @@ func (p *passNotify) repoFailed(ctx context.Context, remote, stage string, err e
 		Remote: remote,
 		Stage:  stage,
 		Err:    err.Error(),
+	})
+}
+
+// updateAvailable reports that a stack's image tag now points at a new
+// remote digest (phase 10). One event per new digest: the caller compares
+// against the persisted record and only calls this on a change, and the
+// notifier's own dedupe window is the second safety net.
+func (p *passNotify) updateAvailable(ctx context.Context, stack, hash, text string) {
+	if p == nil || p.notifier == nil {
+		return
+	}
+	p.notifier.Notify(ctx, notify.Event{
+		Kind:  config.NotificationUpdateAvailable,
+		Stack: stack,
+		Stage: stageUpdateCheck,
+		Err:   text,
+		Hash:  hash,
 	})
 }
 
