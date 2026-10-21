@@ -112,7 +112,12 @@ func (e *Executor) DownProject(ctx context.Context, project string) error {
 // ComposeFile, each joined below stackDir when relative (hand-constructed
 // stacks may carry relative paths).
 func composeFileArgs(stack config.Stack, stackDir string) []string {
-	files := stack.EffectiveComposeFiles()
+	return resolveComposeFileArgs(stack.EffectiveComposeFiles(), stackDir)
+}
+
+// resolveComposeFileArgs is the file-list half of composeFileArgs, shared
+// with the read-only Request of the image update check (images.go).
+func resolveComposeFileArgs(files []string, stackDir string) []string {
 	args := make([]string, 0, len(files)*2)
 	for _, f := range files {
 		if !filepath.IsAbs(f) {

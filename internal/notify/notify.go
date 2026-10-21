@@ -35,14 +35,14 @@ const (
 
 // Event is one reconcile failure to report.
 type Event struct {
-	// Kind is deploy_failed, prune_failed or repo_failed.
+	// Kind is deploy_failed, prune_failed, repo_failed or update_available.
 	Kind string
 	// Stack is the affected stack; empty for repo_failed.
 	Stack string
 	// Remote is the affected remote; only set for repo_failed.
 	Remote string
 	// Stage names the failing phase: pre_deploy, compose_up, post_deploy,
-	// secrets, config or repo.
+	// secrets, config or repo — for update_available it is update_check.
 	Stage string
 	// Err is the failure text, truncated to 2000 characters.
 	Err string

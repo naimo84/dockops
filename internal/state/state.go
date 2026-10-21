@@ -65,6 +65,38 @@ type State struct {
 	// deployed from multiple files (compose_files); ComposeFile stays empty
 	// in that case. Optional, see ComposeFile.
 	ComposeFiles []string `json:"compose_files,omitempty"`
+	// Images holds the last update check per image reference (phase 10).
+	// Purely additive and optional: state files written before the field
+	// existed load unchanged, and fileVersion stays 1 — nothing about a
+	// deployment depends on it (it neither triggers nor blocks one), so a
+	// migration or a schema bump would be noise.
+	Images map[string]ImageRecord `json:"images,omitempty"`
+}
+
+// ImageRecord is the persisted outcome of the last update check of one image
+// reference of a stack (phase 10). It records what was compared when; it
+// never drives a deployment.
+type ImageRecord struct {
+	// Service is the compose service the image belongs to. The map is
+	// keyed by image reference (an image may serve several services, and
+	// the reference is what the registry is asked about); the service name
+	// is kept so GET /status can name it without a compose call.
+	Service string `json:"service,omitempty"`
+	// CurrentDigest is the locally recorded repository digest
+	// (docker image inspect RepoDigests); empty for a locally built image.
+	CurrentDigest string `json:"current_digest,omitempty"`
+	// RemoteDigest is the digest the registry reported for the reference.
+	RemoteDigest string `json:"remote_digest,omitempty"`
+	// UpdateAvailable reports that remote and local digest differ — a new
+	// image is published under the tag the stack uses.
+	UpdateAvailable bool `json:"update_available,omitempty"`
+	// CheckedAt is the UTC time of the check (also the due-date basis for
+	// update_check_interval).
+	CheckedAt time.Time `json:"checked_at"`
+	// Error carries a failed check: registry errors (rate limit, auth,
+	// missing manifest) and "locally built image" (no RepoDigest). An
+	// error never means "update available".
+	Error string `json:"error,omitempty"`
 }
 
 // fileModel is the JSON document persisted by Save.
@@ -156,6 +188,35 @@ func (s *Store) Set(name string, st State) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.stacks[name] = st
+	return nil
+}
+
+// SetImages records the update-check results of one stack, replacing its
+// previous image records. The stack entry itself must exist: an image record
+// belongs to a deployment (it compares that deployment's digests), so there
+// is nothing to attach it to otherwise — the caller logs and skips. Hash,
+// status, timestamps and compose traces stay untouched; call Save to persist.
+func (s *Store) SetImages(stack string, recs map[string]ImageRecord) error {
+	if stack == "" {
+		return fmt.Errorf("state: stack name must not be empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.stacks[stack]
+	if !ok {
+		return fmt.Errorf("state: stack %s: no state entry to attach image records to", stack)
+	}
+	if recs == nil {
+		st.Images = nil
+	} else {
+		copied := make(map[string]ImageRecord, len(recs))
+		for ref, rec := range recs {
+			rec.CheckedAt = rec.CheckedAt.UTC()
+			copied[ref] = rec
+		}
+		st.Images = copied
+	}
+	s.stacks[stack] = st
 	return nil
 }
 

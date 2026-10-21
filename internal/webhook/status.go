@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/local/dockops/internal/compose"
+	"github.com/local/dockops/internal/config"
 	"github.com/local/dockops/internal/state"
 )
 
@@ -116,6 +117,43 @@ type StackStatus struct {
 	Drift string `json:"drift"`
 	// Error carries the container listing failure when Drift is "unknown".
 	Error string `json:"error,omitempty"`
+	// Updates reports the last image update check of this stack (phase 10).
+	// Nil when the stack has no records — no check ran yet, or its
+	// update_policy is pinned. Built exclusively from the state: /status
+	// stays fast, offline-capable and free of registry lookups.
+	Updates *StackUpdates `json:"updates,omitempty"`
+}
+
+// StackUpdates is the persisted image update situation of one stack.
+type StackUpdates struct {
+	// Policy is the stack's update policy. Only stacks with "notify" are
+	// checked, and only they have records, so a present block means
+	// "notify" (the phase-11 apply actor will add its own value).
+	Policy string `json:"policy"`
+	// CheckedAt is the newest check timestamp (RFC3339, empty when
+	// unknown).
+	CheckedAt string `json:"checked_at"`
+	// Pending counts the images whose tag moved (update_available).
+	Pending int `json:"pending"`
+	// Services lists one entry per checked image, sorted by service.
+	Services []ServiceUpdate `json:"services"`
+}
+
+// ServiceUpdate is the update state of one image of a stack.
+type ServiceUpdate struct {
+	// Service is the compose service name.
+	Service string `json:"service"`
+	// Image is the image reference (the registry's identity of the image).
+	Image string `json:"image"`
+	// CurrentDigest is the locally recorded digest, empty for a locally
+	// built image.
+	CurrentDigest string `json:"current_digest"`
+	// RemoteDigest is the digest the registry reported.
+	RemoteDigest string `json:"remote_digest"`
+	// UpdateAvailable reports that the tag points at a different digest.
+	UpdateAvailable bool `json:"update_available"`
+	// Error carries a failed check (registry error, locally built image).
+	Error string `json:"error"`
 }
 
 // UnmanagedProject is a running compose project without a state entry.
@@ -218,6 +256,11 @@ func buildStackStatus(ctx context.Context, logger *slog.Logger, lister ComposeLi
 		Name:         name,
 		DeployedHash: st.Hash,
 		Containers:   make([]compose.Container, 0),
+		// The update block comes from the state alone and is therefore
+		// independent of the container listing: a broken ps must not hide
+		// the recorded image situation, and a broken image record must not
+		// change the drift statement.
+		Updates: buildStackUpdates(st),
 	}
 	if !st.UpdatedAt.IsZero() {
 		entry.LastDeployed = st.UpdatedAt.UTC().Format(time.RFC3339)
@@ -232,6 +275,52 @@ func buildStackStatus(ctx context.Context, logger *slog.Logger, lister ComposeLi
 	entry.Containers = sortContainers(containers)
 	entry.Drift = driftFor(containers)
 	return entry
+}
+
+// buildStackUpdates renders the recorded image update check of one stack.
+// nil means "no records" — the block is omitted from the response (never an
+// empty object pretending a check happened). The state is the only source:
+// no docker, no registry, no configuration.
+func buildStackUpdates(st state.State) *StackUpdates {
+	if len(st.Images) == 0 {
+		return nil
+	}
+	updates := &StackUpdates{
+		// Only stacks with update_policy notify are checked at all, so a
+		// record set implies the policy. Persisting the policy itself
+		// would duplicate the configuration in the state for no gain.
+		Policy:   config.UpdatePolicyNotify,
+		Services: make([]ServiceUpdate, 0, len(st.Images)), // JSON [], not null
+	}
+	var newest time.Time
+	for ref, rec := range st.Images {
+		if rec.CheckedAt.After(newest) {
+			newest = rec.CheckedAt
+		}
+		if rec.UpdateAvailable {
+			updates.Pending++
+		}
+		updates.Services = append(updates.Services, ServiceUpdate{
+			Service:         rec.Service,
+			Image:           ref,
+			CurrentDigest:   rec.CurrentDigest,
+			RemoteDigest:    rec.RemoteDigest,
+			UpdateAvailable: rec.UpdateAvailable,
+			Error:           rec.Error,
+		})
+	}
+	if !newest.IsZero() {
+		updates.CheckedAt = newest.UTC().Format(time.RFC3339)
+	}
+	// Deterministic order: service first (the operator-facing name), the
+	// image reference as the tiebreaker for a service using several images.
+	sort.Slice(updates.Services, func(i, j int) bool {
+		if updates.Services[i].Service != updates.Services[j].Service {
+			return updates.Services[i].Service < updates.Services[j].Service
+		}
+		return updates.Services[i].Image < updates.Services[j].Image
+	})
+	return updates
 }
 
 // driftFor classifies a stack's containers per the drift matrix:

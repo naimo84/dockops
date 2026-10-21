@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/local/dockops/internal/compose"
 	"github.com/local/dockops/internal/config"
 	"github.com/local/dockops/internal/dotenv"
 	"github.com/local/dockops/internal/state"
@@ -73,7 +74,9 @@ type downCall struct {
 	envExists bool
 }
 
-// fakeCompose records Up/Down/DownProject calls with optional failures.
+// fakeCompose records Up/Down/DownProject calls with optional failures. The
+// read-only image methods of the phase-10 update check answer from canned
+// tables so no docker binary is needed.
 type fakeCompose struct {
 	ups               []upCall
 	downs             []downCall
@@ -81,6 +84,16 @@ type fakeCompose struct {
 	failUpFor         string
 	failDownFor       string
 	failDownProjectAt string
+	// images is the service→image map Images reports; imagesErr fails it.
+	images     map[string]string
+	imagesErr  error
+	imagesCall int
+	// digests maps an image reference to its local repository digest; a
+	// missing entry means "locally built" (empty digest).
+	digests   map[string]string
+	digestErr error
+	// imageDigestCalls counts the inspect lookups in call order.
+	imageDigestCalls []string
 	// onUp, when set, runs synchronously at the start of every Up with the
 	// stack name — tests use it to inject mid-pass effects (e.g. making
 	// the state directory unwritable to simulate an interrupted pass).
@@ -119,6 +132,26 @@ func (f *fakeCompose) Down(_ context.Context, stack config.Stack, stackDir, envF
 		return fmt.Errorf("compose down boom: %s", stack.Name)
 	}
 	return nil
+}
+
+func (f *fakeCompose) Images(_ context.Context, _ compose.Request) (map[string]string, error) {
+	f.imagesCall++
+	if f.imagesErr != nil {
+		return nil, f.imagesErr
+	}
+	out := make(map[string]string, len(f.images))
+	for k, v := range f.images {
+		out[k] = v
+	}
+	return out, nil
+}
+
+func (f *fakeCompose) ImageDigest(_ context.Context, ref string) (string, error) {
+	f.imageDigestCalls = append(f.imageDigestCalls, ref)
+	if f.digestErr != nil {
+		return "", f.digestErr
+	}
+	return f.digests[ref], nil
 }
 
 func (f *fakeCompose) DownProject(_ context.Context, project string) error {
