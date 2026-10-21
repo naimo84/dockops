@@ -45,6 +45,8 @@ import (
 	"github.com/local/dockops/internal/git"
 	"github.com/local/dockops/internal/hash"
 	"github.com/local/dockops/internal/hooks"
+	"github.com/local/dockops/internal/notify"
+	"github.com/local/dockops/internal/registry"
 	"github.com/local/dockops/internal/secrets"
 	"github.com/local/dockops/internal/sops"
 	"github.com/local/dockops/internal/state"
@@ -97,6 +99,15 @@ type ComposeExecutor interface {
 	// DownProject tears a project down by name only, without a compose
 	// file (compose.Executor.DownProject).
 	DownProject(ctx context.Context, project string) error
+
+	// Images returns the resolved service→image map of a stack, build-only
+	// services omitted (compose.Executor.Images; phase-10 update check).
+	Images(ctx context.Context, req compose.Request) (map[string]string, error)
+
+	// ImageDigest returns the local repository digest of an image
+	// reference, "" when it has none (built locally) — compose.Executor's
+	// ImageDigest.
+	ImageDigest(ctx context.Context, ref string) (string, error)
 }
 
 // HookRunner is the subset of hooks.Engine the reconciler needs.
@@ -184,6 +195,27 @@ type Deps struct {
 	// NewVault, nil → vault.New. Called at most once per pass, and only
 	// when a stack actually has vault paths or vault templates.
 	NewVault VaultFactory
+
+	// Notifier, when set, receives the reconcile-failure events, wins over
+	// NewNotifier and is used even without a notifications block (tests
+	// inject a recording notifier that way). Regular runs leave it nil.
+	Notifier notify.Notifier
+
+	// NewNotifier builds the notifier for a notifications block; nil →
+	// notify.New. It is only called when the configuration actually has a
+	// block and Notifier is unset, and again only when the block changed.
+	NewNotifier func(config.Notifications, *slog.Logger) notify.Notifier
+
+	// Registry resolves remote image digests for the phase-10 update check.
+	// When set it wins over NewRegistry and is used as-is (tests count the
+	// lookups that way).
+	Registry registry.Resolver
+
+	// NewRegistry builds the resolver for the configured registries block;
+	// nil → registry.New. Only called when Registry is unset and a pass
+	// actually has a due stack, and rebuilt only when the credentials
+	// change.
+	NewRegistry func([]config.Registry, *slog.Logger) registry.Resolver
 }
 
 // Reconciler executes reconciliation passes over the declarative
@@ -200,6 +232,24 @@ type Reconciler struct {
 	hooks    HookRunner
 	sops     SopsDecryptFunc
 	newVault VaultFactory
+
+	// Notification collaborators: an injected notifier wins (injected
+	// records that fact), otherwise the notifier is built lazily from the
+	// first pass that carries a notifications block and rebuilt whenever
+	// that block changes (notifierKey holds its serialised form).
+	notifier    notify.Notifier
+	injected    bool
+	newNotifier func(config.Notifications, *slog.Logger) notify.Notifier
+	notifierKey string
+
+	// Registry collaborators of the image update check: an injected
+	// resolver wins, otherwise the registry client is built from the
+	// root configuration's registries block and rebuilt when that block
+	// changes (registryKey holds its serialised form).
+	registry    registry.Resolver
+	injectedReg bool
+	newRegistry func([]config.Registry, *slog.Logger) registry.Resolver
+	registryKey string
 }
 
 // New returns a Reconciler for deps, applying the defaults documented on
@@ -240,18 +290,36 @@ func New(deps Deps) *Reconciler {
 			return vault.New(cfg, logger)
 		}
 	}
+	newNotifier := deps.NewNotifier
+	if newNotifier == nil {
+		newNotifier = func(cfg config.Notifications, logger *slog.Logger) notify.Notifier {
+			return notify.New(cfg, logger, nil)
+		}
+	}
+	newRegistry := deps.NewRegistry
+	if newRegistry == nil {
+		newRegistry = func(creds []config.Registry, logger *slog.Logger) registry.Resolver {
+			return registry.New(registryCredentials(creds), logger)
+		}
+	}
 	return &Reconciler{
-		repoURL:  deps.RepoURL,
-		branch:   deps.Branch,
-		workDir:  filepath.Clean(workDir),
-		state:    deps.State,
-		logger:   logger,
-		onConfig: deps.OnConfigLoaded,
-		git:      deps.Git,
-		compose:  composeExec,
-		hooks:    hookRunner,
-		sops:     sopsFn,
-		newVault: vaultFactory,
+		repoURL:     deps.RepoURL,
+		branch:      deps.Branch,
+		workDir:     filepath.Clean(workDir),
+		state:       deps.State,
+		logger:      logger,
+		onConfig:    deps.OnConfigLoaded,
+		git:         deps.Git,
+		compose:     composeExec,
+		hooks:       hookRunner,
+		sops:        sopsFn,
+		newVault:    vaultFactory,
+		notifier:    deps.Notifier,
+		injected:    deps.Notifier != nil,
+		newNotifier: newNotifier,
+		registry:    deps.Registry,
+		injectedReg: deps.Registry != nil,
+		newRegistry: newRegistry,
 	}
 }
 
@@ -271,6 +339,10 @@ func New(deps Deps) *Reconciler {
 // all is well); the pass is idempotent and aborts early when ctx is
 // cancelled. Bootstrapping failures (host repo, root config) abort the
 // whole pass since nothing downstream can run without them.
+//
+// Failures are also reported through the configured notifier
+// (deploy_failed, prune_failed, repo_failed); the notifier's own problems
+// are logged by internal/notify and never change the pass result.
 func (r *Reconciler) Reconcile(ctx context.Context) error {
 	if err := r.validate(); err != nil {
 		return err
@@ -279,6 +351,13 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		return fmt.Errorf("reconciler: %w", err)
 	}
 	var errs []error
+
+	// Notifications: the pass starts with the notifier of the previous pass
+	// (an injected one always), so a failure before the root configuration is
+	// readable can still be reported. Once the root config is loaded the
+	// notifier is (re)built for this pass and logged once (see
+	// logNotifications).
+	pn := &passNotify{notifier: r.notifier}
 
 	// 1. Primary host repository. The bootstrap is deliberately path-fixed
 	// (Henne-Ei): the root configuration that may declare global.
@@ -294,12 +373,25 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	}
 	hostPath, err := gitMgr.EnsureRepo(HostRepoName, r.repoURL, r.branch)
 	if err != nil {
-		return fmt.Errorf("reconciler: host repo: %w", err)
+		err = fmt.Errorf("reconciler: host repo: %w", err)
+		pn.repoFailed(ctx, HostRepoName, stageRepo, err)
+		return err
 	}
 	rootFile := filepath.Join(hostPath, rootConfigFile)
 	root, err := config.LoadRoot(rootFile)
 	if err != nil {
-		return fmt.Errorf("reconciler: %w", err)
+		err = fmt.Errorf("reconciler: %w", err)
+		pn.repoFailed(ctx, HostRepoName, stageConfig, err)
+		return err
+	}
+
+	// The root configuration is readable from here on, so the notifier
+	// reflects this pass's channels (rebuilt only when the block changed) and
+	// announces itself once — the verification signal on the hosts
+	// (docker logs).
+	pn.set(r.notifierFor(root.Notifications))
+	if root.Notifications != nil {
+		r.logNotifications(root.Notifications)
 	}
 
 	// global.host_checkout relocates the effective host checkout away from
@@ -313,7 +405,9 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	if hc := root.Global.HostCheckout; hc != "" && filepath.Clean(hc) != filepath.Clean(hostPath) {
 		hostPath, err = gitMgr.EnsureRepoAt(hc, r.repoURL, r.branch)
 		if err != nil {
-			return fmt.Errorf("reconciler: host repo: %w", err)
+			err = fmt.Errorf("reconciler: host repo: %w", err)
+			pn.repoFailed(ctx, HostRepoName, stageRepo, err)
+			return err
 		}
 		rootFile = filepath.Join(hostPath, rootConfigFile)
 	}
@@ -336,7 +430,11 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		}
 		p, err := gitMgr.EnsureRepoAt(path, rem.URL, rem.Branch)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("remote %s: %w", name, err))
+			err = fmt.Errorf("remote %s: %w", name, err)
+			// One repo_failed per pass; the pass error still lists every
+			// failing remote.
+			pn.repoFailed(ctx, name, stageRepo, err)
+			errs = append(errs, err)
 			continue
 		}
 		remotePaths[name] = p
@@ -345,12 +443,17 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	// 3. Full configuration: local stack discovery plus import merge.
 	cfg, err := config.Load(rootFile)
 	if err != nil {
-		errs = append(errs, fmt.Errorf("reconciler: %w", err))
+		err = fmt.Errorf("reconciler: %w", err)
+		pn.repoFailed(ctx, HostRepoName, stageConfig, err)
+		errs = append(errs, err)
 		return errors.Join(errs...)
 	}
 	if r.onConfig != nil {
 		r.onConfig(cfg)
 	}
+	// Load re-reads the root file, so follow whatever block this pass
+	// actually loaded (a removed block drops the notifier).
+	pn.set(r.notifierFor(cfg.Notifications))
 
 	// GIT_COMMIT per stack: the commit of the checkout the stack
 	// definition lives in (host checkout for local stacks, owning remote
@@ -374,7 +477,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("reconciler: aborted before stack %s: %w", stack.Name, err))
 			break
 		}
-		if err := r.deployStack(ctx, stack, vaultSess, commits); err != nil {
+		if err := r.deployStack(ctx, stack, vaultSess, commits, pn); err != nil {
 			r.logger.Error("stack deployment failed", "stack", stack.Name, "error", err)
 			errs = append(errs, err)
 		}
@@ -382,10 +485,17 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 
 	// 5. Prune stacks that disappeared from the configuration.
 	if cfg.Global.PruneRemovedStacks {
-		errs = append(errs, r.prune(ctx, cfg)...)
+		errs = append(errs, r.prune(ctx, cfg, pn)...)
 	}
 
-	// 6. Persist the state. Deployments and failures are already saved per
+	// 6. Image update check (phase 10): compare the deployed images with
+	// their registries and record the outcome. Deliberately last — it needs
+	// the state records the deployments just wrote — and it deploys
+	// nothing: the apply actor is a later phase. Its per-image failures
+	// stay in the records and never fail the pass.
+	errs = append(errs, r.checkImageUpdates(ctx, cfg, pn)...)
+
+	// 7. Persist the state. Deployments and failures are already saved per
 	// stack the moment they are recorded (see deployStack and markFailed),
 	// so this write persists the prunes and any stragglers; a failure to
 	// persist is itself a pass error.
@@ -398,11 +508,13 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 // deployStack runs the deployment sequence of one enabled stack: hash,
 // change detection, secrets, environment, hooks and compose up. Per-stack
 // failures are returned; the caller collects them and continues with the
-// next stack. All deferred cleanup (the shm env file) runs when this
-// function returns, i.e. at the end of the stack; the generated stack-dir
-// .env deliberately outlives a successful deployment (see the WriteStackEnv
-// call below).
-func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultSess *vaultSession, commits map[string]string) error {
+// next stack. Every deployment failure is reported once as deploy_failed
+// with the stage it happened in, and a fully successful deployment clears the
+// dedupe key (Recovery). All deferred cleanup (the shm env file) runs when
+// this function returns, i.e. at the end of the stack; the generated
+// stack-dir .env deliberately outlives a successful deployment (see the
+// WriteStackEnv call below).
+func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultSess *vaultSession, commits map[string]string, pn *passNotify) error {
 	composeFiles := stack.EffectiveComposeFiles()
 	contents := make([][]byte, 0, len(composeFiles))
 	for _, file := range composeFiles {
@@ -434,8 +546,10 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	if len(stack.VaultPaths) > 0 || len(stack.VaultEnvTemplates) > 0 {
 		vaultClient, err = vaultSess.get(ctx)
 		if err != nil {
+			err = fmt.Errorf("stack %s: vault: %w", stack.Name, err)
+			pn.deployFailed(ctx, stack.Name, stageSecrets, newHash, err)
 			r.markFailed(stack, newHash)
-			return fmt.Errorf("stack %s: vault: %w", stack.Name, err)
+			return err
 		}
 	}
 
@@ -443,21 +557,29 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	resolver := &stackResolver{stack: stack, decrypt: r.sops, vault: vaultClient}
 	merged, err := env.MergeStackEnv(ctx, stack, resolver, stack.Dir, sysEnv)
 	if err != nil {
+		err = fmt.Errorf("stack %s: resolve environment: %w", stack.Name, err)
+		pn.deployFailed(ctx, stack.Name, stageSecrets, newHash, err)
 		r.markFailed(stack, newHash)
-		return fmt.Errorf("stack %s: resolve environment: %w", stack.Name, err)
+		return err
 	}
 
 	envFile, cleanup, err := env.WriteShm(merged)
 	if err != nil {
+		// The generated environment is part of the secret pipeline; a
+		// failure here aborts the deployment just like a resolution error.
+		err = fmt.Errorf("stack %s: write env file: %w", stack.Name, err)
+		pn.deployFailed(ctx, stack.Name, stageSecrets, newHash, err)
 		r.markFailed(stack, newHash)
-		return fmt.Errorf("stack %s: write env file: %w", stack.Name, err)
+		return err
 	}
 	defer cleanup()
 
 	hookEnv := envList(merged)
 	if err := r.hooks.Run(ctx, stack.Hooks.PreDeploy, stack.Dir, hookEnv, hookTimeout); err != nil {
+		err = fmt.Errorf("stack %s: pre_deploy: %w", stack.Name, err)
+		pn.deployFailed(ctx, stack.Name, stagePreDeploy, newHash, err)
 		r.markFailed(stack, newHash)
-		return fmt.Errorf("stack %s: pre_deploy: %w", stack.Name, err)
+		return err
 	}
 
 	// The stack-dir .env backs compose's stack-relative env_file: ./.env
@@ -471,8 +593,10 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	// not trigger a redeployment (Komodo reality; see env.WriteStackEnv).
 	stackEnvPath, rollbackStackEnv, err := env.WriteStackEnv(stack.Dir, merged)
 	if err != nil {
+		err = fmt.Errorf("stack %s: write stack env file: %w", stack.Name, err)
+		pn.deployFailed(ctx, stack.Name, stageSecrets, newHash, err)
 		r.markFailed(stack, newHash)
-		return fmt.Errorf("stack %s: write stack env file: %w", stack.Name, err)
+		return err
 	}
 	r.logger.Debug("wrote stack env file", "stack", stack.Name, "path", stackEnvPath)
 
@@ -481,8 +605,10 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		// stack directory does not advertise an environment its services
 		// are not running with.
 		rollbackStackEnv()
+		err = fmt.Errorf("stack %s: up: %w", stack.Name, err)
+		pn.deployFailed(ctx, stack.Name, stageComposeUp, newHash, err)
 		r.markFailed(stack, newHash)
-		return fmt.Errorf("stack %s: up: %w", stack.Name, err)
+		return err
 	}
 
 	// A failed post_deploy hook does not undeploy the stack — the briefing
@@ -493,6 +619,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	if err := r.hooks.Run(ctx, stack.Hooks.PostDeploy, stack.Dir, hookEnv, hookTimeout); err != nil {
 		r.logger.Error("post_deploy failed; stack counts as deployed anyway", "stack", stack.Name, "error", err)
 		postErr = fmt.Errorf("stack %s: post_deploy: %w", stack.Name, err)
+		pn.deployFailed(ctx, stack.Name, stagePostDeploy, newHash, postErr)
 	}
 
 	if err := r.state.Set(stack.Name, state.State{
@@ -512,6 +639,11 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	// from the configuration — no prune, no compose down (phase-6c bugs).
 	if err := r.state.Save(); err != nil {
 		return errors.Join(postErr, fmt.Errorf("stack %s: persist state: %w", stack.Name, err))
+	}
+	if postErr == nil {
+		// Fully successful deployment: drop the dedupe key, so the next
+		// failure of this stack alarms immediately again.
+		pn.recovery(config.NotificationDeployFailed, stack.Name)
 	}
 	return postErr
 }
@@ -541,7 +673,7 @@ func (r *Reconciler) markFailed(stack config.Stack, newHash string) {
 // configuration and removes the entry. Disabled stacks still exist in the
 // configuration and are therefore never pruned. A failed teardown keeps the
 // entry so the next pass retries it.
-func (r *Reconciler) prune(ctx context.Context, cfg *config.Config) []error {
+func (r *Reconciler) prune(ctx context.Context, cfg *config.Config, pn *passNotify) []error {
 	configured := make(map[string]struct{}, len(cfg.Stacks))
 	for _, s := range cfg.Stacks {
 		configured[s.Name] = struct{}{}
@@ -554,7 +686,9 @@ func (r *Reconciler) prune(ctx context.Context, cfg *config.Config) []error {
 		st, _ := r.state.Get(name)
 		if err := r.pruneStack(ctx, name, st); err != nil {
 			r.logger.Error("prune failed; state entry kept for retry", "stack", name, "error", err)
-			errs = append(errs, fmt.Errorf("prune %s: %w", name, err))
+			err = fmt.Errorf("prune %s: %w", name, err)
+			pn.pruneFailed(ctx, name, err)
+			errs = append(errs, err)
 			continue
 		}
 		r.state.Delete(name)

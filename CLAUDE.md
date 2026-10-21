@@ -72,7 +72,77 @@ Docker-Fehler degradieren weiter ins Dokument); CLI-Flag `-print-status`
 `writeStatus` mit 2-Spaces-Indent nach stdout — Logs/Fehler auf stderr
 (stdout bleibt reines JSON), kein `-repo` nötig, gewinnt über
 `-once`/Daemon-Modus (Hinweis-Log), exit 0 auch bei Docker-Problemen, nur
-State-Ladefehler → stderr + exit 1.
+State-Ladefehler → stderr + exit 1. Phase 9: Benachrichtigungen bei
+Reconcile-Fehlern — neues Paket `internal/notify` (stdlib-only Transport für
+`webhook`/`ntfy`/`telegram`/`discord`/`slack`: POST je Destination mit eigenem
+`context.WithTimeout`, HTTP-Status ≥ 400 = Fehler, WARN-Log nur mit Typ und
+Host — nie Token oder URL-Query, Fehler erreichen den Aufrufer nicht),
+In-Memory-Dedupe pro `(kind, stack)` mit `repeat_after` (Mutex + Map,
+Neustart vergisst das Fenster — bewusst akzeptiert) und `Recovery`, das den
+Key löscht; optionaler Root-Block `notifications` (Typen in
+`internal/config/types.go`, Defaults/Validierung/`${VAR}`-Expansion aus der
+Prozessumgebung in `load.go`; fehlende Variable = Ladefehler mit Feld und
+Variablenname, fehlender Block = Feature aus, `enabled: false` lädt und
+validiert weiter, sendet aber nichts; kein Stack-Hash-Bump, weil host-global)
+und Reconciler-Verdrahtung: `deploy_failed` mit `stage`
+(`secrets`/`pre_deploy`/`compose_up`/`post_deploy`), `prune_failed`,
+`repo_failed` höchstens einmal pro Pass (`remote` = betroffener Remote bzw.
+`host`, `stage` `repo`/`config`), Notifier lazy beim ersten Pass mit Block
+und Neuaufbau nur bei geänderter Config (Vergleich über die serialisierte
+Struktur), `Deps.Notifier` gewinnt immer (Tests), `Deps.NewNotifier` nil →
+`notify.New`; INFO `notifications active destinations=… on=[…]` je Pass als
+Verifikationssignal auf den Hosts. Tests: `internal/notify/notify_test.go`
+(httptest je Sender inkl. Telegram-Basis-URL-Override, Timeout blockiert
+Folgekanäle nicht, Dedupe mit injizierter Clock, Recovery, `on`-Filter,
+Kürzung 2000/4000, keine Secrets im Log), `internal/config/phase9_test.go`
+(Defaults, Expansion, fehlende Variable, unbekannter Typ/Pflichtfelder,
+leere Destinations, fehlender Block) und
+`internal/reconciler/phase9_test.go` (Fake-docker via PATH,
+`compose_up`/`pre_deploy`/Prune/Repo-Events, Dedupe über zwei Pässe,
+Notifier-Bau nur mit Block). Phase 10: Image-Update-Erkennung — neues Paket
+`internal/registry` (`ParseRef` mit Docker-Hub-Kurzform/`library/`-Präfix/
+Tag-Default/Digest-Pins, `HEAD /v2/<repo>/manifests/<tag>` mit `Accept` für
+alle vier Manifest-Typen, Digest aus `Docker-Content-Digest`, Bearer-Challenge
+mit Basic-Auth nur bei konfigurierten Credentials und Token-Cache je Host,
+Fehlerklassen `ErrNotFound`/`ErrUnauthorized`/`ErrRateLimited` via
+`errors.Is`, 10s pro Request, Klartext-HTTP nur für Loopback, Digest-Pin ohne
+Netzaufruf); `compose.Images` (`docker compose -p X -f … config --format
+json`, Build-only-Services ohne `image:` fallen heraus) und
+`compose.ImageDigest` (`docker image inspect --format '{{json
+.RepoDigests}}'`, Repository-Match mit Hub-Normalisierung, leer = lokal
+gebaut); optionale Root-Config `registries` (`${VAR}`-Expansion über
+`expandNotificationValue`) und `global.update_check_interval`
+(`*config.Duration`, Default 1h, `0` = aus, negativ = Ladefehler); Stack-Feld
+`update_policy` (`notify` Default | `pinned`, unbekannt = Validierungsfehler);
+additive State-Felder `Images map[string]ImageRecord` mit `Store.SetImages`
+(**fileVersion bleibt 1**, alte Dateien laden weiter); Reconciler-Schritt
+`checkImageUpdates` NACH den Deploys (Fälligkeit über das jüngste `CheckedAt`
+plus Intervall, Services aus `services`/`ignore_services` gefiltert, lokal
+gebautes Image = Record ohne Alarm, Registry-Fehler nur im Record und nie
+Pass-Fehler, Übergang false→true bzw. neuer Remote-Digest = genau ein
+`update_available`-Event mit Stage `update_check`, Recovery bei wieder
+deckungsgleichem Image); `/status` und `-print-status` bekommen das additive
+Feld `updates{policy,checked_at,pending,services[]}` **ausschließlich aus dem
+State** (kein Docker/Registry im HTTP-Pfad). Bewusste Entscheidungen: **kein
+Hash-Bump** (`update_policy` ändert kein Deployment — Test im Hash-Paket),
+State-Feld rein additiv (kein Migrationszwang), `/status` bleibt
+offline-fähig, `update_available` ist **opt-in** (Default-On-Liste bleibt
+`[deploy_failed, prune_failed, repo_failed]`), diese Phase deployt nichts
+(kein `pull`, kein Recreate; der Akteur folgt in Phase 11). Tests:
+`internal/registry/registry_test.go` (Parsing-Tabelle, `httptest`-Registry mit
+401→Token→200, falsches Token, fehlender Digest-Header, Klassen 404/403/429,
+Timeout, `Accept` aller vier Typen, Pin ohne HTTP),
+`internal/compose/images_test.go` (Fake-docker: Config-JSON-Parsing inkl.
+Build-only-Service, RepoDigests-Match, Fehlerfälle),
+`internal/state/phase10_test.go` (Round-Trip, Altdatei ohne `Images`, Version
+1, `SetImages`-Semantik), `internal/config/phase10_test.go`
+(Registries/Expansion/Fehler, Intervall Default/0/negativ, Policy
+Default/`pinned`/ungültig, `update_available` opt-in),
+`internal/reconciler/phase10_test.go` (pinned/Intervall 0 ohne Aufruf,
+Fälligkeit, genau ein Event pro neuem Digest, Registry-Fehler, lokal gebautes
+Image, `ignore_services`, degradierendes Compose-Config) und
+`internal/webhook/phase10_test.go` (`updates` aus dem State, fehlend ohne
+Records, unabhängig von ps-Fehlern).
 
 ## Umgebung
 
@@ -96,12 +166,18 @@ State-Ladefehler → stderr + exit 1.
   Pflicht), Adresse aus `-addr`/`SOPS_SIDECAR_ADDR` (Default `:8081`)
 - `internal/config/` — Config-Loader: Root-Config, Stack-Discovery über
   Include-Globs, Compose-Auto-Detection, Import-Merge, Validierung;
+  Root-Block `notifications` (Defaults, `${VAR}`-Expansion aus der
+  Prozessumgebung, Pflichtfelder je Destination-Typ, `on`-Validierung);
   Stack-Felder: `services` (auch Basis-Stacks), `ignore_services`
   (Schnittmenge mit `services` = Validierungsfehler; Import-Merge:
   services ersetzt, ignore concat+dedup), `compose_files`
   (Multi-`-f`, exklusiv zu `compose_file`, alle Dateien müssen existieren),
   `vault_env_templates` (Import-Merge concat+dedup wie vault_paths, Pfade
-  relativ zum Stack-Dir, Auflösung im Env-Merge);
+  relativ zum Stack-Dir, Auflösung im Env-Merge), `update_policy`
+  (`notify`/`pinned`, bewusst nicht im Hash); Root-Block `registries`
+  (Credentials mit `${VAR}`-Expansion, Pflichtfelder, doppelte Hosts
+  abgelehnt); `global.update_check_interval` als `*Duration` (nil = 1h, `0` =
+  aus, `Global.EffectiveUpdateCheckInterval`);
   Helper `EffectiveComposeFiles`/`EffectiveServices`/`ExcludeServices`
 - `internal/git/` — Git-Manager: Clone-or-Update der Remote-Checkouts über
   die lokal installierte git-Binary (`os/exec`, keine Git-Library); im
@@ -118,7 +194,9 @@ State-Ladefehler → stderr + exit 1.
   vault_env_templates) + normalisierten Compose-Inhalten (einer pro Datei,
   in `-f`-Reihenfolge)
 - `internal/state/` — State-Store: Deployment-Zustand pro Stack (JSON-Datei,
-  atomar geschrieben; `compose_files` für Multi-File-Prune aufgezeichnet);
+  atomar geschrieben; `compose_files` für Multi-File-Prune aufgezeichnet;
+  additives `images`-Feld mit `ImageRecord` je Image-Ref, `SetImages`
+  verlangt einen bestehenden Stack-Eintrag, `fileVersion` bleibt 1);
   RWMutex-gesichert, /status liest aus HTTP-Goroutines parallel zum Poll-Loop
 - `internal/dotenv/` — Minimaler dotenv-Dialekt (Parse/Format), geteilt von
   SOPS-Output, env_files, Vault-Templates und der erzeugten
@@ -150,9 +228,11 @@ State-Ladefehler → stderr + exit 1.
   Compose-Datei in Listenreihenfolge, Service-Filter als positionale
   Argumente (services minus ignore_services; ohne services: Service-Namen
   der Compose-Dateien minus ignore, "alles ignoriert" = Fehler), plus
-  `DownProject` (Prune ohne Compose-Datei) und `ps.go` mit `PsProject`/
-  `PsAllProjects` (Container-/Projekt-Listen für `GET /status`, nie
-  deploy-relevant)
+  `DownProject` (Prune ohne Compose-Datei), `images.go` mit `Images`
+  (Service→Image über `config --format json`, Build-only ausgelassen) und
+  `ImageDigest` (lokaler RepoDigest für die Update-Prüfung) sowie `ps.go` mit
+  `PsProject`/`PsAllProjects` (Container-/Projekt-Listen für `GET /status`,
+  nie deploy-relevant)
 - `internal/webhook/` — Webhook-HTTP-Handler: `POST /webhook` mit
   GitHub-HMAC-SHA256 (`X-Hub-Signature-256`) oder GitLab-Token
   (`X-Gitlab-Token`), konstante Vergleiche, `GET /healthz`; Konstruktor
@@ -169,15 +249,60 @@ State-Ladefehler → stderr + exit 1.
   `DownProject` nur mit `-p`, Eintrag ohne Compose-Spuren → State-Remove
   mit Warnung ohne compose-Aufruf; Git/Compose/Hooks/Sops/Vault als
   injizierbare Interfaces für Tests, `Deps.SopsSidecarURL` schaltet die
-  sops_files-Dekryptierung auf den Sidecar um (injiziertes Sops gewinnt)
+  sops_files-Dekryptierung auf den Sidecar um (injiziertes Sops gewinnt);
+  Benachrichtigungen: `deploy_failed` mit Stage, `prune_failed`,
+  `repo_failed` (max. einmal pro Pass) und `update_available`, Notifier lazy +
+  Neuaufbau nur bei geänderter Config, `Deps.Notifier` gewinnt,
+  `Deps.NewNotifier` nil → `notify.New`, INFO `notifications active` je Pass;
+  `updatecheck.go` prüft nach den Deploys die Images (`Deps.Registry`
+  injizierbar, sonst `registry.New` aus `registries` mit Key-Vergleich)
 - `internal/webhook/status.go` — `GET /status` (Phase 8): Drift-Matrix pro
   State-Stack (`ok`/`stopped`/`partial`, ps-Fehler → `unknown` +
   `"error"`-Feld, Endpoint bleibt 200), unmanaged = laufende Compose-
   Projekte ohne State-Eintrag minus Eigenprojekt, `host_repo` mit HEAD-Commit
   via injizierter Callback-Funktion, Bearer-Schutz (`DOCKOPS_STATUS_TOKEN`,
   constant-time, leer = offen wie `/healthz`), Stacks/Unmanaged immer
-  sortierte JSON-Arrays; Dokument-Bau seit Phase 8b in exportierter
-  `BuildStatus(ctx, StatusDeps)` (Handler und `-print-status` teilen sie)
+  sortierte JSON-Arrays, additives `updates`-Feld (`StackUpdates`/
+  `ServiceUpdate`) rein aus den State-Records (nil = Key fehlt);
+  Dokument-Bau seit Phase 8b in exportierter `BuildStatus(ctx, StatusDeps)`
+  (Handler und `-print-status` teilen sie)
+- `internal/notify/` — Benachrichtigungs-Transport (Phase 9): Sender für
+  `webhook` (JSON), `ntfy` (Klartext + Title/Priority/Tags-Header),
+  `telegram` (Bot-API, Text auf 4000 Zeichen, kein `parse_mode`),
+  `discord`/`slack` (`content`/`text`); per-Destination-Timeout, Kürzung des
+  Fehlertexts auf 2000 Zeichen, In-Memory-Dedupe pro `(kind, stack)` mit
+  `repeat_after`, `Recovery` löscht den Key, Fehler nur als WARN (Typ + Host)
+- `internal/notify/notify_test.go` — Phase-9-Sendertests: `httptest` je Kanal
+  (Methode/Pfad/Header/Body), Timeout blockiert die Folgekanäle nicht, Dedupe
+  mit injizierter Clock, Recovery, `on`-Filter, Kürzung, keine Secrets im Log
+- `internal/registry/` — Registry-Client (Phase 10): `ParseRef`,
+  `Resolver`/`Client`/`Credentials`/`New`; `RemoteDigest` per `HEAD` auf
+  `/v2/<repo>/manifests/<tag>`, Bearer-Challenge, Token-Cache je Host,
+  Fehlerklassen und 10s-Timeout
+- `internal/registry/registry_test.go` — Phase-10-Registrytests:
+  Parsing-Tabelle, `httptest`-Challenge (401→Token→200, Basic-Auth nur mit
+  Credentials), falsches Token, fehlender Digest-Header, Klassen 404/403/429,
+  Timeout, `Accept` aller vier Manifest-Typen, Pin ohne HTTP
+- `internal/reconciler/phase10_test.go` — Phase-10-Regressionstests: `pinned`
+  und `update_check_interval: 0` ohne Registry-/Docker-Aufruf, Fälligkeit über
+  das Intervall, genau ein `update_available` je neuem Digest (zweiter Pass
+  still), Registry-Fehler nur im Record, lokal gebautes Image ohne Alarm,
+  `ignore_services`, degradierendes Compose-Config
+- `internal/webhook/phase10_test.go` — Phase-10-`/status`-Tests: `updates`
+  aus dem State (policy/pending/checked_at/sortierte Services), Key fehlt
+  ohne Records, Überleben eines ps-Fehlers
+- `internal/compose/images_test.go` — Phase-10-Compose-Tests:
+  `config --format json`-Parsing (Fake-docker via PATH, Build-only
+  ausgelassen), `-f`-Reihenfolge, Fehlerfälle, RepoDigests-Match inkl.
+  Hub-Normalisierung
+- `internal/state/phase10_test.go` — Phase-10-State-Tests: Round-Trip,
+  Altdatei ohne `images`, Version 1, `SetImages`-Semantik (Kopie, UTC,
+  Ersetzen, unbekannter Stack)
+- `internal/config/phase10_test.go` — Phase-10-Config-Tests: `registries`
+  inkl. `${VAR}`/Fehlern, `update_check_interval` (Default/0/negativ),
+  `update_policy` (Default/`pinned`/ungültig), `update_available` opt-in
+- `internal/hash/phase10_test.go` — Phase-10-Hash-Test: `update_policy`
+  ändert den Stack-Hash nicht
 - `internal/webhook/phase8b_test.go` — Phase-8b-Regressionstest:
   `BuildStatus` mit identischen Kollaborateuren wie der Endpoint liefert
   dasselbe Dokument (inkl. beider Fehler-Modi), fehlende Konfiguration ist
@@ -185,6 +310,13 @@ State-Ladefehler → stderr + exit 1.
 - `cmd/dockops/phase8b_test.go` — Phase-8b-CLI-Tests: `-print-status`
   (Default/Env/Flag/ungültiges Env, `-repo`-Befreiung) und `writeStatus`
   (2-Spaces-Indent, Newline, Docker-Fehler im Dokument statt Fehler)
+- `internal/reconciler/phase9_test.go` — Phase-9-Regressionstests:
+  `compose_up`-Fehler (auch über Fake-`docker` via PATH) erzeugt genau ein
+  `deploy_failed` mit Stage, `pre_deploy`-Hook → `stage=pre_deploy`,
+  erfolgreicher Pass → kein Event + Recovery, zwei Pässe mit identischem
+  Fehler → ein POST, Prune-Fehler → `prune_failed`, Repo-Fehler →
+  `repo_failed`, kein Notifier-Bau ohne Block, `notifications active` einmal
+  pro Pass
 - `internal/reconciler/phase6c_test.go` — Phase-6c-Regressionstests: die
   drei Prune-Fälle (a/b/c), Skip-über-Prune-Pass (identischer Hash deployt
   nicht neu) und der unterbrochene Pass (State-Dir wird mid-Pass read-only,

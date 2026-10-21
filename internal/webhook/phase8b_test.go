@@ -35,7 +35,7 @@ func TestBuildStatusMatchesStatusEndpoint(t *testing.T) {
 			"gamma": errors.New("docker daemon unreachable"),
 		},
 		refs: []compose.ProjectRef{
-			{Project: "alpha", Containers: []string{"alpha-a"}}, // managed
+			{Project: "alpha", Containers: []string{"alpha-a"}},     // managed
 			{Project: "dockops", Containers: []string{"dockops-1"}}, // self
 			{Project: "legacy", Containers: []string{"legacy-1"}},   // unmanaged
 		},
