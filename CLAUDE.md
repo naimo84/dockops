@@ -72,7 +72,34 @@ Docker-Fehler degradieren weiter ins Dokument); CLI-Flag `-print-status`
 `writeStatus` mit 2-Spaces-Indent nach stdout — Logs/Fehler auf stderr
 (stdout bleibt reines JSON), kein `-repo` nötig, gewinnt über
 `-once`/Daemon-Modus (Hinweis-Log), exit 0 auch bei Docker-Problemen, nur
-State-Ladefehler → stderr + exit 1.
+State-Ladefehler → stderr + exit 1. Phase 9: Benachrichtigungen bei
+Reconcile-Fehlern — neues Paket `internal/notify` (stdlib-only Transport für
+`webhook`/`ntfy`/`telegram`/`discord`/`slack`: POST je Destination mit eigenem
+`context.WithTimeout`, HTTP-Status ≥ 400 = Fehler, WARN-Log nur mit Typ und
+Host — nie Token oder URL-Query, Fehler erreichen den Aufrufer nicht),
+In-Memory-Dedupe pro `(kind, stack)` mit `repeat_after` (Mutex + Map,
+Neustart vergisst das Fenster — bewusst akzeptiert) und `Recovery`, das den
+Key löscht; optionaler Root-Block `notifications` (Typen in
+`internal/config/types.go`, Defaults/Validierung/`${VAR}`-Expansion aus der
+Prozessumgebung in `load.go`; fehlende Variable = Ladefehler mit Feld und
+Variablenname, fehlender Block = Feature aus, `enabled: false` lädt und
+validiert weiter, sendet aber nichts; kein Stack-Hash-Bump, weil host-global)
+und Reconciler-Verdrahtung: `deploy_failed` mit `stage`
+(`secrets`/`pre_deploy`/`compose_up`/`post_deploy`), `prune_failed`,
+`repo_failed` höchstens einmal pro Pass (`remote` = betroffener Remote bzw.
+`host`, `stage` `repo`/`config`), Notifier lazy beim ersten Pass mit Block
+und Neuaufbau nur bei geänderter Config (Vergleich über die serialisierte
+Struktur), `Deps.Notifier` gewinnt immer (Tests), `Deps.NewNotifier` nil →
+`notify.New`; INFO `notifications active destinations=… on=[…]` je Pass als
+Verifikationssignal auf den Hosts. Tests: `internal/notify/notify_test.go`
+(httptest je Sender inkl. Telegram-Basis-URL-Override, Timeout blockiert
+Folgekanäle nicht, Dedupe mit injizierter Clock, Recovery, `on`-Filter,
+Kürzung 2000/4000, keine Secrets im Log), `internal/config/phase9_test.go`
+(Defaults, Expansion, fehlende Variable, unbekannter Typ/Pflichtfelder,
+leere Destinations, fehlender Block) und
+`internal/reconciler/phase9_test.go` (Fake-docker via PATH,
+`compose_up`/`pre_deploy`/Prune/Repo-Events, Dedupe über zwei Pässe,
+Notifier-Bau nur mit Block).
 
 ## Umgebung
 
@@ -96,6 +123,8 @@ State-Ladefehler → stderr + exit 1.
   Pflicht), Adresse aus `-addr`/`SOPS_SIDECAR_ADDR` (Default `:8081`)
 - `internal/config/` — Config-Loader: Root-Config, Stack-Discovery über
   Include-Globs, Compose-Auto-Detection, Import-Merge, Validierung;
+  Root-Block `notifications` (Defaults, `${VAR}`-Expansion aus der
+  Prozessumgebung, Pflichtfelder je Destination-Typ, `on`-Validierung);
   Stack-Felder: `services` (auch Basis-Stacks), `ignore_services`
   (Schnittmenge mit `services` = Validierungsfehler; Import-Merge:
   services ersetzt, ignore concat+dedup), `compose_files`
@@ -169,7 +198,11 @@ State-Ladefehler → stderr + exit 1.
   `DownProject` nur mit `-p`, Eintrag ohne Compose-Spuren → State-Remove
   mit Warnung ohne compose-Aufruf; Git/Compose/Hooks/Sops/Vault als
   injizierbare Interfaces für Tests, `Deps.SopsSidecarURL` schaltet die
-  sops_files-Dekryptierung auf den Sidecar um (injiziertes Sops gewinnt)
+  sops_files-Dekryptierung auf den Sidecar um (injiziertes Sops gewinnt);
+  Benachrichtigungen: `deploy_failed` mit Stage, `prune_failed` und
+  `repo_failed` (max. einmal pro Pass), Notifier lazy + Neuaufbau nur bei
+  geänderter Config, `Deps.Notifier` gewinnt, `Deps.NewNotifier` nil →
+  `notify.New`, INFO `notifications active` je Pass
 - `internal/webhook/status.go` — `GET /status` (Phase 8): Drift-Matrix pro
   State-Stack (`ok`/`stopped`/`partial`, ps-Fehler → `unknown` +
   `"error"`-Feld, Endpoint bleibt 200), unmanaged = laufende Compose-
@@ -178,6 +211,15 @@ State-Ladefehler → stderr + exit 1.
   constant-time, leer = offen wie `/healthz`), Stacks/Unmanaged immer
   sortierte JSON-Arrays; Dokument-Bau seit Phase 8b in exportierter
   `BuildStatus(ctx, StatusDeps)` (Handler und `-print-status` teilen sie)
+- `internal/notify/` — Benachrichtigungs-Transport (Phase 9): Sender für
+  `webhook` (JSON), `ntfy` (Klartext + Title/Priority/Tags-Header),
+  `telegram` (Bot-API, Text auf 4000 Zeichen, kein `parse_mode`),
+  `discord`/`slack` (`content`/`text`); per-Destination-Timeout, Kürzung des
+  Fehlertexts auf 2000 Zeichen, In-Memory-Dedupe pro `(kind, stack)` mit
+  `repeat_after`, `Recovery` löscht den Key, Fehler nur als WARN (Typ + Host)
+- `internal/notify/notify_test.go` — Phase-9-Sendertests: `httptest` je Kanal
+  (Methode/Pfad/Header/Body), Timeout blockiert die Folgekanäle nicht, Dedupe
+  mit injizierter Clock, Recovery, `on`-Filter, Kürzung, keine Secrets im Log
 - `internal/webhook/phase8b_test.go` — Phase-8b-Regressionstest:
   `BuildStatus` mit identischen Kollaborateuren wie der Endpoint liefert
   dasselbe Dokument (inkl. beider Fehler-Modi), fehlende Konfiguration ist
@@ -185,6 +227,13 @@ State-Ladefehler → stderr + exit 1.
 - `cmd/dockops/phase8b_test.go` — Phase-8b-CLI-Tests: `-print-status`
   (Default/Env/Flag/ungültiges Env, `-repo`-Befreiung) und `writeStatus`
   (2-Spaces-Indent, Newline, Docker-Fehler im Dokument statt Fehler)
+- `internal/reconciler/phase9_test.go` — Phase-9-Regressionstests:
+  `compose_up`-Fehler (auch über Fake-`docker` via PATH) erzeugt genau ein
+  `deploy_failed` mit Stage, `pre_deploy`-Hook → `stage=pre_deploy`,
+  erfolgreicher Pass → kein Event + Recovery, zwei Pässe mit identischem
+  Fehler → ein POST, Prune-Fehler → `prune_failed`, Repo-Fehler →
+  `repo_failed`, kein Notifier-Bau ohne Block, `notifications active` einmal
+  pro Pass
 - `internal/reconciler/phase6c_test.go` — Phase-6c-Regressionstests: die
   drei Prune-Fälle (a/b/c), Skip-über-Prune-Pass (identischer Hash deployt
   nicht neu) und der unterbrochene Pass (State-Dir wird mid-Pass read-only,

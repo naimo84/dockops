@@ -36,7 +36,25 @@ const (
 	defaultVaultRoleIDEnv   = "VAULT_ROLE_ID"
 	defaultVaultSecretIDEnv = "VAULT_SECRET_ID"
 	defaultRemoteBranch     = "main"
+
+	defaultNotificationRepeatAfter = time.Hour
+	defaultNotificationTimeout     = 10 * time.Second
 )
+
+// Notification event kinds, the accepted values of notifications.on and the
+// kinds the reconciler reports through the notifier.
+const (
+	NotificationDeployFailed = "deploy_failed"
+	NotificationPruneFailed  = "prune_failed"
+	NotificationRepoFailed   = "repo_failed"
+)
+
+// defaultNotificationEvents is the `on` default: every event kind.
+var defaultNotificationEvents = []string{
+	NotificationDeployFailed,
+	NotificationPruneFailed,
+	NotificationRepoFailed,
+}
 
 var (
 	defaultInclude             = []string{"**/stack.yaml", "**/*.stack.yaml"}
@@ -51,6 +69,10 @@ type Config struct {
 	Remotes map[string]Remote
 	Imports []Import
 	Stacks  []Stack
+	// Notifications is the optional host-global notification block (nil
+	// when the root config has none). The reconciler builds its notifier
+	// from it.
+	Notifications *Notifications
 }
 
 // Load parses the root configuration at rootFile (stacks.yaml in the host
@@ -63,7 +85,12 @@ func Load(rootFile string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg := &Config{Global: root.Global, Remotes: root.Remotes, Imports: root.Imports}
+	cfg := &Config{
+		Global:        root.Global,
+		Remotes:       root.Remotes,
+		Imports:       root.Imports,
+		Notifications: root.Notifications,
+	}
 
 	// The host repository root is the directory of the root config file.
 	// Relative work_dir values resolve against it (conservative choice; the
@@ -105,9 +132,17 @@ func LoadRoot(path string) (*Root, error) {
 
 // loadRoot reads, decodes and validates the root stacks.yaml.
 func loadRoot(path string) (*Root, error) {
-	var root Root
-	if err := decodeYAMLFile(path, &root); err != nil {
+	var doc rootYAML
+	if err := decodeYAMLFile(path, &doc); err != nil {
 		return nil, fmt.Errorf("load root config: %w", err)
+	}
+	root := Root{Global: doc.Global, Remotes: doc.Remotes, Imports: doc.Imports}
+	if doc.Notifications != nil {
+		n, err := buildNotifications(*doc.Notifications, path)
+		if err != nil {
+			return nil, err
+		}
+		root.Notifications = n
 	}
 	applyRootDefaults(&root)
 	if err := validateRoot(&root, path); err != nil {
@@ -592,4 +627,210 @@ func checkDuplicateNames(stacks []Stack) error {
 		sources[s.Name] = source
 	}
 	return nil
+}
+
+// rootYAML is the decode shape of the root stacks.yaml. It mirrors Root
+// field by field, but decodes the notifications block through a pointer and
+// with a pointer to `enabled`: the loader must tell a missing block (feature
+// off) from an empty one, and an unset `enabled` (default true) from an
+// explicit `false`. Decoding straight into Root would lose both distinctions
+// because their zero values are the "absent" values.
+type rootYAML struct {
+	Global        Global             `yaml:"global"`
+	Notifications *notificationsYAML `yaml:"notifications"`
+	Remotes       map[string]Remote  `yaml:"remotes"`
+	Imports       []Import           `yaml:"imports"`
+}
+
+// notificationsYAML is the decode shape of the notifications block; see
+// rootYAML for why `enabled` is a pointer here.
+type notificationsYAML struct {
+	Enabled      *bool                     `yaml:"enabled"`
+	On           []string                  `yaml:"on"`
+	RepeatAfter  Duration                  `yaml:"repeat_after"`
+	Timeout      Duration                  `yaml:"timeout"`
+	Destinations []NotificationDestination `yaml:"destinations"`
+}
+
+// buildNotifications turns the decoded notifications block into its
+// validated form: defaults, ${VAR} expansion of every string field against
+// the process environment, then validation. file supplies the error context,
+// so every failure names the file and the exact field.
+//
+// Decisions where the briefing is silent (conservative):
+//   - an explicitly empty `on: []` falls back to all three events: a block
+//     that notifies about nothing is almost certainly a mistake, and
+//     "notify about nothing" is spelled `enabled: false`,
+//   - a zero repeat_after/timeout means "unset" and takes the default,
+//     negative values are rejected,
+//   - enabled: false still loads, expands and validates every destination:
+//     a broken channel must surface when it is configured, not when the
+//     maintenance window ends,
+//   - ${VAR} expansion covers every string field of a destination (type,
+//     url, token, chat_id, webhook_url, priority, each tag and each header
+//     value); header names stay literal because they are map keys.
+func buildNotifications(doc notificationsYAML, file string) (*Notifications, error) {
+	n := &Notifications{
+		Enabled:      true,
+		On:           slices.Clone(defaultNotificationEvents),
+		RepeatAfter:  Duration(defaultNotificationRepeatAfter),
+		Timeout:      Duration(defaultNotificationTimeout),
+		Destinations: doc.Destinations,
+	}
+	if doc.Enabled != nil {
+		n.Enabled = *doc.Enabled
+	}
+	if len(doc.On) > 0 {
+		n.On = doc.On
+	}
+	if doc.RepeatAfter != 0 {
+		n.RepeatAfter = doc.RepeatAfter
+	}
+	if doc.Timeout != 0 {
+		n.Timeout = doc.Timeout
+	}
+	for i := range n.Destinations {
+		if err := expandDestination(&n.Destinations[i], file, i); err != nil {
+			return nil, err
+		}
+	}
+	if err := validateNotifications(n, file); err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
+// notificationField formats the field path used in error messages, e.g.
+// notifications.destinations[0].token.
+func notificationField(index int, name string) string {
+	if index < 0 {
+		return "notifications." + name
+	}
+	return fmt.Sprintf("notifications.destinations[%d].%s", index, name)
+}
+
+// expandDestination expands ${VAR} references in every string field of one
+// destination. The expansion happens at load time on purpose: a missing
+// secret must fail the pass loudly instead of silently not alarming (the
+// fleet provides these values through the container's .env, see README).
+func expandDestination(d *NotificationDestination, file string, index int) error {
+	scalars := []struct {
+		name  string
+		value *string
+	}{
+		{"type", &d.Type},
+		{"url", &d.URL},
+		{"priority", &d.Priority},
+		{"token", &d.Token},
+		{"chat_id", &d.ChatID},
+		{"webhook_url", &d.WebhookURL},
+	}
+	for _, f := range scalars {
+		expanded, err := expandNotificationValue(notificationField(index, f.name), *f.value)
+		if err != nil {
+			return fmt.Errorf("%s: %w", file, err)
+		}
+		*f.value = expanded
+	}
+	for i := range d.Tags {
+		expanded, err := expandNotificationValue(notificationField(index, fmt.Sprintf("tags[%d]", i)), d.Tags[i])
+		if err != nil {
+			return fmt.Errorf("%s: %w", file, err)
+		}
+		d.Tags[i] = expanded
+	}
+	// Sorted keys keep the error message deterministic when several header
+	// values are broken.
+	for _, name := range sortedHeaderNames(d.Headers) {
+		expanded, err := expandNotificationValue(notificationField(index, "headers."+name), d.Headers[name])
+		if err != nil {
+			return fmt.Errorf("%s: %w", file, err)
+		}
+		d.Headers[name] = expanded
+	}
+	return nil
+}
+
+// expandNotificationValue applies os.Expand semantics with one deliberate
+// difference: a reference to an unset or empty variable is an error naming
+// the variable, instead of the silent empty string os.Expand produces.
+func expandNotificationValue(field, value string) (string, error) {
+	var missing string
+	expanded := os.Expand(value, func(name string) string {
+		v := os.Getenv(name)
+		if v == "" && missing == "" {
+			missing = name
+		}
+		return v
+	})
+	if missing != "" {
+		return "", fmt.Errorf("%s: environment variable %s is not set", field, missing)
+	}
+	return expanded, nil
+}
+
+// sortedHeaderNames returns the header names in deterministic order.
+func sortedHeaderNames(headers map[string]string) []string {
+	names := make([]string, 0, len(headers))
+	for name := range headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// validateNotifications checks the event filter, the timings and every
+// destination's required fields. Unknown types and events are errors: a typo
+// must not turn into a channel that never fires.
+func validateNotifications(n *Notifications, file string) error {
+	for i, kind := range n.On {
+		switch kind {
+		case NotificationDeployFailed, NotificationPruneFailed, NotificationRepoFailed:
+		default:
+			return fmt.Errorf("%s: notifications.on[%d]: unknown event %q (must be deploy_failed, prune_failed or repo_failed)", file, i, kind)
+		}
+	}
+	if n.RepeatAfter < 0 {
+		return fmt.Errorf("%s: notifications.repeat_after: must not be negative", file)
+	}
+	if n.Timeout <= 0 {
+		return fmt.Errorf("%s: notifications.timeout: must be positive (e.g. 10s)", file)
+	}
+	if len(n.Destinations) == 0 {
+		return fmt.Errorf("%s: notifications.destinations: at least one destination is required (remove the notifications block to disable notifications)", file)
+	}
+	for i, d := range n.Destinations {
+		if err := validateDestination(d, file, i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateDestination checks the type and the fields it requires.
+func validateDestination(d NotificationDestination, file string, index int) error {
+	require := func(name, value string) error {
+		if value != "" {
+			return nil
+		}
+		if d.Type == "" {
+			return fmt.Errorf("%s: notifications.destinations[%d].type: is required (webhook, ntfy, telegram, discord or slack)", file, index)
+		}
+		return fmt.Errorf("%s: %s: is required for type %s", file, notificationField(index, name), d.Type)
+	}
+	switch d.Type {
+	case "webhook", "ntfy":
+		return require("url", d.URL)
+	case "telegram":
+		if err := require("token", d.Token); err != nil {
+			return err
+		}
+		return require("chat_id", d.ChatID)
+	case "discord", "slack":
+		return require("webhook_url", d.WebhookURL)
+	case "":
+		return fmt.Errorf("%s: notifications.destinations[%d].type: is required (webhook, ntfy, telegram, discord or slack)", file, index)
+	default:
+		return fmt.Errorf("%s: notifications.destinations[%d].type: unknown type %q (must be webhook, ntfy, telegram, discord or slack)", file, index, d.Type)
+	}
 }

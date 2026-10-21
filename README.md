@@ -511,6 +511,106 @@ Projekt-Listung) und der Aufruf endet mit **exit 0**. Nur eine nicht
 lesbare State-Datei schlägt fehl — Fehler auf stderr, **exit 1**. Eine
 fehlende State-Datei gilt wie beim Endpoint als leerer Snapshot.
 
+## Benachrichtigungen (`notifications`)
+
+Ein fehlgeschlagener Deploy steht heute in `GET /status` und im Log — gesehen
+wird er erst, wenn jemand nachsieht. Der optionale Root-Block
+`notifications` schickt Reconcile-Fehler an einen oder mehrere Kanäle:
+
+```yaml
+notifications:
+  enabled: true            # default true; false = still (Wartungsfenster)
+  on: [deploy_failed, prune_failed, repo_failed]   # default: alle drei
+  repeat_after: 1h         # Dedupe-Fenster je (kind, stack); default 1h
+  timeout: 10s             # pro Destination; default 10s
+  destinations:
+    - type: webhook
+      url: https://example.invalid/hook
+      headers: {X-Source: dockops}       # optional
+    - type: ntfy
+      url: https://ntfy.example.invalid/dockops
+      priority: high                      # optional -> Header "Priority"
+      tags: [warning, docker]             # optional -> Header "Tags"
+    - type: telegram
+      token: ${TELEGRAM_BOT_TOKEN}
+      chat_id: "123456789"
+    - type: discord
+      webhook_url: https://discord.com/api/webhooks/...
+    - type: slack
+      webhook_url: https://hooks.slack.com/services/...
+```
+
+Ohne den Block ist das Feature aus (kein Fehler, kein Log-Spam). Ein
+vorhandener Block wird **immer** geladen und validiert — auch mit
+`enabled: false`, damit ein kaputter Kanal beim Konfigurieren auffällt und
+nicht erst am Ende des Wartungsfensters. Fehlende Pflichtfelder, ein
+unbekannter `type` oder ein unbekannter `on`-Eintrag sind Ladefehler.
+
+### Ereignisse
+
+| `kind` | Wann | `stack` | `stage` |
+| --- | --- | --- | --- |
+| `deploy_failed` | Deploy eines Stacks scheitert | Stackname | `secrets`, `pre_deploy`, `compose_up`, `post_deploy` |
+| `prune_failed` | Teardown eines entfernten Stacks scheitert | Stackname | leer |
+| `repo_failed` | Host-Repo, ein Remote-Checkout oder das Laden der Config scheitert (höchstens einmal pro Pass) | leer (siehe `remote`) | `repo`, `config` |
+
+`secrets` umfasst die ganze Secret-Kette: Vault-Login, Env-Merge,
+`<stackDir>/.env` und die `/dev/shm`-Env-Datei.
+
+### Dedupe
+
+Ein Fehler alarmiert **einmal pro `repeat_after`** und `(kind, stack)`; ein
+weiterlaufender kaputter Stack spammt den Kanal also nicht zu. Nach einem
+erfolgreichen Deploy (Recovery) ist der Schlüssel gelöscht — der nächste
+Fehler meldet sich sofort wieder. Das Fenster liegt **in-memory**: ein
+Neustart des Agents vergisst es und wiederholt höchstens eine Meldung
+(bewusst, statt eine zweite State-Datei zu pflegen).
+
+### `${VAR}`-Expansion
+
+Jedes String-Feld einer Destination darf `${VAR}`-Referenzen enthalten; sie
+werden beim Laden aus der **Prozessumgebung** expandiert (`os.Expand`-
+Semantik). Das ist der Secret-Pfad des Fleets: `vault-env` schreibt die
+`.env` des Containers, dockops liest sie als Umgebung. Fehlt eine Variable
+oder ist sie leer, schlägt das Laden fehl und nennt Feld und Variablenname:
+
+    stacks.yaml: notifications.destinations[0].token: environment variable TELEGRAM_BOT_TOKEN is not set
+
+Ehrlich scheitern statt still nicht alarmieren — der Pass läuft dann gar
+nicht erst los.
+
+### Payloads
+
+- `webhook` — `POST` mit `Content-Type: application/json` und den
+  konfigurierten `headers`:
+
+  ```json
+  {"kind":"deploy_failed","stack":"immich","remote":"","stage":"compose_up",
+   "error":"stack immich: up: ...","hash":"abc123…",
+   "at":"2026-10-21T12:00:00Z","host":"docker-01"}
+  ```
+
+  Das ist die generische Variante für eigene Automationen (n8n, eigener
+  Receiver): `host` unterscheidet mehrere Hosts an einem Kanal.
+- `ntfy` — `POST` an die Topic-URL, Body `[<kind>] <stack>: <error>` (ohne
+  Stack bei `repo_failed`), Header `Title`, `Priority` und `Tags`.
+- `telegram` — `POST https://api.telegram.org/bot<token>/sendMessage` mit
+  `chat_id` und `text` (auf 4000 Zeichen gekürzt, `parse_mode` bewusst nicht
+  gesetzt — kein Markdown-Escaping).
+- `discord` / `slack` — `POST` `{"content": ...}` bzw. `{"text": ...}` mit
+  demselben Klartext.
+
+Jede Destination bekommt ihr eigenes `timeout` (Default 10s) und wird
+**nacheinander** versucht. Ein toter Kanal wird als WARN mit Typ und Host
+geloggt — niemals mit Token oder URL-Query — und stoppt die folgenden
+Kanäle nicht. Notifier-Fehler ändern das Pass-Ergebnis nie.
+
+Beim Pass-Start loggt der Agent einmal `notifications active` mit Anzahl und
+Ereignisliste (bzw. `notifications inactive (enabled: false)`) — das ist das
+Verifikationssignal auf den Hosts:
+
+    docker logs dockops 2>&1 | grep 'notifications active'
+
 ## CLI
 
     dockops [-repo URL] [-branch NAME] [-state PFAD] [-addr HOST:PORT]
