@@ -214,11 +214,22 @@ type Stack struct {
 	Hooks             Hooks    `yaml:"hooks"`
 	// UpdatePolicy decides what the image update check does with a stack
 	// whose image tag moved: "notify" (default) only reports it, "pinned"
-	// skips the stack completely (no registry lookups, no state records).
+	// skips the stack completely (no registry lookups, no state records),
+	// and "apply" pulls the new image, recreates exactly the affected
+	// services and health-gates them, rolling back to the previous digest
+	// when the gate fails (phase 11).
 	// Deliberately not part of the stack hash: it changes no deployment, so
-	// editing it must not redeploy anything (phase 10; the apply actor
-	// follows in phase 11).
+	// editing it must not redeploy anything.
 	UpdatePolicy string `yaml:"update_policy"`
+	// HealthTimeout bounds the health gate of update_policy: apply — how
+	// long the reconciler polls the affected services for "running and
+	// healthy" after recreating them. Absent or 0 means
+	// DefaultHealthTimeout; a negative value is a load error (there is no
+	// documented way to switch the gate off, and a gate that is skipped is
+	// exactly the blind apply this phase exists to prevent). Like
+	// UpdatePolicy it stays out of the stack hash: it tunes the apply step,
+	// not the deployment the apply step targets.
+	HealthTimeout Duration `yaml:"health_timeout"`
 
 	// Load metadata, not part of the YAML schema. Dir is the directory
 	// containing the definition, File the YAML file it was loaded from, and
@@ -237,7 +248,18 @@ const (
 	// images are expected to be maintained deliberately (or the registry
 	// must not be polled for it).
 	UpdatePolicyPinned = "pinned"
+	// UpdatePolicyApply applies a detected update: pull, recreate the
+	// affected services only, health-gate them, roll back on failure
+	// (phase 11). It runs at most once per update_check_interval and never
+	// in a pass whose deployment of the stack failed.
+	UpdatePolicyApply = "apply"
 )
+
+// DefaultHealthTimeout is the health gate window of update_policy: apply
+// when health_timeout is not configured. 90s leaves room for a slow image
+// start without turning every bad image into a two-minute outage of the
+// stack.
+const DefaultHealthTimeout = 90 * time.Second
 
 // EffectiveUpdatePolicy returns the stack's update policy, defaulting to
 // UpdatePolicyNotify for a hand-built stack that carries no value.
@@ -252,6 +274,23 @@ func (s Stack) EffectiveUpdatePolicy() string {
 // stack: everything except UpdatePolicyPinned.
 func (s Stack) ChecksImageUpdates() bool {
 	return s.EffectiveUpdatePolicy() != UpdatePolicyPinned
+}
+
+// AppliesImageUpdates reports whether a detected update is applied by the
+// reconciler (update_policy: apply) instead of only reported.
+func (s Stack) AppliesImageUpdates() bool {
+	return s.EffectiveUpdatePolicy() == UpdatePolicyApply
+}
+
+// EffectiveHealthTimeout returns the configured health gate window, or
+// DefaultHealthTimeout when the key is absent or 0. Hand-built stacks (tests,
+// the prune ghost) never pass through the loader's default, so the default is
+// repeated here — the same pattern as EffectiveUpdatePolicy.
+func (s Stack) EffectiveHealthTimeout() time.Duration {
+	if s.HealthTimeout <= 0 {
+		return DefaultHealthTimeout
+	}
+	return time.Duration(s.HealthTimeout)
 }
 
 // EffectiveComposeFiles returns every compose file of the stack in docker

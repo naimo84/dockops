@@ -9,8 +9,8 @@ import (
 	"github.com/local/dockops/internal/notify"
 )
 
-// Stages reported with a deploy_failed / repo_failed event; they name the
-// step of the pass that failed (see notify.Event.Stage).
+// Stages reported with a deploy_failed / repo_failed / update_failed event;
+// they name the step of the pass that failed (see notify.Event.Stage).
 const (
 	stageSecrets     = "secrets"
 	stagePreDeploy   = "pre_deploy"
@@ -19,6 +19,13 @@ const (
 	stageConfig      = "config"
 	stageRepo        = "repo"
 	stageUpdateCheck = "update_check"
+	// Phase-11 apply stages: the successful apply (update_applied) and its
+	// three failure stages — pulling the image, the health gate of the
+	// recreated services, and the rollback (the stage that needs a human).
+	stageApply      = "apply"
+	stagePull       = "pull"
+	stageHealthGate = "health_gate"
+	stageRollback   = "rollback"
 )
 
 // passNotify carries the notification calls of one reconcile pass. The
@@ -93,6 +100,42 @@ func (p *passNotify) updateAvailable(ctx context.Context, stack, hash, text stri
 		Kind:  config.NotificationUpdateAvailable,
 		Stack: stack,
 		Stage: stageUpdateCheck,
+		Err:   text,
+		Hash:  hash,
+	})
+}
+
+// updateApplied reports a successfully applied image update (phase 11).
+// Opt-in (config.NotificationUpdateApplied): a working apply is normal
+// operation, and its record is visible in GET /status.
+func (p *passNotify) updateApplied(ctx context.Context, stack, hash, text string) {
+	if p == nil || p.notifier == nil {
+		return
+	}
+	p.notifier.Notify(ctx, notify.Event{
+		Kind:  config.NotificationUpdateApplied,
+		Stack: stack,
+		Stage: stageApply,
+		Err:   text,
+		Hash:  hash,
+	})
+}
+
+// updateFailed reports a failed image update apply with the stage that
+// produced it: pull, compose_up, health_gate or rollback (phase 11). The
+// stage of the whole attempt is reported once — the reconciler's apply step
+// sends exactly one event per stack and attempt, so a rollback failure
+// supersedes the gate failure that caused it (the dedupe window of
+// (update_failed, stack) would swallow a second event anyway, and the more
+// severe stage is the one an operator must see).
+func (p *passNotify) updateFailed(ctx context.Context, stack, hash, stage, text string) {
+	if p == nil || p.notifier == nil {
+		return
+	}
+	p.notifier.Notify(ctx, notify.Event{
+		Kind:  config.NotificationUpdateFailed,
+		Stack: stack,
+		Stage: stage,
 		Err:   text,
 		Hash:  hash,
 	})

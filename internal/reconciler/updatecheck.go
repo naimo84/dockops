@@ -22,8 +22,10 @@ const locallyBuiltImage = "locally built image"
 // checkImageUpdates compares the deployed images of every due stack with the
 // digest their registry currently reports and records the outcome in the
 // state (phase 10). It runs after the deployments — the comparison is about
-// what is running — and deploys nothing: pulling or recreating is a later
-// phase's job.
+// what is running. For stacks with update_policy: notify or pinned it deploys
+// nothing; for update_policy: apply it hands the detected updates to
+// applyUpdates at the end of the step (phase 11), which pulls, recreates,
+// health-gates and — if need be — rolls back.
 //
 // Safety properties that shape the implementation:
 //   - update_check_interval 0 disables the whole step; stacks with
@@ -38,6 +40,9 @@ const locallyBuiltImage = "locally built image"
 //   - A stack without any checkable image (build-only services) has no
 //     records to carry a check time, so it is resolved again on every pass:
 //     one `docker compose config` call, never registry traffic.
+//   - The apply step runs only for stacks whose records this pass actually
+//     refreshed, so an unreadable compose configuration cannot trigger an
+//     apply based on yesterday's picture.
 //
 // Only state persistence failures are returned to the caller.
 func (r *Reconciler) checkImageUpdates(ctx context.Context, cfg *config.Config, pn *passNotify) []error {
@@ -77,6 +82,11 @@ func (r *Reconciler) checkImageUpdates(ctx context.Context, cfg *config.Config, 
 		pending int
 		changed bool
 	)
+	// recorded collects the stacks whose records were refreshed in this
+	// pass. Only they are candidates for the phase-11 apply step: applying
+	// against records that this pass could not re-check would act on a
+	// stale picture of the stack.
+	recorded := make(map[string]struct{}, len(due))
 	for _, stack := range due {
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, fmt.Errorf("reconciler: image update check aborted: %w", err))
@@ -101,6 +111,7 @@ func (r *Reconciler) checkImageUpdates(ctx context.Context, cfg *config.Config, 
 			continue
 		}
 		changed = true
+		recorded[stack.Name] = struct{}{}
 		images += len(recs)
 		for _, rec := range recs {
 			if rec.UpdateAvailable {
@@ -116,6 +127,28 @@ func (r *Reconciler) checkImageUpdates(ctx context.Context, cfg *config.Config, 
 			errs = append(errs, fmt.Errorf("reconciler: persist image update records: %w", err))
 		}
 	}
+	// Phase 11: apply the detected updates of the stacks configured for it.
+	// This runs at the end of the check — the records of this pass are the
+	// input, and they are already persisted — and only in a pass that was
+	// due for a check, which bounds the whole apply step to one attempt per
+	// update_check_interval. Every failure stays in the records and the
+	// notifications; only a state persistence failure is returned.
+	for _, stack := range due {
+		if !stack.AppliesImageUpdates() {
+			continue
+		}
+		if _, ok := recorded[stack.Name]; !ok {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			r.logger.Warn("image update apply: aborted", "stack", stack.Name, "error", err)
+			break
+		}
+		if err := r.applyUpdates(ctx, stack, pn); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
 	r.logger.Info("image update check finished", "stacks", len(due), "images", images, "updates", pending)
 	return errs
 }
@@ -161,6 +194,20 @@ func (r *Reconciler) checkStackImages(ctx context.Context, stack config.Stack, i
 		rec.UpdateAvailable = remote != "" && remote != local
 
 		prev := st.Images[ref]
+		// The phase-11 apply bookkeeping survives a re-check: this record is
+		// rebuilt from scratch on every check, and dropping
+		// ApplyBlockedDigest would retry a failed update on every pass.
+		rec.PreviousDigest = prev.PreviousDigest
+		rec.AppliedAt = prev.AppliedAt
+		rec.RolledBackAt = prev.RolledBackAt
+		rec.ApplyBlockedDigest = prev.ApplyBlockedDigest
+		rec.ApplyError = prev.ApplyError
+		if !rec.UpdateAvailable {
+			// Nothing is pending, so a recorded apply failure is history:
+			// the tag moved back, or the image was updated by other means.
+			rec.ApplyBlockedDigest = ""
+			rec.ApplyError = ""
+		}
 		switch {
 		case rec.UpdateAvailable && prev.RemoteDigest != remote:
 			// New digest (including the very first check that already finds

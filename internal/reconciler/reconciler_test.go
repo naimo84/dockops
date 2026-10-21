@@ -66,6 +66,24 @@ type upCall struct {
 	stackEnv       map[string]string // content of <stackDir>/.env at call time
 }
 
+// pullCall records one compose.Pull invocation (phase 11).
+type pullCall struct {
+	project  string
+	services []string
+}
+
+// upOverrideCall records one compose.UpOverride invocation (phase 11),
+// including the content of every override file as it was at call time — the
+// generated rollback file is deleted right after the call, so only a
+// snapshot taken here can be asserted on.
+type upOverrideCall struct {
+	project    string
+	stackDir   string
+	extraFiles []string
+	services   []string
+	contents   []string
+}
+
 // downCall records one compose.Down invocation.
 type downCall struct {
 	stack     config.Stack
@@ -98,6 +116,22 @@ type fakeCompose struct {
 	// stack name — tests use it to inject mid-pass effects (e.g. making
 	// the state directory unwritable to simulate an interrupted pass).
 	onUp func(name string)
+
+	// Phase-11 apply recording: pulls and upOverrides keep the calls in
+	// order, psCalls the health gate polls. psFn scripts the gate answer by
+	// call number (1-based); without it, containers answers every poll.
+	pulls          []pullCall
+	pullErr        error
+	upOverrides    []upOverrideCall
+	upOverrideErrs []error // per UpOverride call index; nil = no failure
+	psCalls        []string
+	psErr          error
+	psFn           func(call int) []compose.Container
+	containers     []compose.Container
+	// onUpOverride, when set, runs synchronously when an UpOverride call
+	// starts (1-based call number). Tests use it to change the scripted
+	// gate answer between the forward up and the rollback up.
+	onUpOverride func(call int)
 }
 
 func (f *fakeCompose) Up(_ context.Context, stack config.Stack, stackDir, envFile string) error {
@@ -152,6 +186,50 @@ func (f *fakeCompose) ImageDigest(_ context.Context, ref string) (string, error)
 		return "", f.digestErr
 	}
 	return f.digests[ref], nil
+}
+
+func (f *fakeCompose) Pull(_ context.Context, req compose.Request, services []string) error {
+	f.pulls = append(f.pulls, pullCall{project: req.Project, services: append([]string(nil), services...)})
+	return f.pullErr
+}
+
+func (f *fakeCompose) UpOverride(_ context.Context, req compose.Request, extraFiles []string, services []string) error {
+	if f.onUpOverride != nil {
+		f.onUpOverride(len(f.upOverrides) + 1)
+	}
+	call := upOverrideCall{
+		project:    req.Project,
+		stackDir:   req.StackDir,
+		extraFiles: append([]string(nil), extraFiles...),
+		services:   append([]string(nil), services...),
+	}
+	for _, file := range extraFiles {
+		if !filepath.IsAbs(file) {
+			file = filepath.Join(req.StackDir, file)
+		}
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			call.contents = append(call.contents, "read error: "+err.Error())
+			continue
+		}
+		call.contents = append(call.contents, string(raw))
+	}
+	f.upOverrides = append(f.upOverrides, call)
+	if i := len(f.upOverrides) - 1; i < len(f.upOverrideErrs) && f.upOverrideErrs[i] != nil {
+		return f.upOverrideErrs[i]
+	}
+	return nil
+}
+
+func (f *fakeCompose) PsProject(_ context.Context, project string) ([]compose.Container, error) {
+	f.psCalls = append(f.psCalls, project)
+	if f.psErr != nil {
+		return nil, f.psErr
+	}
+	if f.psFn != nil {
+		return f.psFn(len(f.psCalls)), nil
+	}
+	return f.containers, nil
 }
 
 func (f *fakeCompose) DownProject(_ context.Context, project string) error {

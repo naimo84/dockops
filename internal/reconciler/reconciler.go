@@ -108,6 +108,20 @@ type ComposeExecutor interface {
 	// reference, "" when it has none (built locally) — compose.Executor's
 	// ImageDigest.
 	ImageDigest(ctx context.Context, ref string) (string, error)
+
+	// Pull fetches the images of the named services, all of the project for
+	// an empty list (compose.Executor.Pull; phase-11 apply step).
+	Pull(ctx context.Context, req compose.Request, services []string) error
+
+	// UpOverride recreates the named services only, with additional compose
+	// files appended after the stack's own files (compose.Executor.
+	// UpOverride; phase-11 apply and rollback).
+	UpOverride(ctx context.Context, req compose.Request, extraFiles []string, services []string) error
+
+	// PsProject lists the containers of a project, running and stopped
+	// (compose.Executor.PsProject; phase-11 health gate and phase-8
+	// /status).
+	PsProject(ctx context.Context, project string) ([]compose.Container, error)
 }
 
 // HookRunner is the subset of hooks.Engine the reconciler needs.
@@ -250,6 +264,13 @@ type Reconciler struct {
 	injectedReg bool
 	newRegistry func([]config.Registry, *slog.Logger) registry.Resolver
 	registryKey string
+
+	// healthPoll is the polling interval of the phase-11 health gate. It is
+	// unexported and defaults to 3s in New; the reconciler's own tests set
+	// it to a millisecond so a gate case needs no real waiting. Deliberately
+	// not part of Deps: production never tunes it, and an exported knob
+	// would invite per-stack configuration without a need.
+	healthPoll time.Duration
 }
 
 // New returns a Reconciler for deps, applying the defaults documented on
@@ -320,6 +341,7 @@ func New(deps Deps) *Reconciler {
 		registry:    deps.Registry,
 		injectedReg: deps.Registry != nil,
 		newRegistry: newRegistry,
+		healthPoll:  defaultHealthPoll,
 	}
 }
 
@@ -628,6 +650,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		StackDir:     stack.Dir,
 		ComposeFile:  stack.ComposeFile,
 		ComposeFiles: stack.ComposeFiles,
+		UpdatePolicy: stack.EffectiveUpdatePolicy(),
 	}); err != nil {
 		return fmt.Errorf("stack %s: record state: %w", stack.Name, err)
 	}
@@ -660,6 +683,7 @@ func (r *Reconciler) markFailed(stack config.Stack, newHash string) {
 		StackDir:     stack.Dir,
 		ComposeFile:  stack.ComposeFile,
 		ComposeFiles: stack.ComposeFiles,
+		UpdatePolicy: stack.EffectiveUpdatePolicy(),
 	}); err != nil {
 		r.logger.Error("cannot record failed state", "stack", stack.Name, "error", err)
 		return

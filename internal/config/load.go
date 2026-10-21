@@ -52,14 +52,27 @@ const (
 	// default set: a new image is normal operation, and nobody should be
 	// messaged about it without opting in.
 	NotificationUpdateAvailable = "update_available"
+	// NotificationUpdateApplied is the phase-11 event of a successfully
+	// applied image update. Like update_available it is opt-in: a working
+	// apply is normal operation, and its record is in GET /status.
+	NotificationUpdateApplied = "update_applied"
+	// NotificationUpdateFailed reports a failed apply: pull error, failed
+	// compose up, failed health gate or — the case a human is needed for —
+	// a failed rollback. Failure class, therefore part of the default set
+	// (like deploy_failed).
+	NotificationUpdateFailed = "update_failed"
 )
 
 // defaultNotificationEvents is the `on` default: the failure events only.
-// update_available stays out until notifications.on requests it.
+// update_available and update_applied stay out until notifications.on
+// requests them; update_failed belongs here for the same reason
+// deploy_failed does — a stack whose update could not be applied (or not
+// even rolled back) is broken, not routine.
 var defaultNotificationEvents = []string{
 	NotificationDeployFailed,
 	NotificationPruneFailed,
 	NotificationRepoFailed,
+	NotificationUpdateFailed,
 }
 
 var (
@@ -544,11 +557,16 @@ func findImportStackFile(dir string) (string, error) {
 }
 
 // applyStackDefaults fills the stack-level defaults whose zero value is not
-// the documented default. Only update_policy has one: an absent key means
-// notify.
+// the documented default: an absent update_policy means notify, an absent
+// health_timeout means DefaultHealthTimeout. A negative health_timeout stays
+// untouched so validateStack reports it (0 is the documented "use the
+// default", not "off").
 func applyStackDefaults(s *Stack) {
 	if s.UpdatePolicy == "" {
 		s.UpdatePolicy = UpdatePolicyNotify
+	}
+	if s.HealthTimeout == 0 {
+		s.HealthTimeout = Duration(DefaultHealthTimeout)
 	}
 }
 
@@ -559,9 +577,15 @@ func validateStack(s *Stack) error {
 	// ghost) need not set a policy; EffectiveUpdatePolicy reads it as
 	// notify.
 	switch s.UpdatePolicy {
-	case "", UpdatePolicyNotify, UpdatePolicyPinned:
+	case "", UpdatePolicyNotify, UpdatePolicyPinned, UpdatePolicyApply:
 	default:
-		return fmt.Errorf("update_policy: invalid value %q (must be notify or pinned)", s.UpdatePolicy)
+		return fmt.Errorf("update_policy: invalid value %q (must be notify, pinned or apply)", s.UpdatePolicy)
+	}
+	// 0 means "use the default" (the loader already filled it), a negative
+	// window would make the health gate fail after the first poll without
+	// ever waiting — a configuration mistake, not a feature.
+	if s.HealthTimeout < 0 {
+		return fmt.Errorf("health_timeout: must not be negative (0 uses the default of %s)", DefaultHealthTimeout)
 	}
 	for i, sf := range s.SopsFiles {
 		if sf.Path == "" {
@@ -909,9 +933,10 @@ func sortedHeaderNames(headers map[string]string) []string {
 func validateNotifications(n *Notifications, file string) error {
 	for i, kind := range n.On {
 		switch kind {
-		case NotificationDeployFailed, NotificationPruneFailed, NotificationRepoFailed, NotificationUpdateAvailable:
+		case NotificationDeployFailed, NotificationPruneFailed, NotificationRepoFailed,
+			NotificationUpdateAvailable, NotificationUpdateApplied, NotificationUpdateFailed:
 		default:
-			return fmt.Errorf("%s: notifications.on[%d]: unknown event %q (must be deploy_failed, prune_failed, repo_failed or update_available)", file, i, kind)
+			return fmt.Errorf("%s: notifications.on[%d]: unknown event %q (must be deploy_failed, prune_failed, repo_failed, update_available, update_applied or update_failed)", file, i, kind)
 		}
 	}
 	if n.RepeatAfter < 0 {
