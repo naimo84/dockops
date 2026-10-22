@@ -71,6 +71,13 @@ type State struct {
 	// deployment depends on it (it neither triggers nor blocks one), so a
 	// migration or a schema bump would be noise.
 	Images map[string]ImageRecord `json:"images,omitempty"`
+	// UpdatePolicy is the stack's update_policy at deploy time ("notify",
+	// "pinned" or "apply"). Phase 11 stores it because GET /status must
+	// report the effective policy exclusively from the state: the phase-10
+	// assumption that "a record set implies notify" no longer holds once
+	// apply stacks keep records too. Optional, like Images — an older file
+	// simply has no value, and callers read it as notify (the default).
+	UpdatePolicy string `json:"update_policy,omitempty"`
 }
 
 // ImageRecord is the persisted outcome of the last update check of one image
@@ -97,6 +104,37 @@ type ImageRecord struct {
 	// missing manifest) and "locally built image" (no RepoDigest). An
 	// error never means "update available".
 	Error string `json:"error,omitempty"`
+
+	// The phase-11 apply bookkeeping. All fields are additive and
+	// omitempty: a notify or pinned stack never sets them, older state
+	// files load unchanged and fileVersion stays 1 (nothing here drives a
+	// deployment — it only documents what the apply step did).
+
+	// PreviousDigest is the digest the image ran before the last apply
+	// attempt. It is the rollback target: the generated override file pins
+	// exactly this digest.
+	PreviousDigest string `json:"previous_digest,omitempty"`
+	// AppliedAt is the UTC time of the last successful apply, zero when
+	// the image was never applied by dockops. Note that encoding/json's
+	// omitempty does not omit a zero time.Time: the key stays with the zero
+	// timestamp, and readers treat that as "never happened" (the briefing
+	// prescribes this field shape, so the wart is documented, not worked
+	// around with a pointer type).
+	AppliedAt time.Time `json:"applied_at,omitempty"`
+	// RolledBackAt is the UTC time of the last rollback, zero when no
+	// rollback ran (same zero-value serialization as AppliedAt).
+	RolledBackAt time.Time `json:"rolled_back_at,omitempty"`
+	// ApplyBlockedDigest is the remote digest whose apply failed its health
+	// gate (or its pull/up). While it equals RemoteDigest, update_policy:
+	// apply treats the image like notify — no retry. A digest comparison
+	// replaces a time-based backoff on purpose: it is honest (the same
+	// broken image stays broken) and it self-clears as soon as the tag
+	// moves to a different digest.
+	ApplyBlockedDigest string `json:"apply_blocked_digest,omitempty"`
+	// ApplyError is the error text of the last failed apply attempt (pull,
+	// compose up, health gate or rollback). Cleared by a successful apply
+	// and by a check that no longer finds an update.
+	ApplyError string `json:"apply_error,omitempty"`
 }
 
 // fileModel is the JSON document persisted by Save.

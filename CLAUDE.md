@@ -127,8 +127,39 @@ State** (kein Docker/Registry im HTTP-Pfad). Bewusste Entscheidungen: **kein
 Hash-Bump** (`update_policy` ändert kein Deployment — Test im Hash-Paket),
 State-Feld rein additiv (kein Migrationszwang), `/status` bleibt
 offline-fähig, `update_available` ist **opt-in** (Default-On-Liste bleibt
-`[deploy_failed, prune_failed, repo_failed]`), diese Phase deployt nichts
-(kein `pull`, kein Recreate; der Akteur folgt in Phase 11). Tests:
+`[deploy_failed, prune_failed, repo_failed, update_failed]`), diese Phase
+deployt nichts (kein `pull`, kein Recreate). Phase 11: kontrolliertes Anwenden
+(`update_policy: apply`) — `update_policy` akzeptiert `apply`, neues
+Stack-Feld `health_timeout` (`Duration`, Default `DefaultHealthTimeout` = 90s,
+`0` = Default, negativ = Ladefehler, bewusst **nicht** im Hash; Helper
+`AppliesImageUpdates`/`EffectiveHealthTimeout`); `compose.Container` additiv um
+`Service` (aus `compose ps --format json`, fehlt es bleibt es leer),
+`compose.Pull` (`compose -p … pull <services…>`, leere Liste = Projekt) und
+`compose.UpOverride` (zusätzliche `-f`-Dateien **nach** den Stack-Files,
+`up -d --remove-orphans --no-deps`, positionale Services; gemeinsamer
+`upSpec`-Aufbau mit `Up`, dessen Verhalten unverändert bleibt); State: `State`
+merkt sich `update_policy` (für `/status` aus dem State) und `ImageRecord`
+additiv `PreviousDigest`/`AppliedAt`/`RolledBackAt`/`ApplyBlockedDigest`/
+`ApplyError` (**fileVersion bleibt 1**, Altdaten laden weiter); neue Datei
+`internal/reconciler/apply.go`: `applyUpdates` läuft am Ende von
+`checkImageUpdates`, nur für `apply`-Stacks und nur in fälligen Pässen —
+Kandidaten aus `UpdateAvailable` (lokal gebaute Images, nicht deployte Stacks
+und bereits blockierte Digests ausgenommen) → `Pull` → `UpOverride(nil,
+services)` → Health-Gate-Polling (`healthPoll`, Default 3s, Fenster
+`health_timeout`; `unhealthy`/`exited`/`dead`/`restarting`/fehlender Container/
+Timeout = Fehlschlag) → bei Fehlschlag `rollbackImages`: temporäre
+`dockops-rollback-<stack>.yaml` mit `image: <repository>@<PreviousDigest>` in
+jedem Fall per `defer` gelöscht, `UpOverride` mit dieser Datei, erneutes Gate;
+`ApplyBlockedDigest == RemoteDigest` blockiert weitere Versuche (degragiert zu
+notify, bis der Tag wandert); genau ein `update_failed` je Stack und Versuch
+(Stages `pull`/`compose_up`/`health_gate`/`rollback`, Rollback-Fehler ersetzt
+den auslösenden Gate-Fehler) plus `update_applied` (Stage `apply`, opt-in,
+Default-On-Liste bekommt nur `update_failed`); kein Fehler dieses Schritts
+lässt den Pass scheitern (nur State-Persistenz wird zurückgegeben), kein
+`panic`; `/status` erweitert `ServiceUpdate` additiv um `previous_digest`,
+`applied_at`, `rolled_back_at`, `apply_error`, `blocked` und liest
+`updates.policy` aus dem State (Phase-10-Annahme „Records ⇒ notify“ gilt nicht
+mehr). Tests:
 `internal/registry/registry_test.go` (Parsing-Tabelle, `httptest`-Registry mit
 401→Token→200, falsches Token, fehlender Digest-Header, Klassen 404/403/429,
 Timeout, `Accept` aller vier Typen, Pin ohne HTTP),
@@ -195,7 +226,8 @@ Records, unabhängig von ps-Fehlern).
   in `-f`-Reihenfolge)
 - `internal/state/` — State-Store: Deployment-Zustand pro Stack (JSON-Datei,
   atomar geschrieben; `compose_files` für Multi-File-Prune aufgezeichnet;
-  additives `images`-Feld mit `ImageRecord` je Image-Ref, `SetImages`
+  additives `images`-Feld mit `ImageRecord` je Image-Ref inkl. der
+  Phase-11-Apply-Felder, additives `update_policy`, `SetImages`
   verlangt einen bestehenden Stack-Eintrag, `fileVersion` bleibt 1);
   RWMutex-gesichert, /status liest aus HTTP-Goroutines parallel zum Poll-Loop
 - `internal/dotenv/` — Minimaler dotenv-Dialekt (Parse/Format), geteilt von
@@ -255,7 +287,10 @@ Records, unabhängig von ps-Fehlern).
   Neuaufbau nur bei geänderter Config, `Deps.Notifier` gewinnt,
   `Deps.NewNotifier` nil → `notify.New`, INFO `notifications active` je Pass;
   `updatecheck.go` prüft nach den Deploys die Images (`Deps.Registry`
-  injizierbar, sonst `registry.New` aus `registries` mit Key-Vergleich)
+  injizierbar, sonst `registry.New` aus `registries` mit Key-Vergleich) und
+  ruft am Ende `applyUpdates` aus `apply.go` für `update_policy: apply`
+  (Pull, gezieltes `up --no-deps`, Health-Gate über das unexportierte Feld
+  `healthPoll`, Rollback per Digest-Override-Datei)
 - `internal/webhook/status.go` — `GET /status` (Phase 8): Drift-Matrix pro
   State-Stack (`ok`/`stopped`/`partial`, ps-Fehler → `unknown` +
   `"error"`-Feld, Endpoint bleibt 200), unmanaged = laufende Compose-
@@ -303,6 +338,26 @@ Records, unabhängig von ps-Fehlern).
   `update_policy` (Default/`pinned`/ungültig), `update_available` opt-in
 - `internal/hash/phase10_test.go` — Phase-10-Hash-Test: `update_policy`
   ändert den Stack-Hash nicht
+- `internal/reconciler/apply.go`/`internal/reconciler/phase11_test.go` —
+  Phase-11-Apply: Fake-docker via PATH protokolliert die argv (pull/up/ps
+  sequenziert beantwortet), `httptest`-Registry; Apply im fälligen Pass,
+  Pull-Reihenfolge vor `up --no-deps`, Health-Gate-Erfolg (`applied_at`,
+  `current_digest = remote_digest`), Rollback bei unhealthy/exited/Timeout
+  (Override-Datei nach den Stack-Files, `previous_digest` gepinnt, Datei
+  wieder entfernt), blockierter Digest wird nicht erneut versucht, lokal
+  gebautes Image und nicht deployter Stack werden übersprungen, genau ein
+  `update_failed` je Versuch, `healthPoll` = 1ms (keine echten sleeps)
+- `internal/compose/phase11_test.go` — `Pull`/`UpOverride`-argv (Override-Datei
+  hinter den Stack-Files, `--no-deps`, positionale Services) und `Service` aus
+  `compose ps --format json`
+- `internal/config/phase11_test.go` — `update_policy: apply`, `health_timeout`
+  (Default/0/negativ), `update_failed` im Default-Set, `update_applied` opt-in
+- `internal/state/phase11_test.go` — Apply-Felder Round-Trip, Altdaten ohne
+  sie, `fileVersion` bleibt 1
+- `internal/webhook/phase11_test.go` — `ServiceUpdate`-Apply-Felder und
+  `policy` aus dem State
+- `internal/hash/phase11_test.go` — `health_timeout`/`update_policy: apply`
+  ändern den Stack-Hash nicht
 - `internal/webhook/phase8b_test.go` — Phase-8b-Regressionstest:
   `BuildStatus` mit identischen Kollaborateuren wie der Endpoint liefert
   dasselbe Dokument (inkl. beider Fehler-Modi), fehlende Konfiguration ist

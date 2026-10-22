@@ -195,11 +195,13 @@ func TestUpdatePolicyPinned(t *testing.T) {
 }
 
 func TestUpdatePolicyInvalid(t *testing.T) {
-	_, err := loadStack10(t, "name: web\nupdate_policy: apply\n")
+	// "apply" was the invalid example until phase 11 introduced it; an
+	// unknown value must still fail with field and value in the message.
+	_, err := loadStack10(t, "name: web\nupdate_policy: auto\n")
 	if err == nil {
 		t.Fatal("Load() error = nil, want a validation error for update_policy")
 	}
-	if !strings.Contains(err.Error(), "update_policy") || !strings.Contains(err.Error(), "apply") {
+	if !strings.Contains(err.Error(), "update_policy") || !strings.Contains(err.Error(), "auto") {
 		t.Errorf("Load() error = %q, want field and value in the message", err)
 	}
 }
@@ -235,7 +237,7 @@ notifications:
 			t.Errorf("default on = %v, want update_available to stay opt-in", def.Notifications.On)
 		}
 	}
-	wantDefault := []string{NotificationDeployFailed, NotificationPruneFailed, NotificationRepoFailed}
+	wantDefault := []string{NotificationDeployFailed, NotificationPruneFailed, NotificationRepoFailed, NotificationUpdateFailed}
 	if !reflect.DeepEqual(def.Notifications.On, wantDefault) {
 		t.Errorf("default on = %v, want %v", def.Notifications.On, wantDefault)
 	}

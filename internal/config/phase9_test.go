@@ -44,7 +44,9 @@ func TestNotificationsDefaults(t *testing.T) {
 	if !n.Enabled {
 		t.Error("Enabled = false, want true by default")
 	}
-	if want := []string{NotificationDeployFailed, NotificationPruneFailed, NotificationRepoFailed}; !reflect.DeepEqual(n.On, want) {
+	// update_failed joined the default set in phase 11 (failure class, like
+	// deploy_failed); update_available and update_applied stay opt-in.
+	if want := []string{NotificationDeployFailed, NotificationPruneFailed, NotificationRepoFailed, NotificationUpdateFailed}; !reflect.DeepEqual(n.On, want) {
 		t.Errorf("On = %v, want %v", n.On, want)
 	}
 	if got := time.Duration(n.RepeatAfter); got != time.Hour {

@@ -63,19 +63,128 @@ func New(logger *slog.Logger, binary string) *Executor {
 // (services minus ignore_services, see upServices) yields the positional
 // service arguments — docker compose takes them without a preceding "--".
 func (e *Executor) Up(ctx context.Context, stack config.Stack, stackDir, envFile string) error {
-	args := []string{"compose", "-p", stack.Name}
-	args = append(args, composeFileArgs(stack, stackDir)...)
-	for _, profile := range stack.Profiles {
-		args = append(args, "--profile", profile)
-	}
-	args = append(args, "--env-file", envFile)
-	args = append(args, "up", "-d", "--remove-orphans")
 	services, err := upServices(stack, stackDir)
 	if err != nil {
 		return err
 	}
+	args, err := upSpec{
+		project:  stack.Name,
+		fileArgs: composeFileArgs(stack, stackDir),
+		stackDir: stackDir,
+		profiles: stack.Profiles,
+		envFile:  envFile,
+	}.args()
+	if err != nil {
+		return err
+	}
+	return e.run(ctx, append(args, services...))
+}
+
+// Pull fetches the images of the named services (the whole project for an
+// empty list):
+//
+//	<binary> compose -p <project> [-f <file> ...] pull [service ...]
+//
+// It only fills the local image cache — nothing is recreated, so a pull
+// cannot break a running stack. The pull is the first step of the phase-11
+// apply path; the services are passed positionally so a 20-service stack does
+// not pull 20 images to update one.
+func (e *Executor) Pull(ctx context.Context, req Request, services []string) error {
+	if req.Project == "" {
+		return fmt.Errorf("docker compose pull: project name must not be empty")
+	}
+	args := []string{"compose", "-p", req.Project}
+	args = append(args, req.fileArgs()...)
+	args = append(args, "pull")
 	args = append(args, services...)
 	return e.run(ctx, args)
+}
+
+// UpOverride brings selected services up with additional compose files
+// appended after the stack's own files (compose merge rules: the later file
+// wins), recreating those services only:
+//
+//	<binary> compose -p <project> [-f <file> ...] [-f <override> ...]
+//	         up -d --remove-orphans --no-deps [service ...]
+//
+// It is the write path of the phase-11 apply step, where Up's inputs are not
+// available: the caller has a Request (project, stack dir, compose files) and
+// a generated override file rather than a full stack. Decisions where the
+// briefing is silent, all conservative and documented here:
+//   - --no-deps is always part of this path. The apply step recreates exactly
+//     the services whose image moved; without --no-deps compose would also
+//     restart their dependencies, turning a one-image update into a stack
+//     restart (and a rollback into two).
+//   - no --profile flags: profiles widen the deploy set (Up needs them for
+//     ignore_services' "all but these"), while this path always names its
+//     services explicitly.
+//   - no --env-file: the caller has no shm env file outside a deployment.
+//     compose reads the stack directory's generated .env instead, which the
+//     deployment wrote from the same merged environment (env.WriteStackEnv)
+//     and which deliberately outlives a successful deploy.
+func (e *Executor) UpOverride(ctx context.Context, req Request, extraFiles []string, services []string) error {
+	args, err := upSpec{
+		project:       req.Project,
+		fileArgs:      req.fileArgs(),
+		overrideFiles: extraFiles,
+		stackDir:      req.StackDir,
+		noDeps:        true,
+	}.args()
+	if err != nil {
+		return err
+	}
+	return e.run(ctx, append(args, services...))
+}
+
+// upSpec is the argument recipe of one compose up invocation. Up and
+// UpOverride fill it from their respective inputs and share args(), so the
+// two command lines cannot drift apart (same flags, same order).
+type upSpec struct {
+	// project is the compose project name (-p).
+	project string
+	// fileArgs are the resolved -f pairs of the stack's compose files, in
+	// configured order.
+	fileArgs []string
+	// overrideFiles are additional compose files, appended after the stack
+	// files so their values win; relative entries resolve against stackDir.
+	overrideFiles []string
+	stackDir      string
+	// profiles are passed as --profile in their configured order.
+	profiles []string
+	// envFile is passed as --env-file when set.
+	envFile string
+	// noDeps adds --no-deps (targeted recreation, see UpOverride).
+	noDeps bool
+}
+
+// args assembles the command line up to (not including) the positional
+// services.
+func (s upSpec) args() ([]string, error) {
+	if s.project == "" {
+		return nil, fmt.Errorf("docker compose up: project name must not be empty")
+	}
+	args := []string{"compose", "-p", s.project}
+	args = append(args, s.fileArgs...)
+	for _, file := range s.overrideFiles {
+		if file == "" {
+			return nil, fmt.Errorf("docker compose up: override file of project %s must not be empty", s.project)
+		}
+		if !filepath.IsAbs(file) {
+			file = filepath.Join(s.stackDir, file)
+		}
+		args = append(args, "-f", file)
+	}
+	for _, profile := range s.profiles {
+		args = append(args, "--profile", profile)
+	}
+	if s.envFile != "" {
+		args = append(args, "--env-file", s.envFile)
+	}
+	args = append(args, "up", "-d", "--remove-orphans")
+	if s.noDeps {
+		args = append(args, "--no-deps")
+	}
+	return args, nil
 }
 
 // Down stops and removes the stack (used for pruning removed stacks):

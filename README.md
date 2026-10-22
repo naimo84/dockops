@@ -303,7 +303,11 @@ gemergte Umgebung des Stacks (inkl. Secrets) sowie `STACK_NAME`,
    (`update_check_interval`, `update_policy != pinned`) lokale gegen
    Remote-Digests vergleichen und im State ablegen — deployt **nichts**,
    siehe [Image-Update-Erkennung](#image-update-erkennung).
-7. **State atomar persistieren**; alle aufgetretenen Fehler werden
+7. **Image-Update anwenden** (Phase 11, nur `update_policy: apply`): im
+   selben fälligen Pass Pull → `up --no-deps` der betroffenen Services →
+   Health-Gate → bei Fehlschlag Rollback per Digest-Override, siehe
+   [Image-Updates anwenden](#image-updates-anwenden-phase-11-update_policy-apply).
+8. **State atomar persistieren**; alle aufgetretenen Fehler werden
    gesammelt und als ein Fehler zurückgegeben (`errors.Join`) — ein
    kaputter Stack verhindert die Reconciliation der anderen nie.
 
@@ -524,7 +528,7 @@ wird er erst, wenn jemand nachsieht. Der optionale Root-Block
 ```yaml
 notifications:
   enabled: true            # default true; false = still (Wartungsfenster)
-  on: [deploy_failed, prune_failed, repo_failed]   # default: alle drei
+  on: [deploy_failed, prune_failed, repo_failed, update_failed]  # default
   repeat_after: 1h         # Dedupe-Fenster je (kind, stack); default 1h
   timeout: 10s             # pro Destination; default 10s
   destinations:
@@ -637,14 +641,14 @@ registries:                      # optional, nur für private Registries
 
 ```yaml
 # stack.yaml
-update_policy: notify           # notify (default) | pinned
+update_policy: notify           # notify (default) | pinned | apply
 ```
 
 | Feld | Bedeutung |
 |---|---|
 | `global.update_check_interval` | Wie oft die Registries gefragt werden. `0` schaltet die Prüfung komplett ab (Rate-Limit-Notbremse); der Default ist `1h`. Ein Stack wird höchstens einmal pro Intervall geprüft, nicht bei jedem 5-Minuten-Poll. |
 | `registries[]` | Optionale Zugangsdaten je Host (`host`, `username`, `password`). `password`/`username` dürfen `${VAR}` enthalten — derselbe Secret-Pfad wie bei `notifications` (Prozessumgebung, `vault-env`). Unbekannte Variablen sind Ladefehler mit Feld und Variablenname. |
-| `update_policy` | `notify` (Default) prüft und meldet; `pinned` lässt den Stack komplett aus (keine Registry-Abfragen, keine Records). |
+| `update_policy` | `notify` (Default) prüft und meldet; `pinned` lässt den Stack komplett aus (keine Registry-Abfragen, keine Records); `apply` wendet ein erkanntes Update an (Pull, gezieltes Recreate, Health-Gate, Rollback — siehe unten). |
 
 **Ablauf je Stack** (nach den Deploys, am Pass-Ende):
 
@@ -699,8 +703,9 @@ Ohne Records fehlt `updates` ganz (kein Check gelaufen oder `pinned`);
 Image-Record ändert die Drift-Aussage nicht und umgekehrt.
 
 **Benachrichtigung**: `update_available` ist ein Ereignis des
-Phase-9-Notifiers, aber **opt-in** — der Default bleibt
-`[deploy_failed, prune_failed, repo_failed]`:
+Phase-9-Notifiers, aber **opt-in** — der Default
+(`[deploy_failed, prune_failed, repo_failed, update_failed]`, Phase 11 nimmt
+den neuen Fehler-Kind gleich mit auf) bleibt unverändert:
 
 ```yaml
 notifications:
@@ -713,6 +718,80 @@ Digest gleich, bleibt es still — auch über Neustarts hinweg, weil der
 Vergleich gegen den gespeicherten Record läuft. Geht der Stack wieder in
 Deckung (Image gepullt, Tag zurückgezogen), wird der Dedupe-Schlüssel
 gelöscht.
+
+## Image-Updates anwenden (Phase 11, `update_policy: apply`)
+
+`notify` macht Drift sichtbar, `apply` räumt ihn auf — kontrolliert, also mit
+Health-Gate und automatischem Rollback:
+
+```yaml
+# stack.yaml
+update_policy: apply
+health_timeout: 90s      # Default 90s; 0 = Default; negativ = Ladefehler
+```
+
+`health_timeout` gehört wie `update_policy` **nicht** in den Stack-Hash: es
+stimmt den Apply-Schritt ab, nicht das Deployment.
+
+**Ablauf**, am Ende von `checkImageUpdates` — nur für `apply`-Stacks und nur
+in einem Pass, in dem die Prüfung für den Stack fällig war:
+
+1. **Kandidaten**: Records mit `update_available` (lokaler Digest != remote).
+   Übersprungen werden lokal gebaute Images (kein `CurrentDigest` → keine
+   Registry-Identität, kein Rollback-Ziel), Stacks, deren Deployment in genau
+   diesem Pass fehlgeschlagen ist, und Records, deren `apply_blocked_digest`
+   schon dem aktuellen Remote-Digest entspricht — dieser Digest ist bereits
+   gescheitert, `apply` degradiert für ihn zu `notify`, bis der Tag auf einen
+   anderen Digest wandert.
+2. **Pull**: `docker compose -p <stack> -f … pull <services…>`, nur die
+   betroffenen Services. Ein Pull-Fehler blockiert den Digest und meldet
+   `update_failed` mit Stage `pull` — es wird nichts recreated.
+3. **Recreate**: `up -d --no-deps <services…>` (derselbe Pfad wie `Up`,
+   inklusive `--remove-orphans`), damit Nachbarn nicht mitgerissen werden.
+   Der bisherige Digest wird vorher als `previous_digest` festgehalten.
+4. **Health-Gate**: Polling alle 3s bis `health_timeout`; gesund ist ein
+   Service, dessen Container `running` ist und `healthy` meldet (ohne
+   Healthcheck genügt `running`). Sofortiges Scheitern bei `unhealthy`,
+   `exited`, `dead`, `restarting`, fehlendem Container oder Timeout.
+5. **Rollback** bei jedem Fehlschlag: eine temporäre Override-Datei
+   (`dockops-rollback-<stack>.yaml`) pinnt die betroffenen Services auf
+   `image: <repository>@<previous_digest>` und wird **nach** den
+   Stack-Compose-Files übergeben (spätere Datei gewinnt), danach erneut
+   `up --no-deps` + Health-Gate. Die Datei wird in jedem Fall wieder gelöscht.
+   Ein fehlgeschlagener Rollback ist der Fall für einen Menschen: der Stack
+   läuft dann weder auf dem alten noch verlässlich auf dem neuen Digest
+   (`update_failed`, Stage `rollback`).
+
+Jeder Fehlschlag landet als `apply_error` (+ `apply_blocked_digest`,
+`rolled_back_at`) im Record und beendet den Apply-Versuch für diesen Digest.
+Ein erfolgreicher Apply setzt `current_digest = remote_digest`,
+`update_available = false`, `applied_at`.
+
+**Isolation**: Pull/Up passieren ausschließlich hier. Deploy-, Prune- und
+Hash-Semantik bleiben unverändert, das State-Schema bleibt `fileVersion: 1`
+(alle Felder additiv). Fehler dieses Schritts lassen den Reconcile-Pass nie
+scheitern — nur ein Persistenz-Fehler des States wird zurückgegeben.
+
+**`/status`** bekommt pro Service die additiven Felder `previous_digest`,
+`applied_at`, `rolled_back_at`, `apply_error` und `blocked` (immer vorhanden:
+„wartet dieser Stack auf einen Menschen?“). `updates.policy` kommt jetzt aus
+dem State statt aus der Annahme „Records ⇒ notify“.
+
+**Benachrichtigungen**:
+
+```yaml
+notifications:
+  on: [deploy_failed, prune_failed, repo_failed, update_failed, update_applied, update_available]
+```
+
+| Kind | Default | Stages |
+|---|---|---|
+| `update_failed` | **an** (Fehlerklasse wie `deploy_failed`) | `pull`, `compose_up`, `health_gate`, `rollback` |
+| `update_applied` | opt-in (normaler Betrieb, steht in `/status`) | `apply` |
+| `update_available` | opt-in (Phase 10) | `update_check` |
+
+Pro Stack und Versuch geht genau ein `update_failed` raus; ein
+Rollback-Fehler ersetzt dabei den Gate-Fehler, der ihn ausgelöst hat.
 
 ## CLI
 

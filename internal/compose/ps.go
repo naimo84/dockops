@@ -20,13 +20,22 @@ import (
 const composeProjectLabel = "com.docker.compose.project"
 
 // Container is one row of docker (compose) ps output, normalized to the
-// fields /status reports. State holds values like "running", "exited",
-// "created" or "paused"; Health is the healthcheck verdict ("healthy",
-// "unhealthy", "starting") or empty when the service has no healthcheck.
+// fields /status reports and the phase-11 health gate checks. State holds
+// values like "running", "exited", "created" or "paused"; Health is the
+// healthcheck verdict ("healthy", "unhealthy", "starting") or empty when the
+// service has no healthcheck.
 type Container struct {
-	Name   string `json:"name"`
-	State  string `json:"state"`
+	Name  string `json:"name"`
+	State string `json:"state"`
+	// Health is the healthcheck verdict; empty for a service without a
+	// healthcheck.
 	Health string `json:"health"`
+	// Service is the compose service the container belongs to. Older
+	// compose versions omit the key in `ps --format json`; it then stays
+	// empty, and the health gate treats the container as unassigned instead
+	// of guessing (see internal/reconciler apply.go) — a missing name must
+	// never turn an unchecked service into a green gate.
+	Service string `json:"service"`
 }
 
 // UnmarshalJSON accepts the key spellings different CLI versions emit: modern
@@ -35,10 +44,11 @@ type Container struct {
 // case-insensitively; the plural alias is resolved here.
 func (c *Container) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		Name   string `json:"Name"`
-		Names  string `json:"Names"`
-		State  string `json:"State"`
-		Health string `json:"Health"`
+		Name    string `json:"Name"`
+		Names   string `json:"Names"`
+		State   string `json:"State"`
+		Health  string `json:"Health"`
+		Service string `json:"Service"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -49,6 +59,7 @@ func (c *Container) UnmarshalJSON(data []byte) error {
 	}
 	c.State = raw.State
 	c.Health = raw.Health
+	c.Service = raw.Service
 	return nil
 }
 

@@ -126,9 +126,12 @@ type StackStatus struct {
 
 // StackUpdates is the persisted image update situation of one stack.
 type StackUpdates struct {
-	// Policy is the stack's update policy. Only stacks with "notify" are
-	// checked, and only they have records, so a present block means
-	// "notify" (the phase-11 apply actor will add its own value).
+	// Policy is the stack's update policy at deploy time: "notify",
+	// "pinned" or "apply" (phase 11). It comes from the state, which
+	// records it with every deployment — the phase-10 shortcut "records
+	// imply notify" stopped holding once apply stacks kept records too. An
+	// entry written before the state carried the policy reads as notify,
+	// the default.
 	Policy string `json:"policy"`
 	// CheckedAt is the newest check timestamp (RFC3339, empty when
 	// unknown).
@@ -154,6 +157,25 @@ type ServiceUpdate struct {
 	UpdateAvailable bool `json:"update_available"`
 	// Error carries a failed check (registry error, locally built image).
 	Error string `json:"error"`
+
+	// The phase-11 apply fields. Additive and omitted while empty, so a
+	// notify stack's document is byte-identical to the phase-10 one.
+
+	// PreviousDigest is the digest the image ran before the last apply
+	// attempt (the rollback target), empty when dockops never applied it.
+	PreviousDigest string `json:"previous_digest,omitempty"`
+	// AppliedAt is the RFC3339 time of the last successful apply.
+	AppliedAt string `json:"applied_at,omitempty"`
+	// RolledBackAt is the RFC3339 time of the last rollback.
+	RolledBackAt string `json:"rolled_back_at,omitempty"`
+	// ApplyError is the failure text of the last apply attempt (pull,
+	// compose up, health gate or rollback).
+	ApplyError string `json:"apply_error,omitempty"`
+	// Blocked reports that this exact remote digest already failed its
+	// apply, so update_policy: apply currently behaves like notify for the
+	// image. Always present (like update_available), because "is this
+	// stack waiting for a human?" is the question the field answers.
+	Blocked bool `json:"blocked"`
 }
 
 // UnmanagedProject is a running compose project without a state entry.
@@ -285,11 +307,14 @@ func buildStackUpdates(st state.State) *StackUpdates {
 	if len(st.Images) == 0 {
 		return nil
 	}
+	policy := st.UpdatePolicy
+	if policy == "" {
+		// State written before the field existed (or by a hand-built
+		// entry): notify is the default policy.
+		policy = config.UpdatePolicyNotify
+	}
 	updates := &StackUpdates{
-		// Only stacks with update_policy notify are checked at all, so a
-		// record set implies the policy. Persisting the policy itself
-		// would duplicate the configuration in the state for no gain.
-		Policy:   config.UpdatePolicyNotify,
+		Policy:   policy,
 		Services: make([]ServiceUpdate, 0, len(st.Images)), // JSON [], not null
 	}
 	var newest time.Time
@@ -307,6 +332,11 @@ func buildStackUpdates(st state.State) *StackUpdates {
 			RemoteDigest:    rec.RemoteDigest,
 			UpdateAvailable: rec.UpdateAvailable,
 			Error:           rec.Error,
+			PreviousDigest:  rec.PreviousDigest,
+			AppliedAt:       formatTime(rec.AppliedAt),
+			RolledBackAt:    formatTime(rec.RolledBackAt),
+			ApplyError:      rec.ApplyError,
+			Blocked:         rec.ApplyBlockedDigest != "" && rec.ApplyBlockedDigest == rec.RemoteDigest,
 		})
 	}
 	if !newest.IsZero() {
@@ -321,6 +351,15 @@ func buildStackUpdates(st state.State) *StackUpdates {
 		return updates.Services[i].Image < updates.Services[j].Image
 	})
 	return updates
+}
+
+// formatTime renders a persisted timestamp as RFC3339, or "" for the zero
+// time (a field that never happened stays out of the document).
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // driftFor classifies a stack's containers per the drift matrix:
