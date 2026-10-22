@@ -145,7 +145,7 @@ func (c *Client) RemoteDigest(ctx context.Context, ref string) (string, error) {
 		return "", err
 	}
 
-	tokenKey := normalizeHost(apiHost(parsed.Registry))
+	tokenKey := tokenCacheKey(parsed.Registry, parsed.Repository)
 	bearer, ok := c.cachedToken(tokenKey)
 	if !ok {
 		bearer, err = c.fetchToken(ctx, parsed.Registry, challenge, parsed.Repository)
@@ -292,7 +292,7 @@ func (c *Client) fetchToken(ctx context.Context, registryHost, challenge, reposi
 		return "", fmt.Errorf("%w: token %s: response carries no token", ErrUnauthorized, tokenURL.Redacted())
 	}
 	c.mu.Lock()
-	c.tokens[normalizeHost(apiHost(registryHost))] = token{value: value, expiresAt: expiryFor(c.now(), tok.ExpiresIn)}
+	c.tokens[tokenCacheKey(registryHost, repository)] = token{value: value, expiresAt: expiryFor(c.now(), tok.ExpiresIn)}
 	c.mu.Unlock()
 	return value, nil
 }
@@ -380,6 +380,14 @@ func (c *Client) credentials(registryHost string) (Credentials, bool) {
 	return Credentials{}, false
 }
 
+// tokenCacheKey identifies one bearer token. Registry tokens are scoped per
+// repository, so the host alone is not enough: reusing a token issued for
+// repository A on repository B answers 401 and every image after the first
+// would look unauthorized.
+func tokenCacheKey(registryHost, repository string) string {
+	return normalizeHost(apiHost(registryHost)) + "|" + repository
+}
+
 // cachedToken returns the cached, not yet expired bearer token of a
 // registry's API host. Expired entries are dropped on the way out.
 func (c *Client) cachedToken(key string) (string, bool) {
@@ -407,8 +415,8 @@ func (c *Client) dropToken(key string) {
 // configured for registryHost.
 func hostAliases(registryHost string) []string {
 	host := normalizeHost(registryHost)
-	if host == normalizeHost(dockerHubAPIHost) {
-		return []string{host, DefaultRegistry, "registry-1.docker.io"}
+	if isDockerHubHost(host) {
+		return []string{dockerHubAPIHost, DefaultRegistry, "index.docker.io"}
 	}
 	return []string{host}
 }

@@ -35,9 +35,10 @@ const (
 	// DefaultTag is used when a reference names neither tag nor digest.
 	DefaultTag = "latest"
 	// dockerHubAPIHost is the host that answers the v2 API for Docker Hub;
-	// "docker.io" itself only redirects. The parsed Ref keeps the
-	// human-readable DefaultRegistry.
-	dockerHubAPIHost = "index.docker.io"
+	// "docker.io" and "index.docker.io" only redirect (and answer an
+	// unauthenticated 401 without a bearer challenge). The parsed Ref keeps
+	// the human-readable DefaultRegistry.
+	dockerHubAPIHost = "registry-1.docker.io"
 )
 
 var (
@@ -161,9 +162,19 @@ func isRegistryHost(component string) bool {
 // apiHost is the host that serves the v2 API for a registry: Docker Hub's
 // "docker.io" is a user-facing alias only.
 func apiHost(registryHost string) string {
-	switch registryHost {
-	case DefaultRegistry, dockerHubAPIHost, "registry-1.docker.io":
+	if isDockerHubHost(registryHost) {
 		return dockerHubAPIHost
 	}
 	return registryHost
+}
+
+// isDockerHubHost reports whether host is Docker Hub under any of its
+// spellings. Only registry-1.docker.io serves the v2 API; the other two
+// redirect.
+func isDockerHubHost(host string) bool {
+	switch normalizeHost(host) {
+	case DefaultRegistry, "index.docker.io", dockerHubAPIHost:
+		return true
+	}
+	return false
 }

@@ -258,19 +258,69 @@ func TestRemoteDigestBearerChallenge(t *testing.T) {
 		}
 	}
 
-	// The token is cached per host: a second lookup goes straight to the
-	// manifest with the bearer token.
+	// The token is cached per repository: a second lookup goes straight to
+	// the manifest with the bearer token.
 	if _, err := c.RemoteDigest(context.Background(), host+"/loki/app:1.2.3"); err != nil {
 		t.Fatalf("second RemoteDigest() error = %v", err)
 	}
 	if n := atomic.LoadInt32(&tokenRequests); n != 1 {
-		t.Errorf("token requests after second lookup = %d, want 1 (cached per host)", n)
+		t.Errorf("token requests after second lookup = %d, want 1 (cached per repository)", n)
 	}
 	// Each lookup probes unauthenticated first (the token is only sent when
 	// the registry asks for it), so the second lookup adds one 401 plus one
 	// authorized HEAD — but no second token request.
 	if n := atomic.LoadInt32(&manifestRequests); n != 4 {
 		t.Errorf("manifest requests after second lookup = %d, want 4", n)
+	}
+}
+
+func TestRemoteDigestTokenIsScopedPerRepository(t *testing.T) {
+	// Registry tokens are scoped per repository. A cache keyed on the host
+	// alone hands repository A's token to repository B, which answers 401 —
+	// with more than one image per registry every image after the first
+	// looks unauthorized (live symptom on the fleet).
+	var srv *httptest.Server
+	tokens := map[string]string{}
+	var tokenRequests int32
+	repos := []string{"loki/app", "loki/other"}
+
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			atomic.AddInt32(&tokenRequests, 1)
+			scope := r.URL.Query().Get("scope")
+			token := "token-" + strings.TrimSuffix(strings.TrimPrefix(scope, "repository:"), ":pull")
+			tokens[token] = scope
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": token, "expires_in": 300})
+			return
+		}
+		for _, repo := range repos {
+			if r.URL.Path != "/v2/"+repo+"/manifests/1.0" {
+				continue
+			}
+			scope := tokens[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")]
+			if scope != "repository:"+repo+":pull" {
+				w.Header().Set("WWW-Authenticate",
+					fmt.Sprintf(`Bearer realm="%s/token",service="registry.test",scope="repository:%s:pull"`, srv.URL, repo))
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Docker-Content-Digest", "sha256:"+strings.Repeat("2", 64))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	host := strings.TrimPrefix(srv.URL, "http://")
+	c := New(nil, nil)
+	for _, repo := range repos {
+		if _, err := c.RemoteDigest(context.Background(), host+"/"+repo+":1.0"); err != nil {
+			t.Fatalf("RemoteDigest(%s) error = %v", repo, err)
+		}
+	}
+	if n := atomic.LoadInt32(&tokenRequests); n != 2 {
+		t.Errorf("token requests = %d, want 2 (one per repository)", n)
 	}
 }
 
@@ -413,13 +463,43 @@ func TestRemoteDigestPinnedSkipsHTTP(t *testing.T) {
 	}
 }
 
-func TestRemoteDigestDockerHubCallsIndexHost(t *testing.T) {
+func TestDockerHubAliasesResolveToAPIHost(t *testing.T) {
+	// Every Docker Hub spelling must end up on registry-1.docker.io: the
+	// other two hosts answer 401 without a bearer challenge, so the token
+	// walk can never start there (live symptom: "registry lookup failed
+	// ... unauthorized" for henrygd/beszel-agent).
+	for _, ref := range []string{"nginx:1.25", "docker.io/library/nginx:1.25", "index.docker.io/library/nginx:1.25"} {
+		parsed, err := ParseRef(ref)
+		if err != nil {
+			t.Fatalf("ParseRef(%q) error = %v", ref, err)
+		}
+		c := New(nil, nil)
+		if want := "https://registry-1.docker.io/v2/library/nginx/manifests/1.25"; c.manifestURL(parsed.Registry, parsed.Repository, parsed.Tag) != want {
+			t.Errorf("manifestURL(%q) = %q, want %q", ref, c.manifestURL(parsed.Registry, parsed.Repository, parsed.Tag), want)
+		}
+	}
+}
+
+func TestDockerHubCredentialsMatchEveryAlias(t *testing.T) {
+	// A registries: entry may name any spelling; the lookup must still
+	// find it, whichever spelling the image reference uses.
+	for _, configured := range []string{"docker.io", "index.docker.io", "registry-1.docker.io"} {
+		for _, referenced := range []string{"docker.io", "index.docker.io", "registry-1.docker.io"} {
+			c := New([]Credentials{{Host: configured, Username: "u", Password: "p"}}, nil)
+			if _, ok := c.credentials(referenced); !ok {
+				t.Errorf("credentials(configured %q, referenced %q) not found", configured, referenced)
+			}
+		}
+	}
+}
+
+func TestRemoteDigestDockerHubCallsAPIHost(t *testing.T) {
 	// The Docker Hub alias must be rewritten to the API host before a
 	// request leaves the process; asserted via the URL builder (no network,
 	// docker.io is never contacted in tests).
 	c := New(nil, nil)
 	got := c.manifestURL(DefaultRegistry, "library/nginx", "latest")
-	if want := "https://index.docker.io/v2/library/nginx/manifests/latest"; got != want {
+	if want := "https://registry-1.docker.io/v2/library/nginx/manifests/latest"; got != want {
 		t.Errorf("manifestURL() = %q, want %q", got, want)
 	}
 	if got := c.manifestURL("localhost:5000", "a/b", "edge"); got != "http://localhost:5000/v2/a/b/manifests/edge" {
