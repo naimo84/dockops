@@ -41,6 +41,7 @@ const (
 	envSopsSidecarURL = "DOCKOPS_SOPS_SIDECAR_URL"
 	envPrintStatus    = "DOCKOPS_PRINT_STATUS"
 	envStatusToken    = "DOCKOPS_STATUS_TOKEN"
+	envLogsToken      = "DOCKOPS_LOGS_TOKEN"
 	envSelfProject    = "DOCKOPS_SELF_PROJECT"
 )
 
@@ -373,6 +374,11 @@ func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconcil
 			"hint", "set -webhook-secret or "+envWebhookSecret)
 	}
 
+	logsToken := os.Getenv(envLogsToken)
+	if logsToken == "" {
+		logger.Info("log API disabled: no token configured", "hint", "set "+envLogsToken)
+	}
+
 	triggers := make(chan struct{}, 1)
 	notify := func() {
 		select {
@@ -394,6 +400,8 @@ func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconcil
 			HeadCommit:  hostCommitFn(collab.git),
 			SelfProject: selfProject(),
 			Token:       os.Getenv(envStatusToken),
+			Logs:        collab.compose,
+			LogsToken:   logsToken,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
