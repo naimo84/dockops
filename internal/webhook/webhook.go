@@ -2,7 +2,8 @@
 // authenticated POST /webhook that triggers a reconcile pass, a GET
 // /healthz liveness probe and a GET /status monitoring endpoint that
 // compares the desired state (state.json) against the running containers
-// (see status.go).
+// (see status.go) and the token-guarded log API /logs* (see logs.go):
+// container inventory, bounded snapshots and live tails.
 //
 // Webhook authentication understands both common flavors — GitHub
 // (X-Hub-Signature-256: "sha256=<hex>" HMAC-SHA256 over the raw request
@@ -25,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/local/dockops/internal/compose"
+	"github.com/local/dockops/internal/logs"
 	"github.com/local/dockops/internal/state"
 )
 
@@ -102,6 +104,16 @@ type Deps struct {
 	// DOCKOPS_SELF_PROJECT override it.
 	SelfProject string
 
+	// Logs is the docker-side source of the log API (/logs*); nil disables
+	// the endpoints with 503. *compose.Executor is the real implementation.
+	Logs logs.Source
+
+	// LogsToken guards every /logs* request (Authorization: Bearer). Unlike
+	// Token it is not optional in spirit: an empty value disables the log
+	// endpoints entirely (503), because log lines routinely carry secrets.
+	// The CLI reads it from DOCKOPS_LOGS_TOKEN.
+	LogsToken string
+
 	// Token optionally guards GET /status: when set, requests must carry
 	// "Authorization: Bearer <token>" (compared in constant time), else
 	// /status answers 401. Empty keeps the endpoint open like /healthz.
@@ -119,6 +131,13 @@ type Handler struct {
 	status StatusDeps
 	// statusToken optionally guards GET /status (Bearer); see Deps.Token.
 	statusToken string
+	// logSrc and logsToken feed the /logs* endpoints; see Deps.Logs and
+	// Deps.LogsToken.
+	logSrc    logs.Source
+	logsToken string
+	// streams is the semaphore bounding concurrent live tails
+	// (logs.MaxConcurrentStreams slots); see takeStreamSlot.
+	streams chan struct{}
 }
 
 // New creates a Handler from deps, applying the defaults documented on Deps.
@@ -141,6 +160,9 @@ func New(deps Deps) *Handler {
 			Logger:      logger,
 		},
 		statusToken: deps.Token,
+		logSrc:      deps.Logs,
+		logsToken:   deps.LogsToken,
+		streams:     make(chan struct{}, logs.MaxConcurrentStreams),
 	}
 }
 
@@ -170,6 +192,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleStatus(w, r)
+	case "/logs", "/logs/containers", "/logs/stream":
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handleLogs(w, r)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}

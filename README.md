@@ -519,6 +519,86 @@ Projekt-Listung) und der Aufruf endet mit **exit 0**. Nur eine nicht
 lesbare State-Datei schlägt fehl — Fehler auf stderr, **exit 1**. Eine
 fehlende State-Datei gilt wie beim Endpoint als leerer Snapshot.
 
+## Log-API (`/logs*`)
+
+Drei Endpunkte, die Container-Logs für **Maschinen** lesbar machen (Agent,
+`curl`, `fleet-ssh`) — bewusst ohne UI: wer Logs ansieht, hat ohnehin
+Shell-Zugriff. Sie ersetzen einen zentralen Log-Viewer wie Dozzle, weil jeder
+Agent die Logs seines eigenen Hosts liefert und der Aufrufer über Hosts hinweg
+merged.
+
+| Endpoint | Zweck |
+|---|---|
+| `GET /logs/containers` | Inventar dieses Hosts: `container`, `project`, `service`, `image`, `state`, `health`, `created` |
+| `GET /logs?container=…` bzw. `?project=…` | Snapshot, begrenzt |
+| `GET /logs/stream?container=…` | Live-Tail als Server-Sent Events |
+
+**Zugriff ist fail-closed**: `DOCKOPS_LOGS_TOKEN` ist Pflicht. Ohne die
+Variable antworten alle `/logs*`-Pfade mit **503**, mit falschem oder
+fehlendem `Authorization: Bearer <token>` mit **401** (konstanter
+Zeitvergleich). Log-Zeilen enthalten regelmäßig Secrets — ein optionaler
+Schutz wie bei `/status` wäre hier die falsche Voreinstellung. Der Token wird
+nie geloggt, ebenso wenig der Query-String (ein `grep`-Muster kann ein Secret
+enthalten).
+
+```bash
+TOKEN=$(cat /etc/dockops/logs-token)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8080/logs/containers"
+
+# letzte 200 Zeilen der letzten Stunde, nur Fehler
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8080/logs?container=n8n-1&since=1h&tail=200&grep=ERROR"
+
+# dasselbe als NDJSON (Zeitstempel und Container als Felder)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8080/logs?project=n8n&since=30m&format=json"
+
+# live mittailen
+curl -N -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8080/logs/stream?container=n8n-1&grep=error&regex=1"
+```
+
+**Query-Parameter** (`container` und `project` schließen sich aus, einer ist
+Pflicht; Namen müssen `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$` erfüllen — ein
+führendes `-` würde `docker logs` sonst als Flag lesen):
+
+| Parameter | Default | Grenze |
+|---|---|---|
+| `since` | `1h` | max. `168h`; RFC3339 oder Dauer (`90m`, `2h30m`, `7d`) |
+| `tail` | `200` (Stream: `0`) | max. `5000`; `0` nur im Stream (= nur neue Zeilen) |
+| `grep` | — | max. 256 Zeichen, literal; mit `regex=1` RE2 |
+| `regex` | `0` | `0`/`1`, verlangt `grep` |
+| `format` | `text` | `text` (Rohzeilen) oder `json` (NDJSON `{"t":…,"c":…,"m":…}`) |
+
+Im `project`-Modus läuft `docker compose -p <projekt> logs` — Compose merged
+und präfixt selbst, deshalb bleibt `c` dort leer. Antwort-Header eines
+Snapshots: `X-Dockops-Lines` (gelieferte Zeilen) und `X-Dockops-Truncated:
+true`, wenn die Byte-Grenze gegriffen hat.
+
+**Harte Limits** (Konstanten in `internal/logs`, nicht konfigurierbar — es
+gibt genau eine Art Aufrufer):
+
+- Snapshot: 2 MiB, max. 5000 Zeilen
+- Stream: 10 MiB, max. 15 min, max. 8 parallel pro Host (sonst **429**)
+- pro Zeile: 64 KiB; eine längere Zeile wird gekürzt und der Rest verworfen
+  (ein crashender Container kann megabyte-große Zeilen ohne Newline schreiben)
+
+**SSE-Format**: Events `log` (eine Zeile), `ping` (alle 15 s Keepalive) und
+`end` mit `{"reason":"docker_exit"}` bzw. `{"reason":"limit"}`. Ein
+Client-Disconnect bricht den `docker logs --follow`-Prozess ab (kein Zombie
+überlebt den Request).
+
+**Fehler-Mapping**: fehlender Container/Projekt **404**, nicht lesbarer
+Log-Treiber **422**, Docker-Fehler **502**, Client-Abbruch **504**, ungültige
+Parameter **400**.
+
+**Einschränkung**: Der `journald`-Log-Treiber ist über `docker logs` nicht
+lesbar (→ 422). Praktisch irrelevant: alle Fleet-Hosts fahren das
+Daemon-Default `json-file` (im Playbook `core/docker` gepinnt, am 25.10.2026
+auf hvaler, netcup2, bifrost und omv verifiziert), und keine Compose-Datei
+setzt den Treiber.
+
 ## Benachrichtigungen (`notifications`)
 
 Ein fehlgeschlagener Deploy steht heute in `GET /status` und im Log — gesehen
@@ -866,8 +946,10 @@ zum Laufen, den er verwaltet (`docker compose build && docker compose up -d`):
   sowie `VAULT_ADDR`/`VAULT_TOKEN` (bzw. `VAULT_ROLE_ID`/`VAULT_SECRET_ID`).
   `DOCKOPS_WEBHOOK_SECRET` und `VAULT_TOKEN` werden beim `up` aus der Shell
   bzw. einer `.env`-Datei neben der `compose.yaml` substituiert; optional
-  `DOCKOPS_STATUS_TOKEN` (Bearer-Schutz für `GET /status`) und
-  `DOCKOPS_SELF_PROJECT` (Unmanaged-Erkennung, default `dockops`).
+  `DOCKOPS_STATUS_TOKEN` (Bearer-Schutz für `GET /status`),
+  `DOCKOPS_LOGS_TOKEN` (Pflicht-Token für die `/logs*`-API; ohne die Variable
+  ist die Log-API mit 503 abgeschaltet) und `DOCKOPS_SELF_PROJECT`
+  (Unmanaged-Erkennung, default `dockops`).
 - **Volume** `dockops-data:/var/lib/dockops` — überlebt Container-Neubau:
   `state.json` (flag `-state`) und die Checkouts unter
   `/var/lib/dockops/repos` (Default `global.work_dir`).
