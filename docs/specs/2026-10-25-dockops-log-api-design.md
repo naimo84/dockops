@@ -80,6 +80,10 @@ Antwort `application/x-ndjson` bei `format=json`, eine Zeile je Log-Zeile:
 {"t":"2026-10-25T09:12:03.123456789Z","c":"n8n-1","m":"Editor is now accessible"}
 ```
 
+`t` wird aus dem `--timestamps`-Präfix der Zeile geparst; `c` ist der Containername im
+`container`-Fall und **leer** im `project`-Fall (das Service-Präfix von compose bleibt dann Teil
+von `m` — es zu zerlegen wäre geraten, nicht geparst).
+
 Header: `X-Dockops-Lines` (ausgelieferte Zeilen), `X-Dockops-Truncated: true`, wenn das Byte-Limit
 gegriffen hat (letzte Zeile ist dann `… [dockops: truncated]`).
 
@@ -180,6 +184,10 @@ type Options struct {
 
 // ParseQuery validiert rohe Query-Parameter; jeder Fehler ist ein 400 mit Begründung.
 func ParseQuery(q url.Values, now time.Time) (Options, error)
+
+// ParseStreamQuery wie ParseQuery, aber Follow=true, Tail-Default 0 und Tail=0
+// erlaubt (nur neue Zeilen ab Stream-Start).
+func ParseStreamQuery(q url.Values, now time.Time) (Options, error)
 
 // Source ist die Injektionsstelle für Tests (echt: *compose.Executor).
 type Source interface {
