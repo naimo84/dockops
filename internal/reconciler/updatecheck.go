@@ -202,6 +202,12 @@ func (r *Reconciler) checkStackImages(ctx context.Context, stack config.Stack, i
 		rec.RolledBackAt = prev.RolledBackAt
 		rec.ApplyBlockedDigest = prev.ApplyBlockedDigest
 		rec.ApplyError = prev.ApplyError
+		// The phase-12 self-update marker survives a re-check as well: a
+		// check that runs while the helper is still working must not drop
+		// the proof that a recreate is in flight (it would allow a second
+		// plan). It is cleared by the finalization, not by the check.
+		rec.ApplyPendingDigest = prev.ApplyPendingDigest
+		rec.PendingAt = prev.PendingAt
 		if !rec.UpdateAvailable {
 			// Nothing is pending, so a recorded apply failure is history:
 			// the tag moved back, or the image was updated by other means.

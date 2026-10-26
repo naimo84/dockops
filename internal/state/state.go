@@ -135,6 +135,25 @@ type ImageRecord struct {
 	// compose up, health gate or rollback). Cleared by a successful apply
 	// and by a check that no longer finds an update.
 	ApplyError string `json:"apply_error,omitempty"`
+
+	// The phase-12 self update bookkeeping. Additive and omitempty like the
+	// fields above — fileVersion stays 1: a state file without them is an
+	// agent that never ran a self update, and the fields only document a
+	// hand-over that is already in flight.
+
+	// ApplyPendingDigest is the target digest of a running self update:
+	// the agent wrote the plan, started the detached helper and cannot
+	// record the outcome itself (its own container is what gets recreated).
+	// While it is set, the apply path refuses to start a second helper,
+	// GET /status reports the record as pending, and the next agent start
+	// finalizes the outcome from the helper's result file. It is the one
+	// honest interim state the dying process can leave behind.
+	ApplyPendingDigest string `json:"apply_pending_digest,omitempty"`
+	// PendingAt is the UTC time the self update was handed to the helper,
+	// zero when none ever ran (same zero-value serialization as AppliedAt).
+	// It answers "how long has this been pending?" without guessing from
+	// CheckedAt.
+	PendingAt time.Time `json:"pending_at,omitempty"`
 }
 
 // fileModel is the JSON document persisted by Save.
@@ -194,6 +213,15 @@ func New(path string, logger *slog.Logger) (*Store, error) {
 	}
 	s.logger.Info("state loaded", "path", path, "stacks", len(s.stacks))
 	return s, nil
+}
+
+// Path returns the file path the store persists to. Callers that need the
+// state directory derive it from this instead of duplicating how the path
+// was configured — the phase-12 self update keeps its plan, result and
+// helper log next to the state file (the one directory the agent and the
+// helper share).
+func (s *Store) Path() string {
+	return s.path
 }
 
 // Get returns the persisted state of the named stack; ok is false when the

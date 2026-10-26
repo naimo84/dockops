@@ -176,6 +176,17 @@ type ServiceUpdate struct {
 	// image. Always present (like update_available), because "is this
 	// stack waiting for a human?" is the question the field answers.
 	Blocked bool `json:"blocked"`
+
+	// Pending reports that a phase-12 self update of this image is in
+	// flight: the agent wrote the plan, started the detached helper and will
+	// finalize the outcome on its next start. Omitted while false, so a
+	// notify or apply stack's document stays unchanged.
+	//
+	// It sits on the service entry, not on the updates block, because
+	// StackUpdates.pending already counts the images whose tag moved
+	// (phase 10). The marker is per image anyway — ApplyPendingDigest is
+	// recorded per image record.
+	Pending bool `json:"pending,omitempty"`
 }
 
 // UnmanagedProject is a running compose project without a state entry.
@@ -337,6 +348,7 @@ func buildStackUpdates(st state.State) *StackUpdates {
 			RolledBackAt:    formatTime(rec.RolledBackAt),
 			ApplyError:      rec.ApplyError,
 			Blocked:         rec.ApplyBlockedDigest != "" && rec.ApplyBlockedDigest == rec.RemoteDigest,
+			Pending:         rec.ApplyPendingDigest != "",
 		})
 	}
 	if !newest.IsZero() {

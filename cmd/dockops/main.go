@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -43,6 +44,7 @@ const (
 	envStatusToken    = "DOCKOPS_STATUS_TOKEN"
 	envLogsToken      = "DOCKOPS_LOGS_TOKEN"
 	envSelfProject    = "DOCKOPS_SELF_PROJECT"
+	envSelfUpdate     = "DOCKOPS_SELF_UPDATE"
 )
 
 // Defaults for the flags and the poll loop.
@@ -85,6 +87,13 @@ type options struct {
 	// Interval is the -interval override; 0 means unset, in which case
 	// global.poll_interval from the loaded config applies.
 	Interval time.Duration
+	// SelfUpdateHelper selects the phase-12 helper mode
+	// (-selfupdate-helper): execute the plan named by -selfupdate-plan and
+	// exit — no repository, no reconcile pass, no HTTP server. It is how the
+	// agent starts its own detached replacement.
+	SelfUpdateHelper bool
+	// SelfUpdatePlan is the plan file path of the helper mode.
+	SelfUpdatePlan string
 }
 
 // boolFromEnv parses an optional boolean environment variable: empty counts
@@ -130,12 +139,21 @@ func parseFlags(args []string, getenv func(string) string) (options, error) {
 	fs.BoolVar(&opts.PrintStatus, "print-status", printStatus,
 		"write the /status JSON document to stdout and exit (env "+envPrintStatus+"; no -repo needed; wins over -once and server mode)")
 	fs.StringVar(&interval, "interval", "", "poll interval override like \"5m\" (default: global.poll_interval from the config)")
+	fs.BoolVar(&opts.SelfUpdateHelper, "selfupdate-helper", false,
+		"run as the self-update helper: execute the plan given by -selfupdate-plan and exit (no repository, no server)")
+	fs.StringVar(&opts.SelfUpdatePlan, "selfupdate-plan", "",
+		"path of the self-update plan (-selfupdate-helper only)")
 
 	if err := fs.Parse(args); err != nil {
 		return opts, err
 	}
-	if !opts.PrintStatus && opts.RepoURL == "" {
+	// The helper and the status mode read everything they need from the
+	// state directory and docker; only the daemon modes need a repository.
+	if !opts.PrintStatus && !opts.SelfUpdateHelper && opts.RepoURL == "" {
 		return opts, fmt.Errorf("no host repository configured: set -repo or %s", envRepoURL)
+	}
+	if opts.SelfUpdateHelper && opts.SelfUpdatePlan == "" {
+		return opts, fmt.Errorf("-selfupdate-helper requires -selfupdate-plan")
 	}
 	if opts.Branch == "" {
 		opts.Branch = defaultBranch
@@ -223,6 +241,16 @@ func run(opts options, logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// -selfupdate-helper wins over every other mode: the helper is a
+	// short-lived container whose only job is the plan (phase 12). No
+	// reconciler, no webhook server, no repository access.
+	if opts.SelfUpdateHelper {
+		if opts.PrintStatus || opts.Once {
+			logger.Info("-selfupdate-helper wins over -print-status/-once; running the helper plan only")
+		}
+		return runSelfUpdateHelper(ctx, opts.SelfUpdatePlan, logger)
+	}
+
 	// -print-status wins over every other mode: no reconcile pass, no
 	// server, just the one-shot document. -repo is not required here (see
 	// parseFlags); an unreadable state file is the only fatal error — docker
@@ -280,6 +308,8 @@ func run(opts options, logger *slog.Logger) error {
 		Logger:         logger,
 		Compose:        composeExec,
 		SopsSidecarURL: opts.SopsSidecarURL,
+		SelfProject:    selfProject(),
+		SelfUpdate:     selfUpdateEnabled(os.Getenv),
 		OnConfigLoaded: func(cfg *config.Config) {
 			intervals.set(time.Duration(cfg.Global.PollInterval))
 		},
@@ -311,6 +341,15 @@ func selfProject() string {
 		return p
 	}
 	return defaultSelfProject
+}
+
+// selfUpdateEnabled reports whether the phase-12 self-update path is active:
+// DOCKOPS_SELF_UPDATE disables it only with the literal value "off" (case
+// insensitive); unset, empty or anything else keeps it on. Default-on is
+// deliberate — a self stack handled by the in-process apply is the bug this
+// phase fixes, so an operator has to opt out explicitly (and only to debug).
+func selfUpdateEnabled(getenv func(string) string) bool {
+	return !strings.EqualFold(strings.TrimSpace(getenv(envSelfUpdate)), "off")
 }
 
 // hostCommitFn wires the host_repo.commit callback of GET /status and
