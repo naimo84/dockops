@@ -358,6 +358,17 @@ Records, unabhängig von ps-Fehlern).
   `policy` aus dem State
 - `internal/hash/phase11_test.go` — `health_timeout`/`update_policy: apply`
   ändern den Stack-Hash nicht
+- `internal/selfupdate/` — Phase-12-Self-Update-Logik (reine Funktionen, keine
+  CLI-Aufrufe): `Plan`/`Target`/`Result` als JSON, `Validate`, `IsSelf`,
+  `WriteAtomic` (tmp+rename, 0o600), `HelperArgs`, `RollbackOverride`;
+  `selfupdate_test.go` deckt Round-Trip, je einen Negativfall pro
+  Validierungsregel, `IsSelf`, die Helper-Argumente, den Override und alle
+  Result-Zustände ab
+- `internal/reconciler/selfupdate.go`/`phase12_test.go` — Phase-12-Hand-over:
+  Plan + `apply_pending_digest` + `previous_digest` im Apply-Pfad, Helper-Start
+  über injiziertes `runHelper` (kein echtes `docker run`), Finalisierung
+  (ok/rolled_back/rollback_failed/beide Digest-Fallbacks), Pending-Guard gegen
+  einen zweiten Helper
 - `internal/webhook/phase8b_test.go` — Phase-8b-Regressionstest:
   `BuildStatus` mit identischen Kollaborateuren wie der Endpoint liefert
   dasselbe Dokument (inkl. beider Fehler-Modi), fehlende Konfiguration ist
@@ -420,6 +431,13 @@ Records, unabhängig von ps-Fehlern).
 - Alle exportierten Symbole sind mit Doc-Kommentaren dokumentiert.
 - Offene Punkte im Briefing werden konservativ entschieden (stdlib, klare
   Fehler) und die Entscheidung als Kommentar im Code festgehalten.
+- Self-Update (Phase 12) läuft über einen **detached Helper-Container**
+  (`internal/selfupdate` für Plan/Result, `cmd/dockops -selfupdate-helper`):
+  der Agent schreibt Plan + `apply_pending_digest` und beendet seinen Teil,
+  der Helper recreated und rollt bei Bedarf zurück, der nächste Agent-Start
+  finalisiert — kein in-process Recreate des eigenen Stacks. Der Helper erbt
+  die Agent-Mounts per `--volumes-from` (kein `-v` der Container-Pfade: die
+  Host-Pfade dahinter sind installtionsabhängig).
 
 ## Checks vor jedem Commit
 

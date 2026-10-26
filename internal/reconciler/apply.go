@@ -13,6 +13,7 @@ import (
 
 	"github.com/local/dockops/internal/compose"
 	"github.com/local/dockops/internal/config"
+	"github.com/local/dockops/internal/selfupdate"
 	"github.com/local/dockops/internal/state"
 )
 
@@ -99,6 +100,14 @@ func (r *Reconciler) applyUpdates(ctx context.Context, stack config.Stack, pn *p
 		}
 		pn.updateFailed(ctx, stack.Name, st.Hash, stagePull, text)
 		return r.persistImageRecords(stack.Name, recs)
+	}
+
+	// Phase 12: the stack the agent itself runs in cannot be applied in
+	// process. The up below would replace our own container and take the
+	// command, the health gate and the rollback down with it. A detached
+	// helper takes over; this pass only hands over and returns.
+	if r.selfUpdate && selfupdate.IsSelf(stack.Name, r.selfProject) {
+		return r.startSelfUpdate(ctx, stack, recs, cands, services, req)
 	}
 
 	// The rollback target is remembered before anything is recreated: a

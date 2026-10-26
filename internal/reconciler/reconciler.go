@@ -230,6 +230,27 @@ type Deps struct {
 	// actually has a due stack, and rebuilt only when the credentials
 	// change.
 	NewRegistry func([]config.Registry, *slog.Logger) registry.Resolver
+
+	// SelfProject is the compose project dockops itself runs under (env
+	// DOCKOPS_SELF_PROJECT, default "dockops"). It is the same value
+	// GET /status uses to keep the agent out of the unmanaged list — one
+	// source, not two. A stack of this name is the self stack of phase 12.
+	SelfProject string
+
+	// SelfContainer is the agent's own container name or ID: the
+	// --volumes-from source of the detached self-update helper (phase 12).
+	// Empty → os.Hostname(), which inside a docker container is the short
+	// container ID docker accepts. Overridden only by tests; there is no
+	// environment variable, because a wrong value would point the helper at
+	// the wrong mounts instead of failing loudly.
+	SelfContainer string
+
+	// SelfUpdate enables the phase-12 self-update path for the self stack
+	// (env DOCKOPS_SELF_UPDATE, default on; the CLI passes true unless the
+	// variable says "off"). False keeps the ordinary phase-11 in-process
+	// apply, which cannot survive its own recreate — a debug mode for a
+	// stack that is not really the agent.
+	SelfUpdate bool
 }
 
 // Reconciler executes reconciliation passes over the declarative
@@ -271,6 +292,17 @@ type Reconciler struct {
 	// not part of Deps: production never tunes it, and an exported knob
 	// would invite per-stack configuration without a need.
 	healthPoll time.Duration
+
+	// Phase-12 self update: the self project, whether the detached helper
+	// path is enabled, and the docker run injection point. runHelper is
+	// unexported and defaults to the plain docker CLI in New; the tests
+	// replace it so no case ever starts a real container.
+	selfProject string
+	selfUpdate  bool
+	// selfContainer is the agent's own container, the --volumes-from
+	// source of the helper.
+	selfContainer string
+	runHelper     func(ctx context.Context, args []string) error
 }
 
 // New returns a Reconciler for deps, applying the defaults documented on
@@ -323,25 +355,39 @@ func New(deps Deps) *Reconciler {
 			return registry.New(registryCredentials(creds), logger)
 		}
 	}
+	// The helper inherits the agent's mounts, so it needs the agent's own
+	// container identity. os.Hostname() is the short container ID inside a
+	// container; outside one it is a hostname docker will refuse, and the
+	// hand-over then fails loudly instead of recreating the wrong stack.
+	selfContainer := deps.SelfContainer
+	if selfContainer == "" {
+		if host, err := os.Hostname(); err == nil {
+			selfContainer = host
+		}
+	}
 	return &Reconciler{
-		repoURL:     deps.RepoURL,
-		branch:      deps.Branch,
-		workDir:     filepath.Clean(workDir),
-		state:       deps.State,
-		logger:      logger,
-		onConfig:    deps.OnConfigLoaded,
-		git:         deps.Git,
-		compose:     composeExec,
-		hooks:       hookRunner,
-		sops:        sopsFn,
-		newVault:    vaultFactory,
-		notifier:    deps.Notifier,
-		injected:    deps.Notifier != nil,
-		newNotifier: newNotifier,
-		registry:    deps.Registry,
-		injectedReg: deps.Registry != nil,
-		newRegistry: newRegistry,
-		healthPoll:  defaultHealthPoll,
+		repoURL:       deps.RepoURL,
+		branch:        deps.Branch,
+		workDir:       filepath.Clean(workDir),
+		state:         deps.State,
+		logger:        logger,
+		onConfig:      deps.OnConfigLoaded,
+		git:           deps.Git,
+		compose:       composeExec,
+		hooks:         hookRunner,
+		sops:          sopsFn,
+		newVault:      vaultFactory,
+		notifier:      deps.Notifier,
+		injected:      deps.Notifier != nil,
+		newNotifier:   newNotifier,
+		registry:      deps.Registry,
+		injectedReg:   deps.Registry != nil,
+		newRegistry:   newRegistry,
+		healthPoll:    defaultHealthPoll,
+		selfProject:   deps.SelfProject,
+		selfUpdate:    deps.SelfUpdate,
+		selfContainer: selfContainer,
+		runHelper:     runDockerHelper,
 	}
 }
 
@@ -380,6 +426,12 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	// notifier is (re)built for this pass and logged once (see
 	// logNotifications).
 	pn := &passNotify{notifier: r.notifier}
+
+	// Phase 12: a self update of the previous process is finalized before
+	// anything touches the repository. It only reads state, the result file
+	// and one local image digest, and its failures are logged inside — a
+	// bookkeeping problem must not cost the pass.
+	r.finalizeSelfUpdate(ctx)
 
 	// 1. Primary host repository. The bootstrap is deliberately path-fixed
 	// (Henne-Ei): the root configuration that may declare global.

@@ -873,6 +873,62 @@ notifications:
 Pro Stack und Versuch geht genau ein `update_failed` raus; ein
 Rollback-Fehler ersetzt dabei den Gate-Fehler, der ihn ausgelöst hat.
 
+## Self-Update (Phase 12)
+
+Ein Stack, den dockops selbst betreibt (`DOCKOPS_SELF_PROJECT`, Default
+`dockops`), lässt sich nicht im eigenen Prozess aktualisieren: `compose up`
+ersetzt den Container, in dem der Compose-Aufruf, das Health-Gate und der
+Rollback laufen. Für genau diesen Stack übernimmt ein **detached
+Helper-Container** den Recreate.
+
+**Ablauf** (nur `update_policy: apply`, und erst nach erfolgreichem Pull):
+
+1. Der Agent schreibt `selfupdate-plan.json` ins State-Dir (Projekt,
+   Compose-Dateien, `--env-file`, Services, Health-Ziele, Ziel- und
+   Vorher-Digest) und markiert die Records mit `apply_pending_digest` +
+   `pending_at`; `previous_digest` ist das Rollback-Ziel.
+2. Er startet `docker run -d --rm --name dockops-selfupdate-<projekt>-<unix>`
+   mit `/var/run/docker.sock`, dem Stack-Verzeichnis und dem State-Dir — beide
+   am **identischen Host-Pfad** — sowie dem gerade gepullten Image.
+3. Der Helper wartet `grace_seconds` (10s), fährt
+   `compose -p … -f … --env-file … up -d --no-deps <services>`, pollt das
+   Health-Gate (`docker inspect`, 180s Timeout, 3s Poll) und schreibt
+   `selfupdate-result.json`: `ok`, `rolled_back` oder `rollback_failed`. Bei
+   einem Fehlschlag schreibt er vorher die Override-Datei
+   `dockops-rollback-<projekt>.yaml` (`<repository>@<previous>`), fährt erneut
+   up und gated noch einmal.
+4. Beim nächsten Start finalisiert der Agent: `ok` → `current_digest`,
+   `applied_at`, `update_applied`; `rolled_back` → `apply_blocked_digest`,
+   `apply_error`, `rolled_back_at`, `update_failed`; `rollback_failed` wie
+   `rolled_back`, zusätzlich mit `rollback FAILED` im Text. Fehlt das
+   Ergebnis, entscheidet der laufende Digest: gleich Ziel ⇒ als Erfolg
+   verbuchen (WARN), gleich Vorher-Digest ⇒ als Fehlschlag blockieren.
+
+Solange `apply_pending_digest` gesetzt ist, startet kein Pass einen zweiten
+Helper, und `/status` meldet den Service mit `pending: true`
+(`updates.services[].pending`; `updates.pending` bleibt der Zähler der
+verschobenen Tags). Alles Weitere des Helpers landet in
+`<state-dir>/selfupdate-helper.log` — bei `--rm` ist das die einzige
+Diagnosequelle.
+
+**Grenzen**:
+
+- Ein Self-Stack pro Host.
+- Der Helper läuft im **laufenden** Image; ein kaputtes neues Image kann sich
+  nicht selbst retten — dafür ist der Rollback auf `previous` da.
+- Der Helper hat Socket-Rechte (wie der Agent), aber keinen Repo-/Secret-
+  Zugriff: er liest den Plan und schreibt Ergebnis und Log.
+- Der Helper erbt die Mounts des Agenten per `--volumes-from <agent>`; er
+  bekommt damit Stack-Dir, State-Dir und Socket unter **denselben absoluten
+  Pfaden** wie der Agent — unabhängig davon, ob dahinter Bind-Mounts oder
+  Named Volumes liegen. Voraussetzung ist nur, dass der Agent seinen eigenen
+  Container kennt; im Container ist das `os.Hostname()` (Kurz-ID) und damit
+  automatisch richtig. Ist er nicht ermittelbar, bricht die Übergabe ab,
+  bevor ein Helper startet (kein Update verbrannt).
+- `DOCKOPS_SELF_UPDATE=off` schaltet den Pfad ab (nur zum Debuggen; der
+  Self-Stack fällt dann auf den In-Process-Apply zurück und stirbt beim
+  Recreate).
+
 ## CLI
 
     dockops [-repo URL] [-branch NAME] [-state PFAD] [-addr HOST:PORT]
@@ -895,11 +951,19 @@ Dazu die Vault-Variablen (Namen in `global.vault` konfigurierbar):
 `VAULT_ADDR` (Fallback für `global.vault.address`), `VAULT_TOKEN`
 (`auth_method: token`) bzw. `VAULT_ROLE_ID` + `VAULT_SECRET_ID`
 (`auth_method: approle`). Ohne eigenes Flag: `DOCKOPS_STATUS_TOKEN`
-(Bearer-Schutz für `GET /status`, leer = offen) und `DOCKOPS_SELF_PROJECT`
-(eigenes Compose-Projekt für die Unmanaged-Erkennung, default `dockops`).
+(Bearer-Schutz für `GET /status`, leer = offen), `DOCKOPS_SELF_PROJECT`
+(eigenes Compose-Projekt für die Unmanaged-Erkennung **und** die
+Self-Update-Erkennung, default `dockops`) und `DOCKOPS_SELF_UPDATE`
+(Default an; nur die exakte Angabe `off` deaktiviert den Helper-Pfad, siehe
+„Self-Update“).
 `DOCKOPS_HOST_CHECKOUT` füllt ein leeres `global.host_checkout` (YAML
 gewinnt; `-print-status` und `/status` folgen der Variable auch ohne
 Config, siehe „Konfigurierbare Checkout-Pfade“).
+
+`-selfupdate-helper` und `-selfupdate-plan` sind ausschließlich für den
+internen Helper-Container gedacht (Phase 12, siehe „Self-Update“): sie werden
+vom Agent selbst gesetzt, brauchen kein `-repo` und schalten Reconciler und
+HTTP-Server ab.
 
 **Betriebsmodi**: Ohne `-once` läuft dockops als Daemon — sofortiger erster
 Durchlauf, danach Poll-Timer (`-interval` überschreibt
