@@ -983,3 +983,7 @@ Reconcile-Durchläufe gegen echte Git-Repos auf `t.TempDir()`;
 Der SOPS-Sidecar ist ein eigenes Binary (`go build ./cmd/sops-sidecar`,
 Image via `cmd/sops-sidecar/Dockerfile.sidecar`).
 Externe Abhängigkeit ist allein `gopkg.in/yaml.v3`.
+
+## Lizenz
+
+MIT - siehe [LICENSE](LICENSE).
