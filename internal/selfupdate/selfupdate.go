@@ -459,11 +459,38 @@ func sanitizeName(s string) string {
 	return b.String()
 }
 
+// Mount is one mount of the agent's own container as docker reports it
+// (`docker inspect --format '{{json .Mounts}}'`): the host side (Source) and
+// the absolute path inside the container (Destination).
+type Mount struct {
+	Host     string
+	Path     string
+	ReadOnly bool
+}
+
+// MountArgs renders mounts as the `-v host:path[:ro]` pairs of a docker run
+// line. Incomplete entries (no host or no path) are skipped instead of
+// producing a mount that docker rejects.
+func MountArgs(mounts []Mount) []string {
+	args := make([]string, 0, 2*len(mounts))
+	for _, m := range mounts {
+		if strings.TrimSpace(m.Host) == "" || strings.TrimSpace(m.Path) == "" {
+			continue
+		}
+		spec := m.Host + ":" + m.Path
+		if m.ReadOnly {
+			spec += ":ro"
+		}
+		args = append(args, "-v", spec)
+	}
+	return args
+}
+
 // HelperArgs builds the docker run argument list (without the "docker"
 // binary) that starts the helper:
 //
 //	run -d --rm --name dockops-selfupdate-<project>-<suffix>
-//	    --volumes-from <agent container>
+//	    --volumes-from <agent container> [-v <host>:<path>[:ro] ...]
 //	    <image> -selfupdate-helper -plan <stateDir>/selfupdate-plan.json
 //
 // Decisions worth naming:
@@ -471,20 +498,18 @@ func sanitizeName(s string) string {
 //     (detached, its own cgroup) and removes itself when it exits. That is
 //     the entire point of the phase — a child process would die with the
 //     agent during the recreate.
-//   - --volumes-from instead of repeated -v <path>:<path> mounts, and that
-//     is not cosmetic. The agent only knows the CONTAINER paths of its
-//     mounts (here /var/lib/dockops and /var/lib/dockops/repos/host), while
-//     the host paths behind them differ per installation (/home/docker/
-//     dockops, /home/docker/apps, or a named volume). A self-mount of the
-//     container path would create two EMPTY host directories, the helper
-//     would find neither the compose files nor the plan, and the update
-//     would fail after the grace period with nothing to diagnose. Inheriting
-//     the agent's mounts hands over exactly what the agent sees — compose
-//     files, generated .env, plan, result — at the same absolute paths, for
-//     bind mounts and named volumes alike.
+//   - --volumes-from AND explicit mounts: --volumes-from hands over VOLUMES
+//     only, never bind mounts. An installation whose state dir, compose
+//     checkouts and docker socket are binds — the normal case — therefore
+//     got a helper that saw none of them: it could not even read the plan,
+//     died before writing a result, and the agent booked "helper left no
+//     result" with no diagnosis source. The caller passes the agent's own
+//     mounts (docker inspect .Mounts), so the helper sees exactly what the
+//     agent sees at the same absolute paths; --volumes-from stays for
+//     installs that really use named volumes, where no host path exists.
 //   - stateDir is read-write in the agent and stays read-write through the
-//     inheritance: the plan is read from it, the result and the helper log
-//     are written there.
+//     inherited mounts: the plan is read from it, the result and the helper
+//     log are written there.
 //   - the helper image is the image reference being deployed: the agent has
 //     just pulled it, so the helper runs the same version it installs.
 //
@@ -493,18 +518,22 @@ func sanitizeName(s string) string {
 // An empty value is an error rather than a degraded run: without the mounts
 // the helper cannot do its job, and starting it anyway would burn an update
 // and leave a confusing log behind.
-func HelperArgs(p Plan, image, stateDir, suffix, selfContainer string) ([]string, error) {
+func HelperArgs(p Plan, image, stateDir, suffix, selfContainer string, mounts ...Mount) ([]string, error) {
 	if strings.TrimSpace(selfContainer) == "" {
 		return nil, errors.New("helper args: the agent's own container (for --volumes-from) is unknown")
 	}
-	return []string{
+	args := []string{
 		"run", "-d", "--rm",
 		"--name", HelperName(p, suffix),
 		"--volumes-from", selfContainer,
+	}
+	args = append(args, MountArgs(mounts)...)
+	args = append(args,
 		image,
 		"-selfupdate-helper",
 		"-plan", PlanPath(stateDir),
-	}, nil
+	)
+	return args, nil
 }
 
 // rollbackDocument mirrors the in-process rollback override (see

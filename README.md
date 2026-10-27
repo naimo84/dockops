@@ -918,13 +918,21 @@ Diagnosequelle.
   nicht selbst retten — dafür ist der Rollback auf `previous` da.
 - Der Helper hat Socket-Rechte (wie der Agent), aber keinen Repo-/Secret-
   Zugriff: er liest den Plan und schreibt Ergebnis und Log.
-- Der Helper erbt die Mounts des Agenten per `--volumes-from <agent>`; er
-  bekommt damit Stack-Dir, State-Dir und Socket unter **denselben absoluten
-  Pfaden** wie der Agent — unabhängig davon, ob dahinter Bind-Mounts oder
-  Named Volumes liegen. Voraussetzung ist nur, dass der Agent seinen eigenen
-  Container kennt; im Container ist das `os.Hostname()` (Kurz-ID) und damit
-  automatisch richtig. Ist er nicht ermittelbar, bricht die Übergabe ab,
-  bevor ein Helper startet (kein Update verbrannt).
+- Der Helper erbt die Mounts des Agenten auf **zwei** Wegen:
+  `--volumes-from <agent>` für Named Volumes **und** explizite
+  `-v <host>:<container>[:ro]` für jeden Bind-Mount, den der Agent beim Start
+  per `docker inspect <eigener Container> --format '{{json .Mounts}}'` meldet
+  (`DOCKOPS_SELF_MOUNTS` als Override: kommagetrennt `host:container[:ro]`).
+  `--volumes-from` allein genügt nicht — es vererbt nur Volumes, **keine**
+  Bind-Mounts. Ein Host, der State-Dir, Checkouts und Socket als Binds fährt
+  (der Normalfall), bekäme sonst einen Helper ohne Plan, ohne Compose-Dateien
+  und ohne Socket: er stirbt ohne Ergebnis (`self deploy: helper left no
+  result`), und der Agent hat keine Diagnosequelle. Mit den Mounts sieht der
+  Helper Stack-Dir, State-Dir und Socket unter **denselben absoluten Pfaden**
+  wie der Agent. Voraussetzung ist nur, dass der Agent seinen eigenen Container
+  kennt; im Container ist das `os.Hostname()` (Kurz-ID) und damit automatisch
+  richtig. Ist er nicht ermittelbar, bricht die Übergabe ab, bevor ein Helper
+  startet (kein Update verbrannt).
 - `DOCKOPS_SELF_UPDATE=off` schaltet den Pfad ab (nur zum Debuggen; der
   Self-Stack fällt dann auf den In-Process-Apply zurück und stirbt beim
   Recreate).
@@ -948,8 +956,10 @@ geht auch dieser Recreate an denselben detached Helper.
    er `deploy_pending_hash` + `deploy_pending_at`; `hash` bleibt der alte
    Stand (ehrlicher Zwischenstand: der Deploy ist beauftragt, nicht passiert).
 2. Er startet denselben Helper-Container wie in Phase 12
-   (`docker run -d --rm --name … --volumes-from <agent> <self-image>
-   -selfupdate-helper -plan <pfad>`). Das Helper-Image ist der eigene Build:
+   (`docker run -d --rm --name … --volumes-from <agent> -v <host>:<pfad>…
+   <self-image> -selfupdate-helper -plan <pfad>`; die `-v`-Paare sind die
+   Bind-Mounts des Agenten, siehe „Grenzen" oben). Das Helper-Image ist der
+   eigene Build:
    `DOCKOPS_SELF_IMAGE`, sonst `docker inspect <eigener Container>
    --format '{{.Config.Image}}'` beim Start.
 3. Der Helper wartet `grace_seconds` und fährt `compose -p … -f …

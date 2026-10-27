@@ -460,8 +460,11 @@ Records, unabhängig von ps-Fehlern).
   der Agent schreibt Plan + `apply_pending_digest` und beendet seinen Teil,
   der Helper recreated und rollt bei Bedarf zurück, der nächste Agent-Start
   finalisiert — kein in-process Recreate des eigenen Stacks. Der Helper erbt
-  die Agent-Mounts per `--volumes-from` (kein `-v` der Container-Pfade: die
-  Host-Pfade dahinter sind installtionsabhängig).
+  die Agent-Mounts per `--volumes-from` (Named Volumes) **und** per explizitem
+  `-v host:container[:ro]` für alle Bind-Mounts des Agenten (`docker inspect
+  .Mounts`, Override `DOCKOPS_SELF_MOUNTS`). `--volumes-from` allein vererbt
+  keine Binds: ein Bind-Host startet damit einen Helper ohne Plan, ohne
+  Compose-Dateien und ohne Socket, der ohne Ergebnis stirbt.
 - Phase 13 hängt am selben Mechanismus und Schalter: Jeder Recreate des
   Self-Stacks, der **kein** Image-Move ist, wird als Deploy-Plan (`kind:
   deploy`, `deploy_hash`, `profiles`) übergeben; der Agent markiert nur
