@@ -262,6 +262,15 @@ type Deps struct {
 	// default to be guessed: an unresolvable image is a hard error before
 	// the helper starts.
 	SelfImage string
+
+	// SelfMounts are the agent's own mounts (docker inspect .Mounts), handed
+	// to the helper as explicit -v arguments. --volumes-from alone is not
+	// enough: it inherits volumes, not bind mounts, and an agent whose state
+	// dir, checkouts and docker socket are binds would otherwise start a
+	// helper that cannot read the plan. Empty keeps the old behaviour
+	// (volumes only) — correct for a named-volume installation, silently
+	// useless for a bind-mount one, which is why cmd/dockops always fills it.
+	SelfMounts []selfupdate.Mount
 }
 
 // Reconciler executes reconciliation passes over the declarative
@@ -319,6 +328,11 @@ type Reconciler struct {
 	// filled by cmd/dockops from DOCKOPS_SELF_IMAGE or the agent's own
 	// container). Empty disables the deploy hand-over — see deployStack.
 	selfImage string
+
+	// selfMounts are the agent's own mounts, re-declared on the helper
+	// (Deps.SelfMounts). Bind mounts are not inherited by --volumes-from, so
+	// without them the helper sees neither plan nor compose files.
+	selfMounts []selfupdate.Mount
 }
 
 // New returns a Reconciler for deps, applying the defaults documented on
@@ -405,6 +419,7 @@ func New(deps Deps) *Reconciler {
 		selfContainer: selfContainer,
 		runHelper:     runDockerHelper,
 		selfImage:     deps.SelfImage,
+		selfMounts:    deps.SelfMounts,
 	}
 }
 

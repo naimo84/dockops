@@ -29,6 +29,7 @@ import (
 	"github.com/local/dockops/internal/config"
 	"github.com/local/dockops/internal/git"
 	"github.com/local/dockops/internal/reconciler"
+	"github.com/local/dockops/internal/selfupdate"
 	"github.com/local/dockops/internal/state"
 	"github.com/local/dockops/internal/webhook"
 )
@@ -47,6 +48,7 @@ const (
 	envSelfProject    = "DOCKOPS_SELF_PROJECT"
 	envSelfUpdate     = "DOCKOPS_SELF_UPDATE"
 	envSelfImage      = "DOCKOPS_SELF_IMAGE"
+	envSelfMounts     = "DOCKOPS_SELF_MOUNTS"
 )
 
 // Defaults for the flags and the poll loop.
@@ -313,6 +315,7 @@ func run(opts options, logger *slog.Logger) error {
 		SelfProject:    selfProject(),
 		SelfUpdate:     selfUpdateEnabled(os.Getenv),
 		SelfImage:      selfImage(os.Getenv, logger),
+		SelfMounts:     selfMounts(os.Getenv, logger),
 		OnConfigLoaded: func(cfg *config.Config) {
 			intervals.set(time.Duration(cfg.Global.PollInterval))
 		},
@@ -381,6 +384,80 @@ func selfImage(getenv func(string) string, logger *slog.Logger) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// selfMounts returns the agent's own mount points, so the self-update helper
+// can re-declare them. The helper inherits volumes through --volumes-from, but
+// bind mounts are not inherited at all — and a bind-mount installation (state
+// dir, compose checkouts, docker socket as binds) is the normal case. Without
+// this the helper starts, cannot read the plan, and dies without a result.
+//
+// DOCKOPS_SELF_MOUNTS overrides the lookup with a comma-separated
+// host:container[:ro] list for installations where docker reports nothing
+// useful. The lookup mirrors selfImage: once at startup, docker inspect on the
+// agent's own container, and a failure is a warning rather than a crash — the
+// helper then starts with volumes only, which fails the same way every install
+// without binds never does.
+func selfMounts(getenv func(string) string, logger *slog.Logger) []selfupdate.Mount {
+	if v := strings.TrimSpace(getenv(envSelfMounts)); v != "" {
+		return parseMountList(v)
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		logger.Warn("self mounts: cannot determine the agent's container", "error", err, "hint", "set "+envSelfMounts)
+		return nil
+	}
+	out, err := exec.Command(helperDockerBinary, "inspect", "--format", "{{json .Mounts}}", host).Output()
+	if err != nil {
+		logger.Warn("self mounts: docker does not know the agent's mounts; the helper will not see bind mounts",
+			"container", host, "error", err, "hint", "set "+envSelfMounts)
+		return nil
+	}
+	var reported []struct {
+		Type        string
+		Source      string
+		Destination string
+		RW          bool
+	}
+	if err := json.Unmarshal(out, &reported); err != nil {
+		logger.Warn("self mounts: cannot parse docker's mount list", "container", host, "error", err, "hint", "set "+envSelfMounts)
+		return nil
+	}
+	mounts := make([]selfupdate.Mount, 0, len(reported))
+	for _, m := range reported {
+		// Volumes are covered by --volumes-from; only binds need the
+		// explicit host path, which docker does not report for them.
+		if m.Type != "bind" {
+			continue
+		}
+		mounts = append(mounts, selfupdate.Mount{Host: m.Source, Path: m.Destination, ReadOnly: !m.RW})
+	}
+	return mounts
+}
+
+// parseMountList splits DOCKOPS_SELF_MOUNTS, the escape hatch of selfMounts:
+// comma-separated host:container entries, a trailing :ro marks a read-only
+// mount. Unparsable entries are dropped (an empty -v value would make docker
+// refuse to start the helper at all).
+func parseMountList(v string) []selfupdate.Mount {
+	var mounts []selfupdate.Mount
+	for _, entry := range strings.Split(v, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		readOnly := false
+		if strings.HasSuffix(entry, ":ro") {
+			readOnly = true
+			entry = strings.TrimSuffix(entry, ":ro")
+		}
+		host, path, ok := strings.Cut(entry, ":")
+		if !ok || strings.TrimSpace(host) == "" || strings.TrimSpace(path) == "" {
+			continue
+		}
+		mounts = append(mounts, selfupdate.Mount{Host: host, Path: path, ReadOnly: readOnly})
+	}
+	return mounts
 }
 
 // selfUpdateEnabled reports whether the phase-12 self-update path is active:
