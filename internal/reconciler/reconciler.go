@@ -48,6 +48,7 @@ import (
 	"github.com/local/dockops/internal/notify"
 	"github.com/local/dockops/internal/registry"
 	"github.com/local/dockops/internal/secrets"
+	"github.com/local/dockops/internal/selfupdate"
 	"github.com/local/dockops/internal/sops"
 	"github.com/local/dockops/internal/state"
 	"github.com/local/dockops/internal/vault"
@@ -249,8 +250,18 @@ type Deps struct {
 	// (env DOCKOPS_SELF_UPDATE, default on; the CLI passes true unless the
 	// variable says "off"). False keeps the ordinary phase-11 in-process
 	// apply, which cannot survive its own recreate — a debug mode for a
-	// stack that is not really the agent.
+	// stack that is not really the agent. Phase 13 gates the deploy
+	// hand-over on the same switch, so "off" means "everything in
+	// process", exactly as before phase 12.
 	SelfUpdate bool
+
+	// SelfImage is the image the phase-13 deploy helper starts from (env
+	// DOCKOPS_SELF_IMAGE). A deploy plan has no target image, so the helper
+	// must run something the agent knows works; empty means "ask docker for
+	// the agent's own image" (docker inspect .Config.Image). It is not a
+	// default to be guessed: an unresolvable image is a hard error before
+	// the helper starts.
+	SelfImage string
 }
 
 // Reconciler executes reconciliation passes over the declarative
@@ -303,6 +314,11 @@ type Reconciler struct {
 	// source of the helper.
 	selfContainer string
 	runHelper     func(ctx context.Context, args []string) error
+
+	// selfImage is the image a phase-13 deploy helper runs (Deps.SelfImage,
+	// filled by cmd/dockops from DOCKOPS_SELF_IMAGE or the agent's own
+	// container). Empty disables the deploy hand-over — see deployStack.
+	selfImage string
 }
 
 // New returns a Reconciler for deps, applying the defaults documented on
@@ -388,6 +404,7 @@ func New(deps Deps) *Reconciler {
 		selfUpdate:    deps.SelfUpdate,
 		selfContainer: selfContainer,
 		runHelper:     runDockerHelper,
+		selfImage:     deps.SelfImage,
 	}
 }
 
@@ -603,6 +620,18 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		return fmt.Errorf("stack %s: compute hash: %w", stack.Name, err)
 	}
 
+	// Phase 13: a deploy of the self stack is already in flight. The helper
+	// the previous pass started owns the stack until it reports; touching it
+	// here would start a second recreate. The guard sits before the change
+	// detection on purpose — a pending hash is "in flight", not "unchanged".
+	if r.selfUpdate && selfupdate.IsSelf(stack.Name, r.selfProject) {
+		if st, ok := r.state.Get(stack.Name); ok && st.DeployPendingHash != "" {
+			r.logger.Debug("deploy handed to a helper, skipping",
+				"stack", stack.Name, "hash", st.DeployPendingHash)
+			return nil
+		}
+	}
+
 	// Unchanged hash and last attempt deployed → skip (logged at debug per
 	// the briefing). Changed() also redeploys entries whose last attempt
 	// failed, so a transient failure is retried on the next pass even with
@@ -673,6 +702,45 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		return err
 	}
 	r.logger.Debug("wrote stack env file", "stack", stack.Name, "path", stackEnvPath)
+
+	// Phase 13: every recreate of the self stack goes through the detached
+	// helper — a changed hash (compose file, env, profile, new service) and
+	// the first adoption alike. The in-process up would replace the
+	// container it runs in and could leave the stack down in the window
+	// between "old container removed" and "new container created".
+	if r.selfUpdate && selfupdate.IsSelf(stack.Name, r.selfProject) && r.helperImageKnown() {
+		services, err := compose.UpServices(stack, stack.Dir)
+		if err != nil {
+			// A pre-flight failure of the service filter: nothing will be
+			// recreated, so the env restore applies exactly like in the
+			// in-process path (compose.Up fails on the same input).
+			rollbackStackEnv()
+			err = fmt.Errorf("stack %s: up: %w", stack.Name, err)
+			pn.deployFailed(ctx, stack.Name, stageComposeUp, newHash, err)
+			r.markFailed(stack, newHash)
+			return err
+		}
+		// No rollbackStackEnv from here on: the helper reads the generated
+		// .env, and the hand-over either succeeds (the helper deploys with
+		// that file) or fails before anything was recreated.
+		return r.startSelfDeploy(ctx, stack, newHash, services, pn)
+	}
+	if r.selfUpdate && selfupdate.IsSelf(stack.Name, r.selfProject) {
+		// Documented boundary of the phase (and the one deliberate deviation
+		// from the spec's "unknown image is a hard error"): without a known
+		// helper image no correct helper can be started — a guessed one would
+		// deploy the stack with a build this agent does not run. Refusing the
+		// deploy outright leaves the stack stale until an operator acts, and
+		// the pre-phase-13 image path of the same pass depends on the records
+		// this deploy writes (see checkImageUpdates), so the deploy falls back
+		// to the in-process recreate it always used — loudly, because that is
+		// the recreate with the outage window this phase removes. cmd/dockops
+		// fills the image at startup (DOCKOPS_SELF_IMAGE or docker inspect of
+		// the own container), so this is a misconfiguration path, not the
+		// normal one.
+		r.logger.Warn("self deploy: no helper image known, deploying in-process",
+			"stack", stack.Name, "hint", "set "+envSelfImage)
+	}
 
 	if err := r.compose.Up(ctx, stack, stack.Dir, envFile); err != nil {
 		// Deployment failed: restore whatever .env was there before, so the

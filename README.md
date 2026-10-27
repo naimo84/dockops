@@ -929,6 +929,62 @@ Diagnosequelle.
   Self-Stack fällt dann auf den In-Process-Apply zurück und stirbt beim
   Recreate).
 
+## Deploy-Handover (Phase 13)
+
+Der Image-Pfad oben deckt nur einen Fall ab: ein neues Image für einen
+laufenden Self-Stack. Jeder andere Recreate des Self-Stacks — geänderte
+Compose-Datei, geänderte `.env`, neues Profil, neuer Service und vor allem die
+**Erst-Adoption** (Hash ändert sich von „nichts" auf „irgendwas") — läuft im
+Agent durch denselben Abgrund: `compose up` entfernt den alten Container,
+*bevor* es den neuen erstellt; stirbt der Prozess in diesem Fenster, ist der
+Stack unten, und `restart:` hat nichts mehr, was es neustarten könnte. Deshalb
+geht auch dieser Recreate an denselben detached Helper.
+
+**Ablauf**:
+
+1. Der Agent schreibt `selfupdate-plan.json` mit `kind: deploy`: Projekt,
+   Compose-Dateien, `--env-file`, `profiles`, die gefilterten Services (leer =
+   alle) und `deploy_hash` — dazu Grace- und Health-Deadlines. Im State setzt
+   er `deploy_pending_hash` + `deploy_pending_at`; `hash` bleibt der alte
+   Stand (ehrlicher Zwischenstand: der Deploy ist beauftragt, nicht passiert).
+2. Er startet denselben Helper-Container wie in Phase 12
+   (`docker run -d --rm --name … --volumes-from <agent> <self-image>
+   -selfupdate-helper -plan <pfad>`). Das Helper-Image ist der eigene Build:
+   `DOCKOPS_SELF_IMAGE`, sonst `docker inspect <eigener Container>
+   --format '{{.Config.Image}}'` beim Start.
+3. Der Helper wartet `grace_seconds` und fährt `compose -p … -f …
+   --profile … --env-file … up -d --remove-orphans [services]`; danach
+   schreibt er `selfupdate-result.json` mit `kind: deploy` und `status: ok`
+   oder `failed`. Kein Health-Gate und kein Rollback: ein Deploy hat kein
+   Vorher, auf das er zurückfallen könnte — der Fehlertext steht im Result und
+   im `selfupdate-helper.log`.
+4. Beim nächsten Start finalisiert der Agent: `ok` → `hash =
+   deploy_pending_hash`, Status `deployed`, Recovery eines offenen
+   `deploy_failed`; `failed` → `hash` wie der Versuch, Status `failed`,
+   `deploy_failed` (Stage `compose_up`). Fehlt das Result, gilt der Deploy erst
+   nach `grace + health_timeout + 120s` als verschollen; bis dahin bleibt
+   `deploy_pending_hash` stehen.
+
+Solange `deploy_pending_hash` gesetzt ist, lässt `deployStack` den Stack
+unangetastet — kein zweiter `compose up`, kein zweiter Helper, auch wenn der
+Hash inzwischen weiter auseinandergelaufen ist: „pending" heißt „in flight",
+nicht „unchanged".
+
+**Grenzen**: Helper, Rechte und Mounts sind die aus Phase 12 (ein Self-Stack pro
+Host, Socket-Rechte, kein Repo-/Secret-Zugriff). Ist kein Helper-Image bekannt
+(weder `DOCKOPS_SELF_IMAGE` noch ein `docker inspect`-Ergebnis), startet
+**kein** Helper — mit geratenem Image würde der Stack mit einem anderen Build
+laufen als der Agent. Der Deploy fällt dann auf den In-Process-Recreate zurück
+(Warnung im Log, inklusive Hinweis auf die Variable), weil der Image-Pfad
+desselben Passes die Records braucht, die dieser Deploy schreibt: das ist
+genau das Fenster, das die Phase schließt, und deshalb ein
+Konfigurationsfehler, kein Betriebsmodus. `DOCKOPS_SELF_UPDATE=off` schaltet
+auch diesen Pfad ab.
+
+Nicht abgedeckt: der **Prune** des Self-Stacks (`compose down`) läuft weiter
+in-process. Der Agent stirbt dabei zwar, aber der Stack verschwindet sowieso;
+das State-Entry bleibt, und der nächste Pass wiederholt den Down.
+
 ## CLI
 
     dockops [-repo URL] [-branch NAME] [-state PFAD] [-addr HOST:PORT]
@@ -954,16 +1010,19 @@ Dazu die Vault-Variablen (Namen in `global.vault` konfigurierbar):
 (Bearer-Schutz für `GET /status`, leer = offen), `DOCKOPS_SELF_PROJECT`
 (eigenes Compose-Projekt für die Unmanaged-Erkennung **und** die
 Self-Update-Erkennung, default `dockops`) und `DOCKOPS_SELF_UPDATE`
-(Default an; nur die exakte Angabe `off` deaktiviert den Helper-Pfad, siehe
-„Self-Update“).
+(Default an; nur die exakte Angabe `off` deaktiviert beide Helper-Pfade, siehe
+„Self-Update“ und „Deploy-Handover“), `DOCKOPS_SELF_IMAGE` (Image, aus dem der
+Phase-13-Helper startet; leer ⇒ `docker inspect` auf den eigenen Container).
 `DOCKOPS_HOST_CHECKOUT` füllt ein leeres `global.host_checkout` (YAML
 gewinnt; `-print-status` und `/status` folgen der Variable auch ohne
 Config, siehe „Konfigurierbare Checkout-Pfade“).
 
 `-selfupdate-helper` und `-selfupdate-plan` sind ausschließlich für den
-internen Helper-Container gedacht (Phase 12, siehe „Self-Update“): sie werden
-vom Agent selbst gesetzt, brauchen kein `-repo` und schalten Reconciler und
-HTTP-Server ab.
+internen Helper-Container gedacht (Phase 12 und 13, siehe „Self-Update“ und
+„Deploy-Handover“): sie werden vom Agent selbst gesetzt, brauchen kein `-repo`
+und schalten Reconciler und HTTP-Server ab. Der Helper führt je nach
+`plan.kind` entweder den Image-Move (Health-Gate, Rollback) oder den
+Deploy (`compose up`, kein Gate) aus.
 
 **Betriebsmodi**: Ohne `-once` läuft dockops als Daemon — sofortiger erster
 Durchlauf, danach Poll-Timer (`-interval` überschreibt

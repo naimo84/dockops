@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -45,6 +46,7 @@ const (
 	envLogsToken      = "DOCKOPS_LOGS_TOKEN"
 	envSelfProject    = "DOCKOPS_SELF_PROJECT"
 	envSelfUpdate     = "DOCKOPS_SELF_UPDATE"
+	envSelfImage      = "DOCKOPS_SELF_IMAGE"
 )
 
 // Defaults for the flags and the poll loop.
@@ -310,6 +312,7 @@ func run(opts options, logger *slog.Logger) error {
 		SopsSidecarURL: opts.SopsSidecarURL,
 		SelfProject:    selfProject(),
 		SelfUpdate:     selfUpdateEnabled(os.Getenv),
+		SelfImage:      selfImage(os.Getenv, logger),
 		OnConfigLoaded: func(cfg *config.Config) {
 			intervals.set(time.Duration(cfg.Global.PollInterval))
 		},
@@ -341,6 +344,43 @@ func selfProject() string {
 		return p
 	}
 	return defaultSelfProject
+}
+
+// selfImage returns the image a phase-13 deploy helper runs. A deploy plan
+// has no target image, so the helper must start the build the agent itself
+// runs:
+//
+//   - DOCKOPS_SELF_IMAGE wins when set (the override for hosts where docker
+//     reports an unusable reference, e.g. a locally built image without a
+//     tag);
+//   - otherwise docker answers for the agent's own container
+//     (`docker inspect <container> --format '{{.Config.Image}}'`), which is
+//     exactly the image this process was created from.
+//
+// The lookup happens once at startup, not per pass: it needs the daemon, and
+// a per-pass shell-out would only add latency to a value that cannot change
+// while the container lives. Failing (no docker, no container) is not fatal at
+// startup — it is reported once, and a self-stack deploy then keeps the
+// in-process recreate with a warning (see deployStack): a helper with a
+// guessed image would deploy a build this agent does not run.
+func selfImage(getenv func(string) string, logger *slog.Logger) string {
+	if v := strings.TrimSpace(getenv(envSelfImage)); v != "" {
+		return v
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		logger.Warn("self image: cannot determine the agent's container", "error", err, "hint", "set "+envSelfImage)
+		return ""
+	}
+	// helperDockerBinary is the same "docker" the helper's own commands use
+	// (selfupdate.go); one string, one CLI.
+	out, err := exec.Command(helperDockerBinary, "inspect", "--format", "{{.Config.Image}}", host).Output()
+	if err != nil {
+		logger.Warn("self image: docker does not know the agent's image; self-stack deploys stay in-process",
+			"container", host, "error", err, "hint", "set "+envSelfImage)
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // selfUpdateEnabled reports whether the phase-12 self-update path is active:

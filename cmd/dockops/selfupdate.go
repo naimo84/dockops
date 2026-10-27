@@ -7,6 +7,12 @@
 // file; everything it decides is in the result file and the append-only log
 // next to it, because after a failed recreate the helper is the only
 // diagnosis source left.
+//
+// Two plan kinds share this mode (phase 13): an image move (kind empty,
+// phase 12: targeted up with --no-deps, health gate, rollback) and a full
+// deploy (kind=deploy: a normal up, no gate, no rollback). The arguments of
+// both come from internal/compose, so the helper cannot drift away from what
+// the agent would have run in-process.
 package main
 
 import (
@@ -21,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/local/dockops/internal/compose"
 	"github.com/local/dockops/internal/selfupdate"
 )
 
@@ -103,13 +110,19 @@ func openHelperLog(path string) (*os.File, error) {
 // the result — a failed update is a *result*, not a process error, so the
 // agent's finalization can read it.
 func (h *helper) runPlan(ctx context.Context) error {
-	h.logf("helper started: project=%s stack_dir=%s services=%v targets=%d",
-		h.plan.Project, h.plan.StackDir, h.plan.Services, len(h.plan.Targets))
+	h.logf("helper started: project=%s kind=%s stack_dir=%s services=%v targets=%d",
+		h.plan.Project, h.plan.Kind, h.plan.StackDir, h.plan.Services, len(h.plan.Targets))
 
 	// The grace period lets the agent finish its pass (state save, log) and
 	// stop writing before its container disappears.
 	if err := h.sleep(ctx, time.Duration(h.plan.GraceSeconds)*time.Second); err != nil {
 		return err
+	}
+
+	// Phase 13: a deploy is the other kind of recreate — same hand-over, no
+	// health gate, no rollback (there is no previous digest to return to).
+	if h.plan.Kind == selfupdate.KindDeploy {
+		return h.runDeploy(ctx)
 	}
 
 	res := selfupdate.Result{Version: selfupdate.Version, At: h.now().UTC()}
@@ -127,6 +140,62 @@ func (h *helper) runPlan(ctx context.Context) error {
 		h.logf("health gate passed: status=%s digest=%s", res.Status, res.Digest)
 	}
 
+	return h.writeResult(res)
+}
+
+// runDeploy executes a phase-13 deploy plan: one normal compose up of the
+// stack, exactly the command line compose.Up would have run in-process
+// (profiles, env file, positional services, dependencies resolved — no
+// --no-deps), and a result that reports ok or failed.
+//
+// Deliberately no health gate and no rollback: the in-process deploy has no
+// gate either (parity), and a deploy has no previous digest to roll back to —
+// a broken compose file would fail the rollback with the same error that
+// broke the up.
+func (h *helper) runDeploy(ctx context.Context) error {
+	res := selfupdate.Result{
+		Version:    selfupdate.Version,
+		Kind:       selfupdate.KindDeploy,
+		DeployHash: h.plan.DeployHash,
+		At:         h.now().UTC(),
+	}
+	args, err := deployUpArgs(h.plan)
+	if err == nil {
+		h.logf("running: %s %s", helperDockerBinary, strings.Join(args, " "))
+		var out []byte
+		out, err = h.exec(ctx, args)
+		if err == nil {
+			if text := strings.TrimSpace(string(out)); text != "" {
+				h.logf("compose output: %s", text)
+			}
+		}
+	}
+	if err != nil {
+		res.Status = selfupdate.StatusFailed
+		res.Error = err.Error()
+		h.logf("deploy failed: %v", err)
+	} else {
+		res.Status = selfupdate.StatusOK
+		h.logf("deploy finished: status=%s hash=%s", res.Status, res.DeployHash)
+	}
+	return h.writeResult(res)
+}
+
+// deployUpArgs builds the deploy command line through internal/compose: the
+// plan is a compose.Request plus profiles, env file and services, so the
+// helper runs the same flag set as the agent's own Up instead of a second,
+// slowly drifting copy of it.
+func deployUpArgs(p selfupdate.Plan) ([]string, error) {
+	return compose.UpArgs(compose.Request{
+		Project:      p.Project,
+		StackDir:     p.StackDir,
+		ComposeFiles: p.ComposeFiles,
+	}, p.Profiles, p.EnvFile, false, p.Services)
+}
+
+// writeResult persists the helper's verdict and reports a write failure as a
+// process error (the agent's finalization can only read what exists).
+func (h *helper) writeResult(res selfupdate.Result) error {
 	resultPath := selfupdate.ResultPath(h.stateDir)
 	if err := selfupdate.WriteAtomic(resultPath, res); err != nil {
 		h.logf("cannot write result: %v", err)

@@ -80,6 +80,16 @@ func (r *Reconciler) applyUpdates(ctx context.Context, stack config.Stack, pn *p
 			"stack", stack.Name, "status", st.Status, "found", ok)
 		return nil
 	}
+	if st.DeployPendingHash != "" {
+		// Phase 13: a deploy of this stack is in flight. The helper the
+		// previous pass started owns the stack — a targeted image recreate
+		// on top of it would start a second helper and fight the first one
+		// for the same containers. The deploy's own result decides; the
+		// image update is retried on a later pass.
+		r.logger.Debug("image update apply: deploy in flight, skipping",
+			"stack", stack.Name, "hash", st.DeployPendingHash)
+		return nil
+	}
 	recs := copyImageRecords(st.Images)
 	cands := r.applyCandidates(stack.Name, recs)
 	if len(cands) == 0 {

@@ -69,6 +69,13 @@ const (
 	// produced it.
 	RollbackFailedTag = "rollback FAILED"
 
+	// KindDeploy marks a plan (and with it a result) that is a full stack
+	// deploy instead of an image move. The empty kind means "images", the
+	// phase-12 behaviour — the two-valued enum is the migration rule of the
+	// schema, so there is deliberately no "images" literal: nothing writes
+	// it, and a third value would have no producer to keep honest.
+	KindDeploy = "deploy"
+
 	// DockerSocket is the daemon socket the helper inherits from the agent
 	// via --volumes-from: docker compose inside the helper talks to the host
 	// daemon exactly like the agent, with the same rights.
@@ -91,6 +98,12 @@ const (
 	StatusRolledBack = "rolled_back"
 	// StatusRollbackFailed means both digests are in doubt.
 	StatusRollbackFailed = "rollback_failed"
+	// StatusFailed means the helper's command failed outright. It is only
+	// produced by deploy plans (phase 13): a deploy has no digest to roll
+	// back to, so there is nothing to call "rolled_back". For an image plan
+	// the status stays invalid on purpose — a failed image move that is not
+	// a rollback would be a bug the finalization must not guess at.
+	StatusFailed = "failed"
 )
 
 // Plan is the JSON document the agent writes before it starts the helper.
@@ -133,6 +146,20 @@ type Plan struct {
 	// fills repository and previous digest so the helper can render its
 	// rollback override without asking a registry or the state file.
 	Targets []Target `json:"targets"`
+
+	// Kind selects what the helper does: empty (or "images") means the
+	// phase-12 image move, KindDeploy a full stack deploy (phase 13). The
+	// field is additive and omitempty because the version stays 1: the OLD
+	// image writes the plan, the NEW image executes it — a version bump
+	// would reject exactly that hand-over.
+	Kind string `json:"kind,omitempty"`
+	// Profiles are the stack's compose profiles (--profile, in configured
+	// order). A deploy without them silently omits profile services, which
+	// the in-process up would have started.
+	Profiles []string `json:"profiles,omitempty"`
+	// DeployHash is the stack hash the deploy installs; the finalization
+	// books it as the deployed hash. Set for kind=deploy only.
+	DeployHash string `json:"deploy_hash,omitempty"`
 }
 
 // Target is one image of the plan: what to install, where it came from, and
@@ -169,8 +196,17 @@ type Result struct {
 	// rollback is tolerated: the agent then falls back to its recorded
 	// ApplyPendingDigest.
 	Digest string `json:"digest,omitempty"`
-	// Error is the failure text of a rolled_back / rollback_failed run.
+	// Error is the failure text of a rolled_back / rollback_failed / failed
+	// run.
 	Error string `json:"error,omitempty"`
+	// Kind echoes the plan's kind (KindDeploy for a deploy plan, empty for
+	// an image move). Additive and optional: a phase-12 result has no kind,
+	// and the finalization must know which bookkeeping applies without
+	// re-reading a plan that may already be overwritten.
+	Kind string `json:"kind,omitempty"`
+	// DeployHash echoes the plan's deploy hash, so the deploy bookkeeping
+	// can cross-check what it finds in the state.
+	DeployHash string `json:"deploy_hash,omitempty"`
 	// At is the UTC time the helper wrote its verdict.
 	At time.Time `json:"at"`
 }
@@ -300,7 +336,7 @@ func ReadResult(path string) (Result, error) {
 		return r, fmt.Errorf("selfupdate: result %s: unsupported version %d (want %d)", path, r.Version, Version)
 	}
 	switch r.Status {
-	case StatusOK, StatusRolledBack, StatusRollbackFailed:
+	case StatusOK, StatusRolledBack, StatusRollbackFailed, StatusFailed:
 	default:
 		return r, fmt.Errorf("selfupdate: result %s: unknown status %q", path, r.Status)
 	}
@@ -329,9 +365,15 @@ func (p Plan) Validate() error {
 			return fmt.Errorf("compose_files[%d] must not be empty", i)
 		}
 	}
-	if len(p.Services) == 0 {
-		return errors.New("services must not be empty")
+	for i, profile := range p.Profiles {
+		if strings.TrimSpace(profile) == "" {
+			return fmt.Errorf("profiles[%d] must not be empty", i)
+		}
 	}
+	// The service list is validated in both kinds, but only a deploy may
+	// leave it empty: "all services" is a legitimate deploy (compose up
+	// without positional arguments), while an image plan without services
+	// would recreate nothing.
 	for i, s := range p.Services {
 		if strings.TrimSpace(s) == "" {
 			return fmt.Errorf("services[%d] must not be empty", i)
@@ -340,25 +382,49 @@ func (p Plan) Validate() error {
 	if p.GraceSeconds < 0 {
 		return fmt.Errorf("grace_seconds must not be negative (got %d)", p.GraceSeconds)
 	}
+	// The health fields stay required for both kinds: the deploy branch
+	// ignores them, but a plan that carries no deadlines would be a schema
+	// change dressed up as a convenience (and the wait window of the deploy
+	// finalization is derived from them).
 	if p.HealthTimeoutSeconds <= 0 {
 		return fmt.Errorf("health_timeout_seconds must be > 0 (got %d)", p.HealthTimeoutSeconds)
 	}
 	if p.HealthPollSeconds <= 0 {
 		return fmt.Errorf("health_poll_seconds must be > 0 (got %d)", p.HealthPollSeconds)
 	}
-	if len(p.Targets) == 0 {
-		return errors.New("targets must not be empty")
-	}
-	for i, t := range p.Targets {
-		if strings.TrimSpace(t.Service) == "" {
-			return fmt.Errorf("targets[%d].service must not be empty", i)
+	switch p.Kind {
+	case "":
+		// Phase 12: an image move needs its targets and the services they
+		// live in.
+		if len(p.Services) == 0 {
+			return errors.New("services must not be empty")
 		}
-		if strings.TrimSpace(t.Repository) == "" {
-			return fmt.Errorf("targets[%d].repository must not be empty", i)
+		if len(p.Targets) == 0 {
+			return errors.New("targets must not be empty")
 		}
-		if strings.TrimSpace(t.Digest) == "" {
-			return fmt.Errorf("targets[%d].digest must not be empty", i)
+		for i, t := range p.Targets {
+			if strings.TrimSpace(t.Service) == "" {
+				return fmt.Errorf("targets[%d].service must not be empty", i)
+			}
+			if strings.TrimSpace(t.Repository) == "" {
+				return fmt.Errorf("targets[%d].repository must not be empty", i)
+			}
+			if strings.TrimSpace(t.Digest) == "" {
+				return fmt.Errorf("targets[%d].digest must not be empty", i)
+			}
 		}
+	case KindDeploy:
+		// Phase 13: a deploy has no rollback digest, so targets must be
+		// empty; the hash it installs is what makes the deploy bookkeeping
+		// possible and must be there.
+		if len(p.Targets) != 0 {
+			return fmt.Errorf("targets must be empty for kind %q (got %d)", KindDeploy, len(p.Targets))
+		}
+		if strings.TrimSpace(p.DeployHash) == "" {
+			return fmt.Errorf("deploy_hash must not be empty for kind %q", KindDeploy)
+		}
+	default:
+		return fmt.Errorf("unknown kind %q (want %q or empty)", p.Kind, KindDeploy)
 	}
 	return nil
 }
