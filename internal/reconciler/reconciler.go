@@ -37,6 +37,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/local/dockops/internal/compose"
@@ -125,6 +126,17 @@ type ComposeExecutor interface {
 	PsProject(ctx context.Context, project string) ([]compose.Container, error)
 }
 
+// Restarter restarts the containers of an already deployed stack
+// (compose.Executor.Restart). It is deliberately not part of
+// ComposeExecutor: that interface is what a reconcile pass needs, while the
+// restart is an operator path (POST /restart) no pass ever touches — the test
+// doubles of the pass must not grow a method for it.
+type Restarter interface {
+	// Restart runs `docker compose restart` for the stack: no pull, no up,
+	// no state or hash change (compose.Executor.Restart).
+	Restart(ctx context.Context, stack config.Stack, stackDir, envFile string) error
+}
+
 // HookRunner is the subset of hooks.Engine the reconciler needs.
 type HookRunner interface {
 	// Run executes commands sequentially via sh -c (hooks.Engine.Run).
@@ -154,6 +166,7 @@ type VaultFactory func(cfg config.Vault, logger *slog.Logger) (VaultClient, erro
 var (
 	_ GitManager       = (*git.Manager)(nil)
 	_ ComposeExecutor  = (*compose.Executor)(nil)
+	_ Restarter        = (*compose.Executor)(nil)
 	_ HookRunner       = (*hooks.Engine)(nil)
 	_ VaultClient      = (*vault.Client)(nil)
 	_ secrets.Resolver = (*stackResolver)(nil)
@@ -191,6 +204,11 @@ type Deps struct {
 
 	// Compose, nil → compose.Executor with the default binary.
 	Compose ComposeExecutor
+
+	// Restarter runs the compose restarts of POST /restart; nil → the
+	// Compose executor when it implements Restart (the real one does), so
+	// the CLI needs no extra wiring. Tests inject a recording fake here.
+	Restarter Restarter
 
 	// Hooks, nil → hooks.Engine.
 	Hooks HookRunner
@@ -312,6 +330,10 @@ type Reconciler struct {
 	sops     SopsDecryptFunc
 	newVault VaultFactory
 
+	// restarter serves POST /restart (Deps.Restarter, or the compose
+	// executor). Nil when the injected Compose double cannot restart.
+	restarter Restarter
+
 	// Notification collaborators: an injected notifier wins (injected
 	// records that fact), otherwise the notifier is built lazily from the
 	// first pass that carries a notifications block and rebuilt whenever
@@ -370,6 +392,16 @@ type Reconciler struct {
 	// it per pass; nil derives the options from the pass's configuration —
 	// see Reconcile.
 	envFileOptions *env.Options
+
+	// stacks are the stack definitions of the last successfully loaded
+	// configuration — the set POST /restart works from (see restart.go).
+	// Cached instead of re-loaded per request: the root configuration is
+	// only readable after the git bootstrap of a pass, and a restart must
+	// not run checkouts. stacksMu guards the field because the HTTP server
+	// serving /restart runs in its own goroutine while a pass replaces the
+	// set.
+	stacks   []config.Stack
+	stacksMu sync.RWMutex
 }
 
 // New returns a Reconciler for deps, applying the defaults documented on
@@ -432,6 +464,15 @@ func New(deps Deps) *Reconciler {
 			selfContainer = host
 		}
 	}
+	// The restart endpoint reuses the compose executor unless a separate
+	// restarter is injected; a pass-only fake simply has no Restart, and
+	// POST /restart then answers 500 instead of silently doing nothing.
+	restarter := deps.Restarter
+	if restarter == nil {
+		if rr, ok := composeExec.(Restarter); ok {
+			restarter = rr
+		}
+	}
 	return &Reconciler{
 		repoURL:       deps.RepoURL,
 		branch:        deps.Branch,
@@ -441,6 +482,7 @@ func New(deps Deps) *Reconciler {
 		onConfig:      deps.OnConfigLoaded,
 		git:           deps.Git,
 		compose:       composeExec,
+		restarter:     restarter,
 		hooks:         hookRunner,
 		sops:          sopsFn,
 		newVault:      vaultFactory,
@@ -595,6 +637,10 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		errs = append(errs, err)
 		return errors.Join(errs...)
 	}
+	// POST /restart acts on exactly this set: the freshly loaded stacks are
+	// cached so the endpoint needs neither git nor a second configuration
+	// load (see Restart).
+	r.storeStacks(cfg.Stacks)
 	if r.onConfig != nil {
 		r.onConfig(cfg)
 	}

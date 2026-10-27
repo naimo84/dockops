@@ -1,16 +1,21 @@
 // Package webhook exposes the HTTP surface of a dockops agent: an
-// authenticated POST /webhook that triggers a reconcile pass, a GET
-// /healthz liveness probe and a GET /status monitoring endpoint that
-// compares the desired state (state.json) against the running containers
-// (see status.go) and the token-guarded log API /logs* (see logs.go):
-// container inventory, bounded snapshots and live tails.
+// authenticated POST /webhook that triggers a reconcile pass, an equally
+// authenticated POST /restart that restarts stacks without touching the
+// deployment state (see restart.go), a GET /healthz liveness probe and a GET
+// /status monitoring endpoint that compares the desired state (state.json)
+// against the running containers (see status.go) and the token-guarded log
+// API /logs* (see logs.go): container inventory, bounded snapshots and live
+// tails.
 //
-// Webhook authentication understands both common flavors — GitHub
+// Webhook authentication understands the common flavors — GitHub
 // (X-Hub-Signature-256: "sha256=<hex>" HMAC-SHA256 over the raw request
-// body) and GitLab (X-Gitlab-Token: plain shared secret). When a secret is
-// configured, at least one of the two must match, otherwise the request is
-// rejected with 401. Both comparisons run in constant time. /status is
-// optionally guarded by its own Bearer token (Deps.Token).
+// body), Gitea (X-Gitea-Signature: the identical HMAC under a different
+// header name) and GitLab (X-Gitlab-Token: plain shared secret). When a
+// secret is configured, at least one of them must match, otherwise the
+// request is rejected with 401. All comparisons run in constant time and
+// never leak header values into the logs. /restart uses exactly the same
+// authentication. /status is optionally guarded by its own Bearer token
+// (Deps.Token).
 package webhook
 
 import (
@@ -38,8 +43,13 @@ const maxBody = 1 << 20 // 1 MiB
 const (
 	// githubSignatureHeader carries the GitHub HMAC as "sha256=<hex>".
 	githubSignatureHeader = "X-Hub-Signature-256"
-	// githubSignaturePrefix separates the algorithm from the hex digest.
-	githubSignaturePrefix = "sha256="
+	// giteaSignatureHeader carries the Gitea HMAC as "sha256=<hex>".
+	// Gitea schickt denselben HMAC wie GitHub, nur unter anderem
+	// Header-Namen — derselbe Verifier (matchHMAC) deckt beide ab.
+	giteaSignatureHeader = "X-Gitea-Signature"
+	// signaturePrefix separates the algorithm from the hex digest; GitHub
+	// and Gitea use the identical scheme.
+	signaturePrefix = "sha256="
 	// gitlabTokenHeader carries the GitLab shared secret in plain text.
 	gitlabTokenHeader = "X-Gitlab-Token"
 )
@@ -75,6 +85,14 @@ type Deps struct {
 	// a non-blocking channel send that merges concurrent requests into one
 	// pending reconcile).
 	Trigger func()
+
+	// Restart serves POST /restart (see restart.go). An empty selection
+	// means every configured stack; names the configuration does not know
+	// come back as unknown and nothing is restarted (the handler answers
+	// 400). Per-stack errors are reported in failed — one failing stack is
+	// not a failed request. The error return is reserved for requests that
+	// cannot be served at all (500). Nil disables the endpoint with 503.
+	Restart RestartFunc
 
 	// Logger; nil falls back to slog.Default().
 	Logger *slog.Logger
@@ -120,11 +138,13 @@ type Deps struct {
 	Token string
 }
 
-// Handler serves POST /webhook, GET /healthz and GET /status. It is a plain
-// http.Handler, so it composes with any router or middleware.
+// Handler serves POST /webhook, POST /restart, GET /healthz and GET /status.
+// It is a plain http.Handler, so it composes with any router or middleware.
 type Handler struct {
 	secret  string
 	trigger func()
+	// restart serves POST /restart (Deps.Restart); nil → 503.
+	restart RestartFunc
 	logger  *slog.Logger
 	// status feeds BuildStatus for GET /status (Logger pinned to the
 	// handler's logger).
@@ -149,6 +169,7 @@ func New(deps Deps) *Handler {
 	return &Handler{
 		secret:  deps.Secret,
 		trigger: deps.Trigger,
+		restart: deps.Restart,
 		logger:  logger,
 		status: StatusDeps{
 			State:       deps.State,
@@ -167,7 +188,7 @@ func New(deps Deps) *Handler {
 }
 
 // ServeHTTP implements http.Handler. Unknown paths answer 404; /webhook,
-// /healthz and /status answer 405 for other methods.
+// /restart, /healthz and /status answer 405 for other methods.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/healthz":
@@ -185,6 +206,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleWebhook(w, r)
+	case "/restart":
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handleRestart(w, r)
 	case "/status":
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -219,12 +247,7 @@ func (h *Handler) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.authorized(r, body) {
-		// Which headers were present, not their values — secrets must not
-		// leak into logs.
-		h.logger.Warn("webhook rejected: authentication failed",
-			"remote", r.RemoteAddr,
-			"github_header", r.Header.Get(githubSignatureHeader) != "",
-			"gitlab_header", r.Header.Get(gitlabTokenHeader) != "")
+		h.logAuthenticationFailure(r)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -243,19 +266,36 @@ func (h *Handler) authorized(r *http.Request, body []byte) bool {
 	if h.secret == "" {
 		return true
 	}
-	return h.matchGitHub(r, body) || h.matchGitLab(r)
+	// GitHub und Gitea nutzen dasselbe HMAC-Verfahren unter unterschiedlichen
+	// Header-Namen; ein Verifier deckt beide ab. GitLab bleibt der
+	// Klartext-Token-Vergleich.
+	return h.matchHMAC(r, body, githubSignatureHeader) ||
+		h.matchHMAC(r, body, giteaSignatureHeader) ||
+		h.matchGitLab(r)
 }
 
-// matchGitHub verifies X-Hub-Signature-256: the header value after the
-// "sha256=" prefix must be the hex-encoded HMAC-SHA256 of the body under
-// the secret. hmac.Equal compares in constant time; wrong-length digests
-// fail without leaking which bytes differ.
-func (h *Handler) matchGitHub(r *http.Request, body []byte) bool {
-	header := r.Header.Get(githubSignatureHeader)
-	if !strings.HasPrefix(header, githubSignaturePrefix) {
+// logAuthenticationFailure logs which authentication headers were present —
+// never their values, secrets must not leak into logs — for one rejected
+// request.
+func (h *Handler) logAuthenticationFailure(r *http.Request) {
+	h.logger.Warn("request rejected: authentication failed",
+		"remote", r.RemoteAddr,
+		"github_header", r.Header.Get(githubSignatureHeader) != "",
+		"gitea_header", r.Header.Get(giteaSignatureHeader) != "",
+		"gitlab_header", r.Header.Get(gitlabTokenHeader) != "")
+}
+
+// matchHMAC verifies an HMAC signature header (GitHub's
+// X-Hub-Signature-256 and Gitea's X-Gitea-Signature are the same scheme):
+// the header value after the "sha256=" prefix must be the hex-encoded
+// HMAC-SHA256 of the body under the secret. hmac.Equal compares in constant
+// time; wrong-length digests fail without leaking which bytes differ.
+func (h *Handler) matchHMAC(r *http.Request, body []byte, headerName string) bool {
+	header := r.Header.Get(headerName)
+	if !strings.HasPrefix(header, signaturePrefix) {
 		return false
 	}
-	got, err := hex.DecodeString(strings.TrimPrefix(header, githubSignaturePrefix))
+	got, err := hex.DecodeString(strings.TrimPrefix(header, signaturePrefix))
 	if err != nil {
 		return false
 	}

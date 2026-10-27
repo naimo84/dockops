@@ -1073,7 +1073,7 @@ Wer ihn in alten Runbooks findet: nicht mehr anwenden.
 | `-repo` | `DOCKOPS_REPO_URL` | — (Pflicht, außer bei `-print-status`) | URL des Host-Repos (HTTPS/SSH/lokal) |
 | `-branch` | `DOCKOPS_BRANCH` | `main` | Branch des Host-Repos |
 | `-state` | — | `/var/lib/dockops/state.json` | Pfad der JSON-State-Datei |
-| `-webhook-secret` | `DOCKOPS_WEBHOOK_SECRET` | leer | Shared Secret für `POST /webhook`; leer ⇒ Webhooks ohne Auth (Warnung im Log) |
+| `-webhook-secret` | `DOCKOPS_WEBHOOK_SECRET` | leer | Shared Secret für `POST /webhook` und `POST /restart`; leer ⇒ beide Endpunkte ohne Auth (Warnung im Log) |
 | `-addr` | — | `:8080` | Listen-Adresse des Webhook-Servers |
 | `-sops-sidecar` | `DOCKOPS_SOPS_SIDECAR_URL` | leer | URL des SOPS-Sidecar (z. B. `http://sops-sidecar:8081`); leer ⇒ lokales `sops -d` |
 | `-interval` | — | `global.poll_interval` (Default 5m) | Poll-Intervall-Override, z. B. `90s` |
@@ -1112,11 +1112,38 @@ anderen Modi.
 **HTTP-Endpunkte**:
 
 - `POST /webhook` — authentifiziert via GitHub
-  (`X-Hub-Signature-256: sha256=<hex>` HMAC-SHA256 über den Body) **oder**
-  GitLab (`X-Gitlab-Token`), beides in konstanter Zeit verglichen:
+  (`X-Hub-Signature-256: sha256=<hex>` HMAC-SHA256 über den Body), Gitea
+  (`X-Gitea-Signature` — derselbe HMAC-SHA256 über den Body, nur unter
+  anderem Header-Namen) **oder** GitLab (`X-Gitlab-Token`); alle Vergleiche
+  in konstanter Zeit:
 
       curl -X POST http://localhost:8080/webhook \
         -H "X-Gitlab-Token: $DOCKOPS_WEBHOOK_SECRET"
+
+- `POST /restart` — startet Stacks neu (`docker compose restart`), ohne zu
+  deployen: kein `pull`, kein `up`, keine Änderung an Hash oder
+  `state.json`. Authentifizierung wie `/webhook`. Der Body ist optional;
+  ohne Body (oder mit leerem `stacks`-Array) werden **alle** Stacks der
+  Host-Konfiguration neu gestartet:
+
+      # alle Stacks
+      curl -X POST http://localhost:8080/restart \
+        -H "X-Gitlab-Token: $DOCKOPS_WEBHOOK_SECRET"
+
+      # nur ausgewählte Stacks
+      curl -X POST http://localhost:8080/restart \
+        -H "X-Gitlab-Token: $DOCKOPS_WEBHOOK_SECRET" \
+        -H "Content-Type: application/json" \
+        -d '{"stacks":["web","db"]}'
+
+  Die Antwort ist **200**, solange der Request bedienbar war — ein Fehler
+  bei einem Stack landet in `failed` und stoppt die übrigen nicht:
+
+      {"restarted":["web"],"failed":[{"stack":"db","error":"docker compose ..."}]}
+
+  Unbekannte Stack-Namen lehnen den ganzen Request mit **400** ab (dann
+  wird nichts neu gestartet), eine falsche Methode mit **405**, fehlende
+  Authentifizierung mit **401**.
 
 - `GET /healthz` — Liveness.
 
