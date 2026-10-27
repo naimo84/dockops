@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +27,16 @@ const DefaultWorkDir = "/var/lib/dockops/repos"
 // (cmd/dockops -print-status) follows the same variable without loading a
 // configuration.
 const EnvHostCheckout = "DOCKOPS_HOST_CHECKOUT"
+
+// EnvFileMode and EnvFileGroup are the environment fallbacks for
+// global.env_file.mode and global.env_file.group: an explicit YAML value
+// wins, the variable fills only a missing field (same precedence as
+// EnvHostCheckout). They exist for hosts whose stacks.yaml should not be
+// touched.
+const (
+	EnvFileMode  = "DOCKOPS_ENV_FILE_MODE"
+	EnvFileGroup = "DOCKOPS_ENV_FILE_GROUP"
+)
 
 // Smart defaults applied when the corresponding field is unset in stacks.yaml.
 const (
@@ -229,6 +240,24 @@ func applyRootDefaults(root *Root) {
 	if g.HostCheckout == "" {
 		g.HostCheckout = os.Getenv(EnvHostCheckout)
 	}
+	// Phase 14: permissions of the generated <stackDir>/.env. Same
+	// precedence again — the YAML block wins over DOCKOPS_ENV_FILE_MODE and
+	// DOCKOPS_ENV_FILE_GROUP, the variables only fill a gap. The mode
+	// defaults to 0600 (the historical artefact) and the group stays empty,
+	// which means "leave the group alone"; an empty mode string is never a
+	// default here, it is a configuration error (see validateRoot).
+	if g.EnvFile.Mode == nil {
+		if v := os.Getenv(EnvFileMode); v != "" {
+			g.EnvFile.Mode = &v
+		}
+	}
+	if g.EnvFile.Mode == nil {
+		d := fmt.Sprintf("%04o", DefaultEnvFileMode)
+		g.EnvFile.Mode = &d
+	}
+	if g.EnvFile.Group == "" {
+		g.EnvFile.Group = os.Getenv(EnvFileGroup)
+	}
 	// Map iteration is nondeterministic, but this loop only mutates in place.
 	for name, rem := range root.Remotes {
 		if rem.Branch == "" {
@@ -247,6 +276,11 @@ func validateRoot(root *Root, file string) error {
 	}
 	if err := validateCheckoutPath(root.Global.HostCheckout); err != nil {
 		return fmt.Errorf("%s: global.host_checkout: %w", file, err)
+	}
+	if root.Global.EnvFile.Mode != nil {
+		if _, err := ParseEnvFileMode(*root.Global.EnvFile.Mode); err != nil {
+			return fmt.Errorf("%s: global.env_file.mode: %w", file, err)
+		}
 	}
 	if root.Global.EffectiveUpdateCheckInterval() < 0 {
 		// 0 is the documented "off" switch; a negative interval is a
@@ -276,6 +310,35 @@ func validateRoot(root *Root, file string) error {
 		}
 	}
 	return nil
+}
+
+// ParseEnvFileMode parses an octal permission literal such as "0640" or
+// "640" (the leading zero is optional) into permission bits. The world-
+// readable bit is rejected: the generated <stackDir>/.env carries the merged
+// stack environment including its secrets, and a world-readable artefact is
+// exactly the mistake phase 14 removes — a clear configuration error at load
+// time beats a silent downgrade to a wider mode. Setuid, setgid and sticky
+// bits are rejected too (they mean nothing for a dotenv file and only invite
+// mistakes), and so is a mode without owner read access: the file exists to
+// be read by its owner.
+func ParseEnvFileMode(raw string) (os.FileMode, error) {
+	if raw == "" {
+		return 0, errors.New(`must not be empty (want an octal permission like "0640")`)
+	}
+	bits, err := strconv.ParseUint(raw, 8, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid octal permission %q (want e.g. \"0640\")", raw)
+	}
+	if bits&^uint64(0o777) != 0 {
+		return 0, fmt.Errorf("mode %q: setuid, setgid and sticky bits are not allowed", raw)
+	}
+	if bits&0o004 != 0 {
+		return 0, fmt.Errorf("mode %q is world-readable, but the file carries the merged stack secrets", raw)
+	}
+	if bits&0o400 == 0 {
+		return 0, fmt.Errorf("mode %q: the owner must be able to read the file", raw)
+	}
+	return os.FileMode(bits), nil
 }
 
 // sortedRemoteNames returns the remote names in deterministic order so that

@@ -67,6 +67,12 @@ global:
   # Stacks, die aus der Config verschwinden, mit `compose down` entfernen
   # (Default: false — nie ohne explizites Opt-in löschen)
   prune_removed_stacks: true
+  # Rechte der generierten <stackDir>/.env: Mode und Gruppe
+  # (Default: "0600" und die Gruppe des Agenten; group leer = nicht anfassen)
+  # — siehe „Wer darf host-seitig deployen“.
+  # env_file:
+  #   mode: "0640"
+  #   group: docker
   # Welche Dateien als lokale Stack-Definitionen entdeckt werden
   # (Defaults)
   include:
@@ -361,7 +367,10 @@ Das Ergebnis geht als `--env-file` an `docker compose` (Interpolation in
 der Compose-Datei) und als Umgebung an Hooks. Die Datei liegt in
 `/dev/shm` (Tmpfs) mit `0600`, wird nach dem Stack-Durchlauf mit Zufallsbytes
 überschrieben und gelöscht; Secrets erscheinen nie in Logs oder
-Fehlermeldungen.
+Fehlermeldungen. Die zusätzlich generierte `<stackDir>/.env` trägt dieselben
+Variablen und ist ebenfalls `0600` — Mode und Gruppe sind über
+`global.env_file` konfigurierbar (siehe
+[Wer darf host-seitig deployen](#wer-darf-host-seitig-deployen-phase-14)).
 
 ## SOPS decryption
 
@@ -1002,6 +1011,56 @@ auch diesen Pfad ab.
 Nicht abgedeckt: der **Prune** des Self-Stacks (`compose down`) läuft weiter
 in-process. Der Agent stirbt dabei zwar, aber der Stack verschwindet sowieso;
 das State-Entry bleibt, und der nächste Pass wiederholt den Down.
+
+## Wer darf host-seitig deployen (Phase 14)
+
+Jeder Deploy schreibt `<stackDir>/.env` mit dem gemergten Environment —
+inklusive Secrets. Die Datei entsteht `0600` und gehört dem Benutzer des
+Agenten (auf der Fleet `1000:4001`). Der host-seitige Weg
+`deploy <stackdir> up` läuft dagegen als **anderer** Benutzer (`hermes`,
+uid 3200) und scheitert an genau dieser Datei:
+
+    open /var/lib/dockops/repos/infrastructure/dockops/.env: permission denied
+
+Damit ist der einzige host-seitige Rettungsweg — Bootstrap eines neuen Images
+und Rollback ohne laufenden Agenten — für den Betriebsbenutzer dicht. Mode und
+Gruppe der Datei sind deshalb host-global konfigurierbar:
+
+```yaml
+# stacks.yaml (Host-Repo, global)
+env_file:
+  mode: "0640"      # Default "0600" — unverändertes Verhalten
+  group: "docker"   # Name oder numerische gid; leer = Gruppe nicht anfassen
+```
+
+- Beides wird auf die **Temp-Datei vor dem Rename** angewendet, damit der
+  Zielname nie in einem Zwischenzustand existiert.
+- `0640` + Gruppe `docker` genügt auf der Fleet: der Ops-Benutzer ist
+  Mitglied von `docker` (er muss ohnehin an den Socket), und der Agent ist es
+  per `group_add` ebenfalls — nur so darf er `chgrp` ausführen.
+- Der Loader validiert hart: weltlesbare Modi (`0644`, `0604`),
+  Setuid/Setgid/Sticky-Bits, ein Modus ohne Leserecht für den Eigentümer sowie
+  leere oder nicht-oktale Werte sind Ladefehler mit Feld und Wert
+  (`global.env_file.mode`). Die Datei trägt Secrets — ein stilles Downgrade
+  auf einen weiteren Mode gibt es nicht.
+- Gruppe nicht auflösbar (Tippfehler, Host ohne diesen `/etc/group`-Eintrag)
+  oder `chgrp` verweigert (`EPERM`, der Agent ist kein Mitglied): **Warnung,
+  kein Abbruch**. Die Datei entsteht mit dem konfigurierten Mode und der
+  Gruppe des Agenten; die Warnung nennt Stack-Pfad, Gruppenwert und beide gids
+  und ist damit die Diagnose, warum der Ops-Benutzer später nicht lesen kann.
+- Env-Fallbacks `DOCKOPS_ENV_FILE_MODE` / `DOCKOPS_ENV_FILE_GROUP` füllen nur
+  eine Lücke — ein YAML-Wert gewinnt (wie bei `DOCKOPS_HOST_CHECKOUT`), für
+  Hosts, deren `stacks.yaml` nicht angefasst werden soll.
+- Bewusst nicht im Scope: Per-Stack-Override (das ist eine
+  Betriebs-Eigenschaft des Hosts, nicht des einzelnen Stacks — sonst müsste
+  jeder host-seitig deploybare Stack denselben Block wiederholen), ACLs statt
+  Gruppe, und die Rechte anderer Artefakte (`state.json`, Plan/Result/
+  Helper-Log bleiben `0600`, sie sind Agent-intern).
+
+Historische Notiz: Der frühere Workaround, die Datei einmalig per
+`chmod 644` (im Container oder auf dem Host) weltlesbar zu machen, ist damit
+**obsolet** — er macht Secrets weltlesbar und war schlimmer als das Problem.
+Wer ihn in alten Runbooks findet: nicht mehr anwenden.
 
 ## CLI
 

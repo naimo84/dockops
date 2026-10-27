@@ -173,7 +173,22 @@ Default/`pinned`/ungültig, `update_available` opt-in),
 Fälligkeit, genau ein Event pro neuem Digest, Registry-Fehler, lokal gebautes
 Image, `ignore_services`, degradierendes Compose-Config) und
 `internal/webhook/phase10_test.go` (`updates` aus dem State, fehlend ohne
-Records, unabhängig von ps-Fehlern).
+Records, unabhängig von ps-Fehlern). Phase 14: Ops-lesbares Stack-Env —
+`global.env_file` (`mode`/`group`; Default `"0600"` und leer = Gruppe nicht
+anfassen, also unverändertes Verhalten) steuert die Rechte der generierten
+`<stackDir>/.env`; harte Validierung im Loader (`config.ParseEnvFileMode`:
+weltlesbar, Setuid/Setgid/Sticky, Modus ohne Owner-Read, leer/nicht-oktal =
+Ladefehler mit Feld und Wert), Env-Fallbacks `DOCKOPS_ENV_FILE_MODE`/
+`DOCKOPS_ENV_FILE_GROUP` (YAML gewinnt, wie `host_checkout`);
+`env.WriteStackEnv(stackDir, env, env.Options)` setzt Mode (`chmod`) und
+Gruppe (`os.Chown`, numerische gid direkt, Name via `os/user.LookupGroup`,
+pure Go liest `/etc/group`) auf die Temp-Datei **vor** dem Rename — eine nicht
+auflösbare oder verweigerte Gruppe kostet nur eine WARN mit Pfad, Gruppenwert
+und beiden gids, nie den Deploy; Reconciler reicht `Deps.EnvFileOptions`
+(Pointer, den `cmd/dockops` in `OnConfigLoaded` aus `global.env_file` füllt,
+weil die Root-Config erst im Pass lesbar ist) an `WriteStackEnv` durch, ohne
+Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
+`internal/config/phase14_test.go`, `internal/reconciler/phase14_test.go`.
 
 ## Umgebung
 
@@ -208,7 +223,10 @@ Records, unabhängig von ps-Fehlern).
   (`notify`/`pinned`, bewusst nicht im Hash); Root-Block `registries`
   (Credentials mit `${VAR}`-Expansion, Pflichtfelder, doppelte Hosts
   abgelehnt); `global.update_check_interval` als `*Duration` (nil = 1h, `0` =
-  aus, `Global.EffectiveUpdateCheckInterval`);
+  aus, `Global.EffectiveUpdateCheckInterval`); `global.env_file` (`mode` als
+  `*string` — fehlend = Default `0600`, explizit leer = Fehler — und `group`,
+  harte Validierung `ParseEnvFileMode`, Env-Fallbacks
+  `DOCKOPS_ENV_FILE_MODE`/`_GROUP` mit YAML-Vorrang, `EnvFile.FileMode()`);
   Helper `EffectiveComposeFiles`/`EffectiveServices`/`ExcludeServices`
 - `internal/git/` — Git-Manager: Clone-or-Update der Remote-Checkouts über
   die lokal installierte git-Binary (`os/exec`, keine Git-Library); im
@@ -251,7 +269,8 @@ Records, unabhängig von ps-Fehlern).
   (`${VAULT:path#key}`/`${VAULT:path:key}`, zeilenweises Ersetzen, Fehler
   mit Zeilennummer + Referenz, per Template gecachte KV-Reads), WriteShm
   (0600-Env-Datei in /dev/shm mit idempotentem Cleanup) und WriteStackEnv
-  (atomare 0600-`<stackDir>/.env` mit Rollback: restore-or-remove;
+  (atomare `<stackDir>/.env` mit Rollback: restore-or-remove; `Options` setzt
+  Mode und Gruppe vor dem Rename, Default 0600, Gruppenfehler nur WARN;
   bewusst nicht im Stack-Hash)
 - `internal/hooks/` — Hook-Engine: sequenzielle `sh -c`-Ausführung mit
   Per-Kommando-Timeout (Prozessgruppen-Kill) und slog-Output

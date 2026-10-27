@@ -315,7 +315,7 @@ func TestWriteShmEmptyEnv(t *testing.T) {
 func TestWriteStackEnv(t *testing.T) {
 	stackDir := t.TempDir()
 
-	path, rollback, err := WriteStackEnv(stackDir, map[string]string{"SECRET": "hunter2", "A": "1"})
+	path, rollback, err := WriteStackEnv(stackDir, map[string]string{"SECRET": "hunter2", "A": "1"}, Options{})
 	if err != nil {
 		t.Fatalf("WriteStackEnv() error = %v", err)
 	}
@@ -365,7 +365,7 @@ func TestWriteStackEnv(t *testing.T) {
 func TestWriteStackEnvRollbackRemovesNewFile(t *testing.T) {
 	stackDir := t.TempDir()
 
-	path, rollback, err := WriteStackEnv(stackDir, map[string]string{"A": "1"})
+	path, rollback, err := WriteStackEnv(stackDir, map[string]string{"A": "1"}, Options{})
 	if err != nil {
 		t.Fatalf("WriteStackEnv() error = %v", err)
 	}
@@ -391,7 +391,7 @@ func TestWriteStackEnvRollbackRestoresPreviousFile(t *testing.T) {
 		t.Fatalf("chmod previous .env: %v", err)
 	}
 
-	gotPath, rollback, err := WriteStackEnv(stackDir, map[string]string{"NEW": "value"})
+	gotPath, rollback, err := WriteStackEnv(stackDir, map[string]string{"NEW": "value"}, Options{})
 	if err != nil {
 		t.Fatalf("WriteStackEnv() error = %v", err)
 	}
@@ -425,7 +425,7 @@ func TestWriteStackEnvRollbackRestoresPreviousFile(t *testing.T) {
 }
 
 func TestWriteStackEnvMissingDir(t *testing.T) {
-	_, _, err := WriteStackEnv(filepath.Join(t.TempDir(), "does-not-exist"), map[string]string{"A": "1"})
+	_, _, err := WriteStackEnv(filepath.Join(t.TempDir(), "does-not-exist"), map[string]string{"A": "1"}, Options{})
 	if err == nil || !strings.Contains(err.Error(), "does-not-exist") {
 		t.Errorf("WriteStackEnv() into missing dir error = %v, want error naming the dir", err)
 	}
@@ -433,7 +433,7 @@ func TestWriteStackEnvMissingDir(t *testing.T) {
 
 func TestWriteStackEnvEmptyEnv(t *testing.T) {
 	stackDir := t.TempDir()
-	path, rollback, err := WriteStackEnv(stackDir, map[string]string{})
+	path, rollback, err := WriteStackEnv(stackDir, map[string]string{}, Options{})
 	if err != nil {
 		t.Fatalf("WriteStackEnv() error = %v", err)
 	}

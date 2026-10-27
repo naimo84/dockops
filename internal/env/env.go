@@ -14,7 +14,10 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/local/dockops/internal/config"
@@ -233,12 +236,93 @@ func randomHex(n int) (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
+// Options are the permissions of the generated <stackDir>/.env (phase 14).
+// The zero value is the historical artefact: 0600, group untouched.
+type Options struct {
+	// Mode is the file mode of the generated file; 0 means 0600. It must
+	// not be world-readable — the config loader rejects that (see
+	// config.ParseEnvFileMode); this type applies what it is given.
+	Mode os.FileMode
+	// Group is the owning group as a name or a numeric gid. Empty leaves
+	// the group as os.CreateTemp made it, i.e. the agent's egid.
+	Group string
+}
+
+// OptionsFromEnvFile maps the root configuration's global.env_file block to
+// the write options. The loader has already validated and defaulted the
+// values, so mode and group arrive in usable form.
+func OptionsFromEnvFile(f config.EnvFile) Options {
+	return Options{Mode: f.FileMode(), Group: f.Group}
+}
+
+// mode returns the effective permission bits: the zero value means the
+// historical 0600, everything else is applied as configured.
+func (o Options) mode() os.FileMode {
+	if m := o.Mode.Perm(); m != 0 {
+		return m
+	}
+	return 0o600
+}
+
+// applyPermissions sets mode and group on the freshly written temporary file
+// — before it is renamed over <stackDir>/.env, so the target name never
+// exists in an intermediate permission state. Both steps only warn: a
+// deployment must not fail over a permission nuance of its own artefact, and
+// the warning is the diagnosis — it names why the ops user cannot read the
+// file later (unknown group, chgrp refused because the agent is no member).
+func applyPermissions(tmpName, target string, opts Options) {
+	mode := opts.mode()
+	if err := os.Chmod(tmpName, mode); err != nil {
+		slog.Default().Warn("cannot set generated stack env mode",
+			"path", target, "mode", fmt.Sprintf("%04o", mode), "error", err)
+	}
+	group := strings.TrimSpace(opts.Group)
+	if group == "" {
+		return
+	}
+	gid, err := resolveGroup(group)
+	if err != nil {
+		slog.Default().Warn("cannot resolve stack env group, writing the file without chgrp",
+			"path", target, "group", group, "error", err)
+		return
+	}
+	if err := os.Chown(tmpName, -1, gid); err != nil {
+		slog.Default().Warn("cannot change stack env group, writing the file with the agent's group",
+			"path", target, "group", group, "gid", gid, "current_gid", os.Getegid(), "error", err)
+	}
+}
+
+// resolveGroup resolves a configured group — a numeric gid or a name — to
+// the numeric gid. Numeric values are taken as they are (no lookup, so a gid
+// the host's /etc/group does not name still works); names go through
+// os/user, whose pure-Go path reads /etc/group directly (no cgo, no NSS).
+func resolveGroup(group string) (int, error) {
+	if gid, err := strconv.Atoi(group); err == nil {
+		if gid < 0 {
+			return 0, fmt.Errorf("negative gid %d", gid)
+		}
+		return gid, nil
+	}
+	g, err := user.LookupGroup(group)
+	if err != nil {
+		return 0, fmt.Errorf("group %q: %w", group, err)
+	}
+	gid, err := strconv.Atoi(g.Gid)
+	if err != nil {
+		return 0, fmt.Errorf("group %q: gid %q: %w", group, g.Gid, err)
+	}
+	return gid, nil
+}
+
 // WriteStackEnv writes env in dotenv format to <stackDir>/.env — atomically
-// (a temporary file in the same directory, renamed over the target) and
-// with 0600 permissions, since the merged environment carries secrets. The
-// content is the deterministic dotenv format (sorted keys, literal
-// KEY=VALUE lines, no quoting) that the compose dotenv parser reads
-// verbatim.
+// (a temporary file in the same directory, renamed over the target) and with
+// the permissions of opts (0600 when opts is the zero value, since the
+// merged environment carries secrets). opts allows a wider mode and a
+// different owning group for hosts where an operator deploys the stack by
+// hand as another user (phase 14); an unresolvable or unsettable group only
+// warns, the file is then written without chgrp. The content is the
+// deterministic dotenv format (sorted keys, literal KEY=VALUE lines, no
+// quoting) that the compose dotenv parser reads verbatim.
 //
 // The file backs everything compose resolves relative to the stack
 // directory: `env_file: ./.env` references and ${...} interpolation in the
@@ -259,7 +343,7 @@ func randomHex(n int) (string, error) {
 // not trigger a redeployment — a conscious decision matching the Komodo
 // reality the briefing describes (secret rotation alone deploys nothing
 // until the stack definition changes).
-func WriteStackEnv(stackDir string, env map[string]string) (path string, rollback func(), err error) {
+func WriteStackEnv(stackDir string, env map[string]string, opts Options) (path string, rollback func(), err error) {
 	content := dotenv.Format(env)
 	path = filepath.Join(stackDir, stackEnvFile)
 
@@ -282,7 +366,8 @@ func WriteStackEnv(stackDir string, env map[string]string) (path string, rollbac
 		return "", nil, fmt.Errorf("env: create temp file in %s: %w", stackDir, err)
 	}
 	tmpName := tmp.Name()
-	// os.CreateTemp creates 0600 files; the permission survives the rename.
+	// os.CreateTemp creates 0600 files; mode and group are applied to the
+	// temporary file before the rename, so the permission survives it.
 	if _, err := tmp.Write(content); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
@@ -292,6 +377,9 @@ func WriteStackEnv(stackDir string, env map[string]string) (path string, rollbac
 		os.Remove(tmpName)
 		return "", nil, fmt.Errorf("env: close %s: %w", tmpName, err)
 	}
+	// Phase 14: the artefact's permissions, on the temporary file and
+	// therefore before the target name exists (see applyPermissions).
+	applyPermissions(tmpName, path, opts)
 	if err := os.Rename(tmpName, path); err != nil {
 		os.Remove(tmpName)
 		return "", nil, fmt.Errorf("env: rename %s to %s: %w", tmpName, path, err)
