@@ -286,6 +286,15 @@ type Deps struct {
 	// to the Docker daemon socket". Empty is the correct value for an agent
 	// that needs no extra group.
 	SelfGroups []string
+
+	// EnvFileOptions pins mode and group of the generated <stackDir>/.env
+	// (phase 14). cmd/dockops passes a pointer and fills it from every
+	// pass's global.env_file block in OnConfigLoaded — the root
+	// configuration is only readable inside a pass — so the YAML block
+	// wins over the DOCKOPS_ENV_FILE_* fallbacks the loader already
+	// resolved. Nil (tests, embedders without a CLI) derives the same
+	// options from each pass's configuration in Reconcile.
+	EnvFileOptions *env.Options
 }
 
 // Reconciler executes reconciliation passes over the declarative
@@ -355,6 +364,12 @@ type Reconciler struct {
 
 	// selfGroups are the helper's --group-add values (Deps.SelfGroups).
 	selfGroups []string
+
+	// envFileOptions pins the permissions of the generated stack .env
+	// (Deps.EnvFileOptions, phase 14). The CLI owns the pointer and fills
+	// it per pass; nil derives the options from the pass's configuration —
+	// see Reconcile.
+	envFileOptions *env.Options
 }
 
 // New returns a Reconciler for deps, applying the defaults documented on
@@ -444,6 +459,8 @@ func New(deps Deps) *Reconciler {
 		selfMounts:    deps.SelfMounts,
 		selfUser:      deps.SelfUser,
 		selfGroups:    deps.SelfGroups,
+
+		envFileOptions: deps.EnvFileOptions,
 	}
 }
 
@@ -595,6 +612,15 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		recordCommit(gitMgr, commits, remotePaths[name], r.logger)
 	}
 
+	// Phase 14: the permissions of the generated <stackDir>/.env come from
+	// global.env_file. The CLI filled Deps.EnvFileOptions from this pass's
+	// configuration in the callback above (the root config is only readable
+	// inside a pass); without that pointer the same mapping happens here.
+	envFileOpts := env.OptionsFromEnvFile(cfg.Global.EnvFile)
+	if r.envFileOptions != nil {
+		envFileOpts = *r.envFileOptions
+	}
+
 	// 4. Deploy every enabled stack; a failing stack is skipped while the
 	// pass continues with the next one.
 	vaultSess := &vaultSession{factory: r.newVault, cfg: cfg.Global.Vault, logger: r.logger}
@@ -607,7 +633,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("reconciler: aborted before stack %s: %w", stack.Name, err))
 			break
 		}
-		if err := r.deployStack(ctx, stack, vaultSess, commits, pn); err != nil {
+		if err := r.deployStack(ctx, stack, vaultSess, commits, pn, envFileOpts); err != nil {
 			r.logger.Error("stack deployment failed", "stack", stack.Name, "error", err)
 			errs = append(errs, err)
 		}
@@ -644,7 +670,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 // this function returns, i.e. at the end of the stack; the generated
 // stack-dir .env deliberately outlives a successful deployment (see the
 // WriteStackEnv call below).
-func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultSess *vaultSession, commits map[string]string, pn *passNotify) error {
+func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultSess *vaultSession, commits map[string]string, pn *passNotify, envFileOpts env.Options) error {
 	composeFiles := stack.EffectiveComposeFiles()
 	contents := make([][]byte, 0, len(composeFiles))
 	for _, file := range composeFiles {
@@ -733,7 +759,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	// remove or revert it, and the next deployment regenerates it. It is
 	// deliberately not part of the stack hash: a changed secret value must
 	// not trigger a redeployment (Komodo reality; see env.WriteStackEnv).
-	stackEnvPath, rollbackStackEnv, err := env.WriteStackEnv(stack.Dir, merged)
+	stackEnvPath, rollbackStackEnv, err := env.WriteStackEnv(stack.Dir, merged, envFileOpts)
 	if err != nil {
 		err = fmt.Errorf("stack %s: write stack env file: %w", stack.Name, err)
 		pn.deployFailed(ctx, stack.Name, stageSecrets, newHash, err)

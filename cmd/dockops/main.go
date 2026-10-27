@@ -27,6 +27,7 @@ import (
 
 	"github.com/local/dockops/internal/compose"
 	"github.com/local/dockops/internal/config"
+	"github.com/local/dockops/internal/env"
 	"github.com/local/dockops/internal/git"
 	"github.com/local/dockops/internal/reconciler"
 	"github.com/local/dockops/internal/selfupdate"
@@ -295,6 +296,16 @@ func run(opts options, logger *slog.Logger) error {
 	// host repository; the callback hands it over to the poll loop.
 	intervals := &intervalSource{}
 
+	// Phase 14: mode and group of the generated <stackDir>/.env follow the
+	// root config's global.env_file block. That block is only readable
+	// inside a pass (the host repository is bootstrapped there), so the
+	// reconciler keeps this pointer and the OnConfigLoaded callback below
+	// fills it from the freshly loaded configuration — before the pass
+	// deploys anything. cmd/dockops owns the mapping from Global; the
+	// loader owns defaults, validation and the DOCKOPS_ENV_FILE_*
+	// fallbacks (an explicit YAML value wins).
+	envFileOpts := &env.Options{}
+
 	// Shared collaborators of the reconcile passes and GET /status: one
 	// compose executor (stateless) and one git manager over the bootstrap
 	// work dir (the same default the reconciler applies when Deps.WorkDir
@@ -320,8 +331,12 @@ func run(opts options, logger *slog.Logger) error {
 		SelfMounts:     selfMounts(os.Getenv, logger),
 		SelfUser:       selfUser(os.Getenv, logger),
 		SelfGroups:     selfGroups(os.Getenv, logger),
+		// The stack .env permissions of every pass, from the just-loaded
+		// root configuration (phase 14).
+		EnvFileOptions: envFileOpts,
 		OnConfigLoaded: func(cfg *config.Config) {
 			intervals.set(time.Duration(cfg.Global.PollInterval))
+			*envFileOpts = env.OptionsFromEnvFile(cfg.Global.EnvFile)
 		},
 	}
 	if gitMgr != nil { // nil *git.Manager would be a non-nil interface and panic on use

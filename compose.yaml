@@ -42,6 +42,11 @@ services:
       # only the literal "off" disables it — a self stack then falls back to
       # the in-process apply, which cannot survive its own recreate).
       DOCKOPS_SELF_UPDATE: "${DOCKOPS_SELF_UPDATE:-on}"
+      # Phase 14: fallbacks for global.env_file — mode and group of the
+      # generated <stackDir>/.env. A value in the host repository's
+      # stacks.yaml wins; empty keeps the default 0600 and the agent's group.
+      DOCKOPS_ENV_FILE_MODE: "${DOCKOPS_ENV_FILE_MODE:-}"
+      DOCKOPS_ENV_FILE_GROUP: "${DOCKOPS_ENV_FILE_GROUP:-}"
       # Vault: VAULT_ADDR is the fallback for an unset global.vault.address;
       # VAULT_TOKEN is read at login time (token auth method).
       VAULT_ADDR: "https://vault.example.com"

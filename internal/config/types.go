@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -122,6 +123,50 @@ type Global struct {
 	// entirely — the global emergency brake for rate-limited registries.
 	// A pointer is needed because 0 is a meaningful setting, not "unset".
 	UpdateCheckInterval *Duration `yaml:"update_check_interval"`
+	// EnvFile configures mode and group of the generated
+	// <stackDir>/.env (phase 14). Host-global on purpose: it decides who
+	// may deploy a stack by hand on this host, which is a property of the
+	// host, not of one stack.
+	EnvFile EnvFile `yaml:"env_file"`
+}
+
+// EnvFile is the global.env_file block: the permissions of the generated
+// <stackDir>/.env, the file that backs compose's stack-relative
+// `env_file: ./.env` and the ${...} interpolation. It carries the merged
+// stack environment including its secrets, so the loader validates the
+// mode hard (see ParseEnvFileMode).
+type EnvFile struct {
+	// Mode is the octal permission literal of the generated file, with or
+	// without a leading zero ("0640" and "640" are the same). Nil (the key
+	// is absent) takes DefaultEnvFileMode; a pointer is needed because an
+	// explicitly empty value is a configuration error, not "unset".
+	Mode *string `yaml:"mode"`
+	// Group is the owning group of the generated file, as a name or a
+	// numeric gid. Empty (the default) leaves the group as the agent's
+	// egid. Deliberately not resolved by the loader — it may run where
+	// /etc/group has no such entry (a container without the host's
+	// groups); the write path resolves it and only warns when it cannot.
+	Group string `yaml:"group"`
+}
+
+// DefaultEnvFileMode is the mode of the generated <stackDir>/.env when
+// global.env_file does not configure one: the historical artefact,
+// readable for the agent's own user only.
+const DefaultEnvFileMode os.FileMode = 0o600
+
+// FileMode returns the effective permission bits of the generated file.
+// The loader validates Mode, so a hand-built Global (tests, embedders) is
+// the only way to reach the fallback: it gets DefaultEnvFileMode instead of
+// an unparsable value making the deployment artefact unreadable.
+func (e EnvFile) FileMode() os.FileMode {
+	if e.Mode == nil {
+		return DefaultEnvFileMode
+	}
+	mode, err := ParseEnvFileMode(*e.Mode)
+	if err != nil {
+		return DefaultEnvFileMode
+	}
+	return mode
 }
 
 // DefaultUpdateCheckInterval is the interval of the image update check when
