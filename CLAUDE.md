@@ -369,6 +369,30 @@ Records, unabhängig von ps-Fehlern).
   über injiziertes `runHelper` (kein echtes `docker run`), Finalisierung
   (ok/rolled_back/rollback_failed/beide Digest-Fallbacks), Pending-Guard gegen
   einen zweiten Helper
+- `internal/reconciler/deploy.go`/`phase13_test.go` — Phase-13-Deploy-Hand-over:
+  jeder Recreate des Self-Stacks ohne Image-Move (Hash-/Config-Änderung und
+  Erst-Adoption) schreibt einen Plan mit `kind: deploy`, setzt
+  `deploy_pending_hash`/`deploy_pending_at` und startet den Helper; der Guard
+  sitzt vor der Change-Detection („pending" = in flight, nicht „unchanged").
+  Tests decken Adoption, Hash-Wechsel, den zweiten Pass ohne zweiten Helper,
+  den fehlgeschlagenen Helper-Start (Pending zurückgerollt, ein
+  `deploy_failed`), Nicht-Self-Stacks, das unbekannte Helper-Image
+  (in-process) sowie die Finalisierung (ok/failed/rolled_back, fehlendes
+  Result innerhalb und außerhalb des Fensters, Reihenfolge vor dem
+  Image-Pending) ab
+- `internal/selfupdate/phase13_test.go` — Deploy-Plan-Validierung
+  (Ziele verboten, Hash Pflicht), Altdaten ohne `kind`, Result-Round-Trip mit
+  `kind`/`deploy_hash`, unbekannter Status
+- `internal/state/phase13_test.go` — `deploy_pending_hash`/`deploy_pending_at`
+  Round-Trip, `omitempty` (nur der Hash verschwindet; der Null-Zeitstempel
+  bleibt wie bei den anderen Zeiten), Altdaten laden ohne Pending,
+  `fileVersion` bleibt 1
+- `internal/compose/phase13_test.go` — `UpArgs`: Datei-/Profil-/Env-Reihenfolge,
+  `--no-deps` nur auf Wunsch, Services zuletzt, leerer Projektname als Fehler
+- `cmd/dockops/phase13_test.go` — Helper-Deploy-Modus (`deployUpArgs` ohne
+  `--no-deps`, genau ein `compose up`, kein Rollback-Artefakt, `kind: deploy`
+  im Result, Fehlertext + Log) und `DOCKOPS_SELF_IMAGE`-Vorrang in
+  `selfImage`
 - `internal/webhook/phase8b_test.go` — Phase-8b-Regressionstest:
   `BuildStatus` mit identischen Kollaborateuren wie der Endpoint liefert
   dasselbe Dokument (inkl. beider Fehler-Modi), fehlende Konfiguration ist
@@ -438,6 +462,19 @@ Records, unabhängig von ps-Fehlern).
   finalisiert — kein in-process Recreate des eigenen Stacks. Der Helper erbt
   die Agent-Mounts per `--volumes-from` (kein `-v` der Container-Pfade: die
   Host-Pfade dahinter sind installtionsabhängig).
+- Phase 13 hängt am selben Mechanismus und Schalter: Jeder Recreate des
+  Self-Stacks, der **kein** Image-Move ist, wird als Deploy-Plan (`kind:
+  deploy`, `deploy_hash`, `profiles`) übergeben; der Agent markiert nur
+  `deploy_pending_hash`/`deploy_pending_at` und lässt den Stack bis zur
+  Finalisierung unangetastet. Der Helper fährt ein normales
+  `compose up -d --remove-orphans` — ohne Health-Gate und ohne Rollback, weil
+  ein Deploy kein Vorher hat. Kennt der Agent sein eigenes Image nicht
+  (`DOCKOPS_SELF_IMAGE` leer und `docker inspect` erfolglos), startet kein
+  Helper (ein geratenes Image würde einen anderen Build deployen als den, den
+  der Agent fährt); der Deploy fällt dann mit Warnung auf den
+  In-Process-Recreate zurück, weil der Image-Pfad desselben Passes die Records
+  dieses Deploys liest — dokumentierte Ausnahme von der Spec-Regel
+  „unbekanntes Image = harter Fehler“, siehe `deployStack`.
 
 ## Checks vor jedem Commit
 

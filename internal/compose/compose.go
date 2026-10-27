@@ -60,10 +60,10 @@ func New(logger *slog.Logger, binary string) *Executor {
 // the multi-file compose_files configuration or the single compose_file —
 // in their configured order (compose merge rules apply, later files win).
 // Profiles are appended in their configured order; the service filter
-// (services minus ignore_services, see upServices) yields the positional
+// (services minus ignore_services, see UpServices) yields the positional
 // service arguments — docker compose takes them without a preceding "--".
 func (e *Executor) Up(ctx context.Context, stack config.Stack, stackDir, envFile string) error {
-	services, err := upServices(stack, stackDir)
+	services, err := UpServices(stack, stackDir)
 	if err != nil {
 		return err
 	}
@@ -187,6 +187,36 @@ func (s upSpec) args() ([]string, error) {
 	return args, nil
 }
 
+// UpArgs assembles the compose up command line of a Request without running
+// it:
+//
+//	compose -p <project> [-f <file> ...] [--profile p ...]
+//	        [--env-file <env>] up -d --remove-orphans [--no-deps] [service ...]
+//
+// It exists for the detached helper (phase 13): a deploy plan is a Request
+// plus profiles, an env file and a service list, and the helper must build
+// exactly the command line that Up would have built in-process. Sharing
+// upSpec keeps the flag set in one place instead of a second, quietly
+// drifting list in the helper.
+//
+// noDeps is part of the caller's intent, not a default: the phase-12 image
+// move recreates named services only (--no-deps), a phase-13 deploy is a
+// normal full up of the stack and must resolve its dependencies.
+func UpArgs(req Request, profiles []string, envFile string, noDeps bool, services []string) ([]string, error) {
+	args, err := upSpec{
+		project:  req.Project,
+		fileArgs: req.fileArgs(),
+		stackDir: req.StackDir,
+		profiles: profiles,
+		envFile:  envFile,
+		noDeps:   noDeps,
+	}.args()
+	if err != nil {
+		return nil, err
+	}
+	return append(args, services...), nil
+}
+
 // Down stops and removes the stack (used for pruning removed stacks):
 //
 //	<binary> compose -p <stack.Name> [-f <file> ...] --env-file <envFile>
@@ -237,7 +267,7 @@ func resolveComposeFileArgs(files []string, stackDir string) []string {
 	return args
 }
 
-// upServices returns the positional service arguments for compose up:
+// UpServices returns the positional service arguments for compose up:
 // docker compose has no native exclude flag, so ignore_services is
 // materialized as a set difference here.
 //
@@ -249,7 +279,12 @@ func resolveComposeFileArgs(files []string, stackDir string) []string {
 // A result that would deploy nothing is an error — passing no positional
 // argument would silently deploy everything, the exact opposite of the
 // configured filter.
-func upServices(stack config.Stack, stackDir string) ([]string, error) {
+//
+// Exported since phase 13: the deploy hand-over writes the very list into
+// the helper plan, and rebuilding the filter next to it would let the two
+// drift apart (a plan that misses ignore_services would start what the
+// agent deliberately kept down).
+func UpServices(stack config.Stack, stackDir string) ([]string, error) {
 	if len(stack.Services) > 0 {
 		effective := config.ExcludeServices(stack.Services, stack.IgnoreServices)
 		if len(effective) == 0 {

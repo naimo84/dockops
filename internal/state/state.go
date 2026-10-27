@@ -78,6 +78,25 @@ type State struct {
 	// apply stacks keep records too. Optional, like Images — an older file
 	// simply has no value, and callers read it as notify (the default).
 	UpdatePolicy string `json:"update_policy,omitempty"`
+
+	// The phase-13 deploy pending bookkeeping. Additive and omitempty like
+	// the fields above — fileVersion stays 1: a state file without them is
+	// an agent that never handed a deploy over, and the fields only
+	// document a hand-over that is already in flight.
+
+	// DeployPendingHash is the stack hash whose deploy was handed to the
+	// detached helper (phase 13). While it is set, deployStack leaves the
+	// stack untouched and starts no second helper, and the next agent start
+	// finalizes the outcome from the helper's result file. It is the stack
+	// counterpart of ImageRecord.ApplyPendingDigest: a deploy concerns the
+	// stack, an image record concerns one image.
+	DeployPendingHash string `json:"deploy_pending_hash,omitempty"`
+	// DeployPendingAt is the UTC time of that hand-over, zero when none
+	// ever ran (same zero-value serialization as ImageRecord.AppliedAt).
+	// It is the age basis of the finalization timeout: without it a helper
+	// that left no result would keep its marker forever and the stack would
+	// never be deployed again.
+	DeployPendingAt time.Time `json:"deploy_pending_at,omitempty"`
 }
 
 // ImageRecord is the persisted outcome of the last update check of one image

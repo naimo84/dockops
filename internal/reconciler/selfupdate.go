@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -25,6 +26,12 @@ const (
 	// helperOutputLimit bounds the command output embedded into a helper
 	// error (same spirit as the compose executor's bound).
 	helperOutputLimit = 512
+	// deployFinalizeSlack is the grace on top of a deploy's own deadlines
+	// (grace + health timeout) before a missing helper result counts as a
+	// failure. It covers the helper's own start-up, the log write and the
+	// moment between "container exited" and "result file visible" — without
+	// it the finalization would declare a slow-but-working deploy dead.
+	deployFinalizeSlack = 120 * time.Second
 )
 
 // startSelfUpdate is the phase-12 alternative to the in-process apply: it
@@ -203,6 +210,12 @@ func secondsAtLeastOne(d time.Duration) int {
 // repository update, because the state file is the only thing that survives
 // the recreate and the pending marker must not outlive its outcome.
 //
+// Since phase 13 there are two kinds of pending: the deploy pending of a
+// stack recreate (deploy_pending_hash, handled first by
+// finalizeDeployPending) and the phase-12 image pending
+// (apply_pending_digest). The result file is shared by both, which is safe
+// because only one of them is ever in flight.
+//
 // The result file is the primary source. The two fallbacks exist because the
 // helper can die harder than it writes: if it vanished without a result but
 // the tag already points at the target digest, the recreate worked; if it
@@ -231,13 +244,6 @@ func (r *Reconciler) finalizeSelfUpdate(ctx context.Context) {
 	stateDir := filepath.Dir(r.state.Path())
 	resultPath := selfupdate.ResultPath(stateDir)
 
-	pending := make([]string, 0, len(st.Images))
-	for _, ref := range sortedKeys(st.Images) {
-		if st.Images[ref].ApplyPendingDigest != "" {
-			pending = append(pending, ref)
-		}
-	}
-
 	res, err := selfupdate.ReadResult(resultPath)
 	haveResult := err == nil
 	switch {
@@ -248,6 +254,23 @@ func (r *Reconciler) finalizeSelfUpdate(ctx context.Context) {
 	default:
 		r.logger.Error("self update: unreadable result file; falling back to the digest comparison",
 			"stack", project, "path", resultPath, "error", err)
+	}
+
+	// Phase 13: a deploy pending is the coarser bookkeeping (it concerns the
+	// whole stack), so it is finalized first and the pass stops there. Both
+	// markers cannot be in flight at the same time — a deploy interrupts the
+	// image path, not the other way round — but the order is fixed anyway so
+	// a stale mix cannot be half-consumed.
+	if st.DeployPendingHash != "" {
+		r.finalizeDeployPending(ctx, project, st, res, haveResult, resultPath)
+		return
+	}
+
+	pending := make([]string, 0, len(st.Images))
+	for _, ref := range sortedKeys(st.Images) {
+		if st.Images[ref].ApplyPendingDigest != "" {
+			pending = append(pending, ref)
+		}
 	}
 
 	if len(pending) == 0 {
@@ -269,6 +292,134 @@ func (r *Reconciler) finalizeSelfUpdate(ctx context.Context) {
 	} else {
 		r.fallbackSelfUpdate(ctx, project, st, recs, pending, pn, now)
 	}
+}
+
+// finalizeDeployPending book-keeps a phase-13 deploy the previous agent
+// process handed to a helper. Called from finalizeSelfUpdate before the
+// image bookkeeping; the table is the design's:
+//
+//	result ok                     → hash deployed, pending cleared,
+//	                                recovery(deploy_failed)
+//	result failed                 → hash = pending, status failed (the next
+//	                                pass retries), deploy_failed
+//	result rolled_back/failed     → like failed, plus RollbackFailedTag: a
+//	                                deploy has nothing to roll back to, so
+//	                                this cannot happen — it must be loud
+//	no result, past the window    → like failed ("helper left no result for
+//	                                the deploy"); otherwise the pending would
+//	                                keep the stack untouched forever
+//	no result, inside the window  → stay pending, the helper may just be
+//	                                working
+//
+// Every failure is logged and swallowed: bookkeeping must never cost the
+// pass (phase 12's rule). Notifications use the cached notifier of the
+// previous pass, because this runs before the root configuration is read.
+func (r *Reconciler) finalizeDeployPending(ctx context.Context, project string, st state.State, res selfupdate.Result, haveResult bool, resultPath string) {
+	pendingHash := st.DeployPendingHash
+	pn := &passNotify{notifier: r.notifier}
+
+	if !haveResult {
+		window := r.deployWaitWindow(filepath.Dir(r.state.Path()))
+		age := time.Now().UTC().Sub(st.DeployPendingAt)
+		// A pending without a timestamp cannot be aged and would hold the
+		// stack forever; treat it as expired (conservative: a deploy that is
+		// retried is better than a stack that is never deployed again).
+		if !st.DeployPendingAt.IsZero() && age <= window {
+			r.logger.Debug("self deploy: helper has not reported yet, staying pending",
+				"stack", project, "hash", pendingHash, "age", age, "window", window)
+			return
+		}
+		r.logger.Warn("self deploy: helper left no result, marking the deploy failed",
+			"stack", project, "hash", pendingHash, "age", age, "window", window)
+		r.bookDeploy(ctx, project, st, pendingHash, state.StatusFailed,
+			fmt.Sprintf("self deploy: helper left no result for the deploy of hash %s", pendingHash), pn, resultPath)
+		return
+	}
+
+	if res.Kind != selfupdate.KindDeploy {
+		// Cannot normally happen (a deploy pending and an image result never
+		// overlap); if it does, the status decides and the log says why the
+		// books look odd.
+		r.logger.Warn("self deploy: result is not a deploy result but a deploy is pending",
+			"stack", project, "kind", res.Kind, "status", res.Status)
+	}
+	if res.DeployHash != "" && res.DeployHash != pendingHash {
+		// The state's pending hash is what this agent wrote and what the
+		// stack will be booked on; the echo is diagnostic only.
+		r.logger.Warn("self deploy: result names another hash than the pending one",
+			"stack", project, "pending", pendingHash, "result", res.DeployHash)
+	}
+
+	switch res.Status {
+	case selfupdate.StatusOK:
+		r.logger.Info("self deploy: helper deployed the stack", "stack", project, "hash", pendingHash)
+		r.bookDeploy(ctx, project, st, pendingHash, state.StatusDeployed, "", pn, resultPath)
+
+	case selfupdate.StatusFailed:
+		text := strings.TrimSpace(res.Error)
+		if text == "" {
+			text = "self deploy: helper reported failed without an error text"
+		}
+		r.logger.Error("self deploy: helper failed", "stack", project, "error", text)
+		r.bookDeploy(ctx, project, st, pendingHash, state.StatusFailed, text, pn, resultPath)
+
+	case selfupdate.StatusRolledBack, selfupdate.StatusRollbackFailed:
+		text := strings.TrimSpace(res.Error)
+		if text == "" {
+			text = "self deploy: helper reported " + res.Status + " without an error text"
+		}
+		// The in-process path's marker, so an alert reads identically no
+		// matter which path produced it.
+		text += "; " + selfupdate.RollbackFailedTag + " (a deploy has no rollback)"
+		r.logger.Error("self deploy: helper reported a rollback for a deploy", "stack", project,
+			"status", res.Status, "error", res.Error)
+		r.bookDeploy(ctx, project, st, pendingHash, state.StatusFailed, text, pn, resultPath)
+	}
+}
+
+// bookDeploy writes the deploy outcome into the state and consumes the
+// result file. A persistence failure keeps the file: the verdict would
+// otherwise be lost and the next pass would age the pending out as
+// "failed" although it succeeded.
+func (r *Reconciler) bookDeploy(ctx context.Context, project string, st state.State, hash, status, errText string, pn *passNotify, resultPath string) {
+	st.Hash = hash
+	st.Status = status
+	st.DeployPendingHash = ""
+	st.DeployPendingAt = time.Time{}
+	if err := r.state.Set(project, st); err != nil {
+		r.logger.Error("self deploy: cannot record the outcome", "stack", project, "error", err)
+		return
+	}
+	if err := r.state.Save(); err != nil {
+		r.logger.Error("self deploy: cannot persist the outcome", "stack", project, "error", err)
+		return
+	}
+	if errText != "" {
+		pn.deployFailed(ctx, project, stageComposeUp, hash, errors.New(errText))
+	} else {
+		// A working deploy clears the dedupe key, exactly like a working
+		// in-process deploy.
+		pn.recovery(config.NotificationDeployFailed, project)
+	}
+	r.removeResult(resultPath)
+}
+
+// deployWaitWindow is how long a deploy pending may live without a result
+// before the finalization declares it failed: the plan's grace period plus
+// its health timeout plus deployFinalizeSlack.
+//
+// The plan is the authoritative source (it is what the helper works with);
+// the constants are only the fallback for an unreadable or unrelated plan
+// file — the window must never be zero, or a slow helper would be declared
+// dead on the first pass after the recreate.
+func (r *Reconciler) deployWaitWindow(stateDir string) time.Duration {
+	grace := time.Duration(selfUpdateGraceSeconds) * time.Second
+	health := config.DefaultHealthTimeout
+	if plan, err := selfupdate.ReadPlan(selfupdate.PlanPath(stateDir)); err == nil && plan.Kind == selfupdate.KindDeploy {
+		grace = time.Duration(plan.GraceSeconds) * time.Second
+		health = time.Duration(plan.HealthTimeoutSeconds) * time.Second
+	}
+	return grace + health + deployFinalizeSlack
 }
 
 // applySelfUpdateResult books the verdict of a finished helper run and
