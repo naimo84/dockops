@@ -637,8 +637,12 @@ func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconcil
 	server := &http.Server{
 		Addr: opts.Addr,
 		Handler: webhook.New(webhook.Deps{
-			Secret:      opts.WebhookSecret,
-			Trigger:     notify,
+			Secret:  opts.WebhookSecret,
+			Trigger: notify,
+			// POST /restart acts on the stacks of the last reconcile pass;
+			// the reconciler owns config, stack dirs, compose files and the
+			// generated .env (see Reconciler.Restart).
+			Restart:     rec.Restart,
 			Logger:      logger,
 			State:       collab.store,
 			Compose:     collab.compose,
@@ -665,7 +669,8 @@ func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconcil
 		serveErr <- err
 	}()
 	logger.Info("webhook server listening",
-		"addr", opts.Addr, "endpoints", "POST /webhook, GET /healthz, GET /status")
+		"addr", opts.Addr,
+		"endpoints", "POST /webhook, POST /restart, GET /healthz, GET /status")
 
 	// First pass immediately: deploy the current state on startup; it also
 	// loads the config and thereby the poll interval.

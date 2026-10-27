@@ -136,6 +136,34 @@ func (e *Executor) UpOverride(ctx context.Context, req Request, extraFiles []str
 	return e.run(ctx, append(args, services...))
 }
 
+// Restart restarts the containers of an already deployed stack:
+//
+//	<binary> compose -p <stack.Name> [-f <file> ...] [--env-file <envFile>]
+//	         restart
+//
+// It is deliberately only restart: no pull, no up, no recreate. The
+// containers keep their configuration, the stack hash and the state stay
+// untouched — restart is the operator's fix for wedged containers, not a
+// deployment. One -f per compose file in configured order (the merged
+// configuration compose validates against), --env-file only when the caller
+// has one: outside a deployment the generated <stackDir>/.env is the only
+// env file, and a stack that never deployed has none (see
+// reconciler.Reconciler.Restart). Profiles and the service filter stay out of
+// the command line: restart acts on the containers that exist, not on the
+// desired service set.
+func (e *Executor) Restart(ctx context.Context, stack config.Stack, stackDir, envFile string) error {
+	if stack.Name == "" {
+		return fmt.Errorf("docker compose restart: project name must not be empty")
+	}
+	args := []string{"compose", "-p", stack.Name}
+	args = append(args, composeFileArgs(stack, stackDir)...)
+	if envFile != "" {
+		args = append(args, "--env-file", envFile)
+	}
+	args = append(args, "restart")
+	return e.run(ctx, args)
+}
+
 // upSpec is the argument recipe of one compose up invocation. Up and
 // UpOverride fill it from their respective inputs and share args(), so the
 // two command lines cannot drift apart (same flags, same order).
