@@ -1,7 +1,8 @@
 // Phase-12 helper mode: the detached container that recreates the stack
 // dockops itself runs in.
 //
-// It is the same image, started with -selfupdate-helper -plan <path>, and it
+// It is the same image, started with -selfupdate-helper -selfupdate-plan
+// <path>, and it
 // owns the part of a self update the agent cannot do: recreate its own stack,
 // watch the health gate and roll back. Everything it needs is in the plan
 // file; everything it decides is in the result file and the append-only log

@@ -184,16 +184,16 @@ func TestHelperArgs(t *testing.T) {
 		"run -d --rm",
 		"--name dockops-selfupdate-dockops-1700000000",
 		"--volumes-from 3f1c2a9b4d5e",
-		"ghcr.io/x/dockops:latest -selfupdate-helper -plan /var/lib/dockops/selfupdate-plan.json",
+		"ghcr.io/x/dockops:latest -selfupdate-helper -selfupdate-plan /var/lib/dockops/selfupdate-plan.json",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("HelperArgs() = %q, want it to contain %q", got, want)
 		}
 	}
-	// No self-mount of the agent's paths: stack dir and state dir are
-	// CONTAINER paths (the host paths behind them differ per installation),
-	// so a -v of them would mount empty host directories and the helper
-	// would find neither compose files nor plan. The mounts arrive through
+	// Mounts come from the caller (Deps.SelfMounts) as explicit -v pairs of
+	// the agent's HOST paths — never as a -v of the container path, which
+	// would mount empty host directories. This case passes none, so the list
+	// stays at --volumes-from. The mounts arrive through
 	// --volumes-from instead.
 	for _, unwanted := range []string{"-v ", p.StackDir, "/var/run/docker.sock"} {
 		if strings.Contains(got, unwanted) {
