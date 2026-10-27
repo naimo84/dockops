@@ -66,7 +66,7 @@ func TestPhase13HelperArgsCarryMounts(t *testing.T) {
 		" --volumes-from abc123" +
 		" -v /home/docker/dockops:/var/lib/dockops" +
 		" -v /var/run/docker.sock:/var/run/docker.sock:ro" +
-		" " + image + " -selfupdate-helper -plan " + PlanPath("/var/lib/dockops")
+		" " + image + " -selfupdate-helper -selfupdate-plan " + PlanPath("/var/lib/dockops")
 	if joined != want {
 		t.Errorf("HelperArgs() = %q, want %q", joined, want)
 	}

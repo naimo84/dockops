@@ -294,6 +294,19 @@ func (r *Reconciler) finalizeSelfUpdate(ctx context.Context) {
 	}
 }
 
+// helperLogHint names the next diagnostic step for a helper that left no
+// result. The missing-log case is the sharper signal: the helper opens its log
+// right after reading the plan, so a helper without a log died before that —
+// a flag it does not know (the flag package exits with status 2), a mount it
+// does not have, or an unreadable plan. A helper WITH a log got as far as
+// compose; that log has the output and the exit reason.
+func helperLogHint(logExists bool) string {
+	if !logExists {
+		return "no helper log either: the helper died before reading the plan (unknown flag, missing mount or unreadable plan) — run the helper command line by hand"
+	}
+	return "read the helper log for the compose output and the exit reason"
+}
+
 // finalizeDeployPending book-keeps a phase-13 deploy the previous agent
 // process handed to a helper. Called from finalizeSelfUpdate before the
 // image bookkeeping; the table is the design's:
@@ -329,8 +342,16 @@ func (r *Reconciler) finalizeDeployPending(ctx context.Context, project string, 
 				"stack", project, "hash", pendingHash, "age", age, "window", window)
 			return
 		}
+		// A helper that leaves nothing at all is the expensive case to
+		// diagnose: --rm removes the container, so its stdout is gone with
+		// it. The helper log is the only trace, and its existence is itself
+		// the diagnosis — the log is opened right after the plan is read.
+		helperLog := selfupdate.HelperLogPath(filepath.Dir(r.state.Path()))
+		_, logErr := os.Stat(helperLog)
 		r.logger.Warn("self deploy: helper left no result, marking the deploy failed",
-			"stack", project, "hash", pendingHash, "age", age, "window", window)
+			"stack", project, "hash", pendingHash, "age", age, "window", window,
+			"helper_log", helperLog, "helper_log_exists", logErr == nil,
+			"hint", helperLogHint(logErr == nil))
 		r.bookDeploy(ctx, project, st, pendingHash, state.StatusFailed,
 			fmt.Sprintf("self deploy: helper left no result for the deploy of hash %s", pendingHash), pn, resultPath)
 		return

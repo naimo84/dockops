@@ -109,7 +109,7 @@ func TestPhase13SelfDeployHandsOverToHelper(t *testing.T) {
 		"run -d --rm",
 		"--name dockops-selfupdate-dockops-",
 		"--volumes-from " + testSelfContainer,
-		phase13SelfImage + " -selfupdate-helper -plan " + planPath(f),
+		phase13SelfImage + " -selfupdate-helper -selfupdate-plan " + planPath(f),
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("helper args = %q, want it to contain %q", joined, want)

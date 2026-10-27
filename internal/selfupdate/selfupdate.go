@@ -45,7 +45,7 @@ const (
 
 	// PlanFileName and ResultFileName are the fixed file names below the
 	// state directory. Fixed, not configurable: the agent writes the plan,
-	// the helper finds it through the -plan argument, and the next agent
+	// the helper finds it through the -selfupdate-plan argument, and the next agent
 	// start looks for the result before anything else — a configuration
 	// knob would only add a way to lose the file.
 	PlanFileName   = "selfupdate-plan.json"
@@ -491,7 +491,7 @@ func MountArgs(mounts []Mount) []string {
 //
 //	run -d --rm --name dockops-selfupdate-<project>-<suffix>
 //	    --volumes-from <agent container> [-v <host>:<path>[:ro] ...]
-//	    <image> -selfupdate-helper -plan <stateDir>/selfupdate-plan.json
+//	    <image> -selfupdate-helper -selfupdate-plan <stateDir>/selfupdate-plan.json
 //
 // Decisions worth naming:
 //   - -d --rm: the helper outlives the agent container that starts it
@@ -531,7 +531,14 @@ func HelperArgs(p Plan, image, stateDir, suffix, selfContainer string, mounts ..
 	args = append(args,
 		image,
 		"-selfupdate-helper",
-		"-plan", PlanPath(stateDir),
+		// The flag name must match cmd/dockops' flag set exactly: the helper
+		// parses its arguments with the same flag package as the agent, so a
+		// drifted name is "flag provided but not defined" — the process exits
+		// with status 2 before it can write a result or a log line. That is
+		// what happened live with the abbreviated "-plan": every helper died
+		// in under a second and the agent only saw "helper left no result".
+		// TestHelperArgsMatchTheCLIFlags guards the name.
+		"-selfupdate-plan", PlanPath(stateDir),
 	)
 	return args, nil
 }

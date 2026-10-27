@@ -957,7 +957,7 @@ geht auch dieser Recreate an denselben detached Helper.
    Stand (ehrlicher Zwischenstand: der Deploy ist beauftragt, nicht passiert).
 2. Er startet denselben Helper-Container wie in Phase 12
    (`docker run -d --rm --name … --volumes-from <agent> -v <host>:<pfad>…
-   <self-image> -selfupdate-helper -plan <pfad>`; die `-v`-Paare sind die
+   <self-image> -selfupdate-helper -selfupdate-plan <pfad>`; die `-v`-Paare sind die
    Bind-Mounts des Agenten, siehe „Grenzen" oben). Das Helper-Image ist der
    eigene Build:
    `DOCKOPS_SELF_IMAGE`, sonst `docker inspect <eigener Container>
