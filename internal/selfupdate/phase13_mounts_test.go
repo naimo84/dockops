@@ -58,13 +58,14 @@ func TestPhase13HelperArgsCarryMounts(t *testing.T) {
 		[]Mount{
 			{Host: "/home/docker/dockops", Path: "/var/lib/dockops"},
 			{Host: "/var/run/docker.sock", Path: "/var/run/docker.sock", ReadOnly: true},
-		}, "1000:4001")
+		}, "1000:4001", []string{"989"})
 	if err != nil {
 		t.Fatalf("HelperArgs() error = %v", err)
 	}
 	joined := strings.Join(args, " ")
 	want := "run -d --rm --name " + HelperName(p, "1700000000") +
 		" --user 1000:4001" +
+		" --group-add 989" +
 		" --volumes-from abc123" +
 		" -v /home/docker/dockops:/var/lib/dockops" +
 		" -v /var/run/docker.sock:/var/run/docker.sock:ro" +
@@ -78,7 +79,7 @@ func TestPhase13HelperArgsCarryMounts(t *testing.T) {
 // without the agent's own container there is nothing to inherit and no
 // shipment to guess at.
 func TestPhase13HelperArgsStillNeedTheSelfContainer(t *testing.T) {
-	if _, err := HelperArgs(deployPlan(), "img", "/var/lib/dockops", "1", "  ", []Mount{{Host: "/a", Path: "/b"}}, ""); err == nil {
+	if _, err := HelperArgs(deployPlan(), "img", "/var/lib/dockops", "1", "  ", []Mount{{Host: "/a", Path: "/b"}}, "", nil); err == nil {
 		t.Fatal("HelperArgs() error = nil, want an error for a missing self container")
 	}
 }
@@ -88,7 +89,7 @@ func TestPhase13HelperArgsStillNeedTheSelfContainer(t *testing.T) {
 // helper must then start without the flag (a stray empty --user would make
 // docker refuse the container).
 func TestPhase13HelperArgsWithoutUser(t *testing.T) {
-	args, err := HelperArgs(deployPlan(), "img:1", "/var/lib/dockops", "1", "abc123", nil, "   ")
+	args, err := HelperArgs(deployPlan(), "img:1", "/var/lib/dockops", "1", "abc123", nil, "   ", nil)
 	if err != nil {
 		t.Fatalf("HelperArgs() error = %v", err)
 	}

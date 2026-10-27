@@ -919,10 +919,13 @@ Diagnosequelle.
 - Der Helper hat Socket-Rechte (wie der Agent), aber keinen Repo-/Secret-
   Zugriff: er liest den Plan und schreibt Ergebnis und Log. Er läuft mit dem
   **User des Agenten** (`--user` aus `docker inspect .Config.User`, Override
-  `DOCKOPS_SELF_USER`): Ergebnis und Log entstehen mit dessen uid, damit der
-  Agent sein eigenes Urteil lesen kann. Ohne das schreibt ein root-Helper
-  `0600`-Dateien, die der Agent nicht öffnen darf — der Deploy bleibt dann für
-  immer `pending` (`self update: unreadable result file`).
+  `DOCKOPS_SELF_USER`) **und dessen Zusatzgruppen** (`--group-add` aus
+  `.HostConfig.GroupAdd`, Override `DOCKOPS_SELF_GROUPS`). Beides ist nötig und
+  beides fehlt bei einem nackten `docker run`: ohne `--user` schreibt der
+  Helper `0600`-Dateien als root, die der Agent nicht lesen darf (der Deploy
+  bleibt `pending`, `self update: unreadable result file`); ohne `--group-add`
+  fehlt ihm die docker-Gruppe und er scheitert am Socket
+  (`permission denied while trying to connect to the Docker daemon socket`).
 - Der Helper erbt die Mounts des Agenten auf **zwei** Wegen:
   `--volumes-from <agent>` für Named Volumes **und** explizite
   `-v <host>:<container>[:ro]` für jeden Bind-Mount, den der Agent beim Start

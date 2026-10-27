@@ -88,7 +88,7 @@ func (r *Reconciler) startSelfDeploy(ctx context.Context, stack config.Stack, ne
 		return r.abandonSelfDeploy(ctx, stack.Name, newHash, pn, fmt.Errorf("write plan: %w", err))
 	}
 
-	helperArgs, err := selfupdate.HelperArgs(plan, image, stateDir, fmt.Sprintf("%d", now.Unix()), r.selfContainer, r.selfMounts, r.selfUser)
+	helperArgs, err := selfupdate.HelperArgs(plan, image, stateDir, fmt.Sprintf("%d", now.Unix()), r.selfContainer, r.selfMounts, r.selfUser, r.selfGroups)
 	if err != nil {
 		r.logger.Error("self deploy: cannot build the helper command", "stack", stack.Name, "error", err)
 		return r.abandonSelfDeploy(ctx, stack.Name, newHash, pn, err)

@@ -50,6 +50,7 @@ const (
 	envSelfImage      = "DOCKOPS_SELF_IMAGE"
 	envSelfMounts     = "DOCKOPS_SELF_MOUNTS"
 	envSelfUser       = "DOCKOPS_SELF_USER"
+	envSelfGroups     = "DOCKOPS_SELF_GROUPS"
 )
 
 // Defaults for the flags and the poll loop.
@@ -318,6 +319,7 @@ func run(opts options, logger *slog.Logger) error {
 		SelfImage:      selfImage(os.Getenv, logger),
 		SelfMounts:     selfMounts(os.Getenv, logger),
 		SelfUser:       selfUser(os.Getenv, logger),
+		SelfGroups:     selfGroups(os.Getenv, logger),
 		OnConfigLoaded: func(cfg *config.Config) {
 			intervals.set(time.Duration(cfg.Global.PollInterval))
 		},
@@ -466,6 +468,47 @@ func selfUser(getenv func(string) string, logger *slog.Logger) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// selfGroups returns the supplementary groups the helper needs: docker's
+// group_add entries of the agent's own container (docker inspect
+// .HostConfig.GroupAdd), normally the host's docker gid that owns the socket.
+//
+// --user does not carry groups over, so a helper that inherits only the uid
+// starts, reads the plan and then fails at the first daemon call:
+//
+//	permission denied while trying to connect to the Docker daemon socket
+//
+// DOCKOPS_SELF_GROUPS overrides the lookup with a comma-separated gid list.
+// An empty answer is legitimate (an agent without group_add) and means "no
+// --group-add flag".
+func selfGroups(getenv func(string) string, logger *slog.Logger) []string {
+	if v := strings.TrimSpace(getenv(envSelfGroups)); v != "" {
+		groups := make([]string, 0, 2)
+		for _, g := range strings.Split(v, ",") {
+			if g = strings.TrimSpace(g); g != "" {
+				groups = append(groups, g)
+			}
+		}
+		return groups
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		logger.Warn("self groups: cannot determine the agent's container", "error", err, "hint", "set "+envSelfGroups)
+		return nil
+	}
+	out, err := exec.Command(helperDockerBinary, "inspect", "--format", "{{json .HostConfig.GroupAdd}}", host).Output()
+	if err != nil {
+		logger.Warn("self groups: docker does not know the agent's groups; the helper may not reach the docker socket",
+			"container", host, "error", err, "hint", "set "+envSelfGroups)
+		return nil
+	}
+	var groups []string
+	if err := json.Unmarshal(out, &groups); err != nil {
+		logger.Warn("self groups: cannot parse docker's group list", "container", host, "error", err, "hint", "set "+envSelfGroups)
+		return nil
+	}
+	return groups
 }
 
 // parseMountList splits DOCKOPS_SELF_MOUNTS, the escape hatch of selfMounts:

@@ -92,3 +92,14 @@ func TestPhase13SelfUserEnvWins(t *testing.T) {
 		t.Fatalf("selfUser() = %q, want the trimmed env value", got)
 	}
 }
+
+// TestPhase13SelfGroupsEnvWins pins the --group-add override: --user carries no
+// supplementary groups, so the helper needs docker's group_add list of the
+// agent (normally the host docker gid that owns the socket).
+func TestPhase13SelfGroupsEnvWins(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	got := selfGroups(fakeEnv(map[string]string{envSelfGroups: " 989 , 44 "}), logger)
+	if len(got) != 2 || got[0] != "989" || got[1] != "44" {
+		t.Fatalf("selfGroups() = %v, want [989 44]", got)
+	}
+}

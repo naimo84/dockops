@@ -175,7 +175,7 @@ func TestIsSelf(t *testing.T) {
 
 func TestHelperArgs(t *testing.T) {
 	p := validPlan()
-	args, err := HelperArgs(p, "ghcr.io/x/dockops:latest", "/var/lib/dockops", "1700000000", "3f1c2a9b4d5e", nil, "")
+	args, err := HelperArgs(p, "ghcr.io/x/dockops:latest", "/var/lib/dockops", "1700000000", "3f1c2a9b4d5e", nil, "", nil)
 	if err != nil {
 		t.Fatalf("HelperArgs() error = %v", err)
 	}
@@ -210,7 +210,7 @@ func TestHelperArgs(t *testing.T) {
 
 func TestHelperArgsRejectsUnknownSelfContainer(t *testing.T) {
 	for _, self := range []string{"", "   "} {
-		if _, err := HelperArgs(validPlan(), "img:1", "/var/lib/dockops", "1", self, nil, ""); err == nil {
+		if _, err := HelperArgs(validPlan(), "img:1", "/var/lib/dockops", "1", self, nil, "", nil); err == nil {
 			t.Errorf("HelperArgs() with self container %q must fail: without --volumes-from the helper has no mounts", self)
 		}
 	}
