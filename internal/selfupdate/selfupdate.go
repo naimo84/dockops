@@ -490,7 +490,7 @@ func MountArgs(mounts []Mount) []string {
 // binary) that starts the helper:
 //
 //	run -d --rm --name dockops-selfupdate-<project>-<suffix>
-//	    [--user <uid:gid>] --volumes-from <agent container>
+//	    [--user <uid:gid>] [--group-add <gid> ...] --volumes-from <agent container>
 //	    [-v <host>:<path>[:ro] ...]
 //	    <image> -selfupdate-helper -selfupdate-plan <stateDir>/selfupdate-plan.json
 //
@@ -519,7 +519,7 @@ func MountArgs(mounts []Mount) []string {
 // An empty value is an error rather than a degraded run: without the mounts
 // the helper cannot do its job, and starting it anyway would burn an update
 // and leave a confusing log behind.
-func HelperArgs(p Plan, image, stateDir, suffix, selfContainer string, mounts []Mount, user string) ([]string, error) {
+func HelperArgs(p Plan, image, stateDir, suffix, selfContainer string, mounts []Mount, user string, groups []string) ([]string, error) {
 	if strings.TrimSpace(selfContainer) == "" {
 		return nil, errors.New("helper args: the agent's own container (for --volumes-from) is unknown")
 	}
@@ -536,6 +536,16 @@ func HelperArgs(p Plan, image, stateDir, suffix, selfContainer string, mounts []
 	// helper runs with exactly the identity the agent has.
 	if u := strings.TrimSpace(user); u != "" {
 		args = append(args, "--user", u)
+	}
+	// Supplementary groups are not inherited by --user: they are docker's
+	// group_add entries of the agent (normally the host's docker gid, which
+	// owns /var/run/docker.sock). Without them the helper starts, reads the
+	// plan and then cannot talk to the daemon:
+	//   permission denied while trying to connect to the Docker daemon socket
+	for _, g := range groups {
+		if g = strings.TrimSpace(g); g != "" {
+			args = append(args, "--group-add", g)
+		}
 	}
 	args = append(args, "--volumes-from", selfContainer)
 	args = append(args, MountArgs(mounts)...)

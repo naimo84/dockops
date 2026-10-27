@@ -130,7 +130,7 @@ func (r *Reconciler) startSelfUpdate(ctx context.Context, stack config.Stack, re
 		return r.abandonSelfUpdate(stack.Name, recs, handed, fmt.Errorf("write plan: %w", err))
 	}
 
-	helperArgs, err := selfupdate.HelperArgs(plan, targets[0].Image, stateDir, fmt.Sprintf("%d", now.Unix()), r.selfContainer, r.selfMounts, r.selfUser)
+	helperArgs, err := selfupdate.HelperArgs(plan, targets[0].Image, stateDir, fmt.Sprintf("%d", now.Unix()), r.selfContainer, r.selfMounts, r.selfUser, r.selfGroups)
 	if err != nil {
 		// Nothing was started: the pending markers still have to go.
 		r.logger.Error("self update: cannot build the helper command", "stack", stack.Name, "error", err)

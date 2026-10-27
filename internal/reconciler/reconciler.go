@@ -278,6 +278,14 @@ type Deps struct {
 	// agent, which then cannot finalize its own deploy. Empty keeps the image
 	// default (correct when the agent itself runs as the image default).
 	SelfUser string
+
+	// SelfGroups are the agent's supplementary groups (docker inspect
+	// .HostConfig.GroupAdd), passed to the helper as --group-add. --user does
+	// not carry them over, and without the docker group the helper cannot open
+	// the socket — it then reports "permission denied while trying to connect
+	// to the Docker daemon socket". Empty is the correct value for an agent
+	// that needs no extra group.
+	SelfGroups []string
 }
 
 // Reconciler executes reconciliation passes over the declarative
@@ -344,6 +352,9 @@ type Reconciler struct {
 	// selfUser is the helper's --user value (Deps.SelfUser): the agent's own
 	// docker user, so plan, result and log stay readable for both sides.
 	selfUser string
+
+	// selfGroups are the helper's --group-add values (Deps.SelfGroups).
+	selfGroups []string
 }
 
 // New returns a Reconciler for deps, applying the defaults documented on
@@ -432,6 +443,7 @@ func New(deps Deps) *Reconciler {
 		selfImage:     deps.SelfImage,
 		selfMounts:    deps.SelfMounts,
 		selfUser:      deps.SelfUser,
+		selfGroups:    deps.SelfGroups,
 	}
 }
 
