@@ -271,6 +271,13 @@ type Deps struct {
 	// (volumes only) — correct for a named-volume installation, silently
 	// useless for a bind-mount one, which is why cmd/dockops always fills it.
 	SelfMounts []selfupdate.Mount
+
+	// SelfUser is the agent's own docker user (docker inspect .Config.User),
+	// passed to the helper as --user. Without it the helper runs as the image
+	// default — root — and its result/log files (0600) are unreadable for the
+	// agent, which then cannot finalize its own deploy. Empty keeps the image
+	// default (correct when the agent itself runs as the image default).
+	SelfUser string
 }
 
 // Reconciler executes reconciliation passes over the declarative
@@ -333,6 +340,10 @@ type Reconciler struct {
 	// (Deps.SelfMounts). Bind mounts are not inherited by --volumes-from, so
 	// without them the helper sees neither plan nor compose files.
 	selfMounts []selfupdate.Mount
+
+	// selfUser is the helper's --user value (Deps.SelfUser): the agent's own
+	// docker user, so plan, result and log stay readable for both sides.
+	selfUser string
 }
 
 // New returns a Reconciler for deps, applying the defaults documented on
@@ -420,6 +431,7 @@ func New(deps Deps) *Reconciler {
 		runHelper:     runDockerHelper,
 		selfImage:     deps.SelfImage,
 		selfMounts:    deps.SelfMounts,
+		selfUser:      deps.SelfUser,
 	}
 }
 

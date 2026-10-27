@@ -21,7 +21,10 @@ func TestHelperArgsMatchTheCLIFlags(t *testing.T) {
 	const image = "ghcr.io/x/dockops:test"
 	const stateDir = "/var/lib/dockops"
 
-	args, err := selfupdate.HelperArgs(p, image, stateDir, "1700000000", "abc123")
+	args, err := selfupdate.HelperArgs(p, image, stateDir, "1700000000", "abc123", nil, "")
+	if err != nil {
+		t.Fatalf("HelperArgs() error = %v", err)
+	}
 	if err != nil {
 		t.Fatalf("HelperArgs() error = %v", err)
 	}
