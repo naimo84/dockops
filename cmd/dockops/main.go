@@ -49,6 +49,7 @@ const (
 	envSelfUpdate     = "DOCKOPS_SELF_UPDATE"
 	envSelfImage      = "DOCKOPS_SELF_IMAGE"
 	envSelfMounts     = "DOCKOPS_SELF_MOUNTS"
+	envSelfUser       = "DOCKOPS_SELF_USER"
 )
 
 // Defaults for the flags and the poll loop.
@@ -316,6 +317,7 @@ func run(opts options, logger *slog.Logger) error {
 		SelfUpdate:     selfUpdateEnabled(os.Getenv),
 		SelfImage:      selfImage(os.Getenv, logger),
 		SelfMounts:     selfMounts(os.Getenv, logger),
+		SelfUser:       selfUser(os.Getenv, logger),
 		OnConfigLoaded: func(cfg *config.Config) {
 			intervals.set(time.Duration(cfg.Global.PollInterval))
 		},
@@ -433,6 +435,37 @@ func selfMounts(getenv func(string) string, logger *slog.Logger) []selfupdate.Mo
 		mounts = append(mounts, selfupdate.Mount{Host: m.Source, Path: m.Destination, ReadOnly: !m.RW})
 	}
 	return mounts
+}
+
+// selfUser returns the user spec the self-update helper runs as: the agent's
+// own runtime user (docker inspect .Config.User, e.g. "1000:4001").
+//
+// Not cosmetic. The helper writes selfupdate-result.json and
+// selfupdate-helper.log into the state directory with 0600. Started as the
+// image default (root) it owns those files, and the agent — a non-root uid in
+// its own container — cannot read the verdict it is waiting for: the log said
+// "self update: unreadable result file; falling back to the digest
+// comparison" and a phase-13 deploy stayed pending forever.
+//
+// An empty answer is legitimate (agent runs as the image default too) and
+// means "no --user flag". DOCKOPS_SELF_USER overrides it for installations
+// where docker cannot report the container.
+func selfUser(getenv func(string) string, logger *slog.Logger) string {
+	if v := strings.TrimSpace(getenv(envSelfUser)); v != "" {
+		return v
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		logger.Warn("self user: cannot determine the agent's container", "error", err, "hint", "set "+envSelfUser)
+		return ""
+	}
+	out, err := exec.Command(helperDockerBinary, "inspect", "--format", "{{.Config.User}}", host).Output()
+	if err != nil {
+		logger.Warn("self user: docker does not know the agent's user; the helper runs as the image default",
+			"container", host, "error", err, "hint", "set "+envSelfUser)
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // parseMountList splits DOCKOPS_SELF_MOUNTS, the escape hatch of selfMounts:

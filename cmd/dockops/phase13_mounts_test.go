@@ -82,3 +82,13 @@ func TestPhase13MountArgsOrdering(t *testing.T) {
 		t.Fatalf("MountArgs() = %v, want [-v /a:/b]", args)
 	}
 }
+
+// TestPhase13SelfUserEnvWins pins the --user override: the helper writes result
+// and log into the state dir, so it must run with the agent's own uid — as root
+// those files are unreadable for the agent and its deploy never finalizes.
+func TestPhase13SelfUserEnvWins(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if got := selfUser(fakeEnv(map[string]string{envSelfUser: "  1000:4001 "}), logger); got != "1000:4001" {
+		t.Fatalf("selfUser() = %q, want the trimmed env value", got)
+	}
+}

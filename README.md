@@ -917,7 +917,12 @@ Diagnosequelle.
 - Der Helper läuft im **laufenden** Image; ein kaputtes neues Image kann sich
   nicht selbst retten — dafür ist der Rollback auf `previous` da.
 - Der Helper hat Socket-Rechte (wie der Agent), aber keinen Repo-/Secret-
-  Zugriff: er liest den Plan und schreibt Ergebnis und Log.
+  Zugriff: er liest den Plan und schreibt Ergebnis und Log. Er läuft mit dem
+  **User des Agenten** (`--user` aus `docker inspect .Config.User`, Override
+  `DOCKOPS_SELF_USER`): Ergebnis und Log entstehen mit dessen uid, damit der
+  Agent sein eigenes Urteil lesen kann. Ohne das schreibt ein root-Helper
+  `0600`-Dateien, die der Agent nicht öffnen darf — der Deploy bleibt dann für
+  immer `pending` (`self update: unreadable result file`).
 - Der Helper erbt die Mounts des Agenten auf **zwei** Wegen:
   `--volumes-from <agent>` für Named Volumes **und** explizite
   `-v <host>:<container>[:ro]` für jeden Bind-Mount, den der Agent beim Start

@@ -55,14 +55,16 @@ func TestPhase13HelperArgsCarryMounts(t *testing.T) {
 	p := deployPlan()
 	image := "ghcr.io/x/dockops:test"
 	args, err := HelperArgs(p, image, "/var/lib/dockops", "1700000000", "abc123",
-		Mount{Host: "/home/docker/dockops", Path: "/var/lib/dockops"},
-		Mount{Host: "/var/run/docker.sock", Path: "/var/run/docker.sock", ReadOnly: true},
-	)
+		[]Mount{
+			{Host: "/home/docker/dockops", Path: "/var/lib/dockops"},
+			{Host: "/var/run/docker.sock", Path: "/var/run/docker.sock", ReadOnly: true},
+		}, "1000:4001")
 	if err != nil {
 		t.Fatalf("HelperArgs() error = %v", err)
 	}
 	joined := strings.Join(args, " ")
 	want := "run -d --rm --name " + HelperName(p, "1700000000") +
+		" --user 1000:4001" +
 		" --volumes-from abc123" +
 		" -v /home/docker/dockops:/var/lib/dockops" +
 		" -v /var/run/docker.sock:/var/run/docker.sock:ro" +
@@ -76,7 +78,22 @@ func TestPhase13HelperArgsCarryMounts(t *testing.T) {
 // without the agent's own container there is nothing to inherit and no
 // shipment to guess at.
 func TestPhase13HelperArgsStillNeedTheSelfContainer(t *testing.T) {
-	if _, err := HelperArgs(deployPlan(), "img", "/var/lib/dockops", "1", "  ", Mount{Host: "/a", Path: "/b"}); err == nil {
+	if _, err := HelperArgs(deployPlan(), "img", "/var/lib/dockops", "1", "  ", []Mount{{Host: "/a", Path: "/b"}}, ""); err == nil {
 		t.Fatal("HelperArgs() error = nil, want an error for a missing self container")
+	}
+}
+
+// TestPhase13HelperArgsWithoutUser pins the other side of the --user hand-over:
+// an agent that runs as the image default hands over no user spec, and the
+// helper must then start without the flag (a stray empty --user would make
+// docker refuse the container).
+func TestPhase13HelperArgsWithoutUser(t *testing.T) {
+	args, err := HelperArgs(deployPlan(), "img:1", "/var/lib/dockops", "1", "abc123", nil, "   ")
+	if err != nil {
+		t.Fatalf("HelperArgs() error = %v", err)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "--user") {
+		t.Errorf("HelperArgs() = %q, want no --user for an empty user spec", joined)
 	}
 }

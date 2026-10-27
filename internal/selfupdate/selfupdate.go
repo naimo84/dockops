@@ -490,7 +490,8 @@ func MountArgs(mounts []Mount) []string {
 // binary) that starts the helper:
 //
 //	run -d --rm --name dockops-selfupdate-<project>-<suffix>
-//	    --volumes-from <agent container> [-v <host>:<path>[:ro] ...]
+//	    [--user <uid:gid>] --volumes-from <agent container>
+//	    [-v <host>:<path>[:ro] ...]
 //	    <image> -selfupdate-helper -selfupdate-plan <stateDir>/selfupdate-plan.json
 //
 // Decisions worth naming:
@@ -518,15 +519,25 @@ func MountArgs(mounts []Mount) []string {
 // An empty value is an error rather than a degraded run: without the mounts
 // the helper cannot do its job, and starting it anyway would burn an update
 // and leave a confusing log behind.
-func HelperArgs(p Plan, image, stateDir, suffix, selfContainer string, mounts ...Mount) ([]string, error) {
+func HelperArgs(p Plan, image, stateDir, suffix, selfContainer string, mounts []Mount, user string) ([]string, error) {
 	if strings.TrimSpace(selfContainer) == "" {
 		return nil, errors.New("helper args: the agent's own container (for --volumes-from) is unknown")
 	}
 	args := []string{
 		"run", "-d", "--rm",
 		"--name", HelperName(p, suffix),
-		"--volumes-from", selfContainer,
 	}
+	// The helper writes the result and its log into the state directory. Run
+	// as the image default (root) it would own both files with 0600, and the
+	// agent — a non-root uid inside its own container — could not read its own
+	// verdict back: live that showed as "self update: unreadable result file;
+	// falling back to the digest comparison" with a deploy that stayed pending
+	// forever. user is the agent's own docker user spec (Config.User), so the
+	// helper runs with exactly the identity the agent has.
+	if u := strings.TrimSpace(user); u != "" {
+		args = append(args, "--user", u)
+	}
+	args = append(args, "--volumes-from", selfContainer)
 	args = append(args, MountArgs(mounts)...)
 	args = append(args,
 		image,
