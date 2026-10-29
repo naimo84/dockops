@@ -38,7 +38,16 @@ import (
 // deployment artifacts, a changed secret value must not redeploy). A state
 // file written against an older version therefore mismatches once and every
 // stack redeploys a single time, which is the safe direction.
-const schemaVersion = 3
+//
+// Version 4 adds the content digest of every vault_env_template (see
+// ComputeWithTemplates). Version 3 hashed only the template path, so editing
+// a template — a new host in a list, a different KV key, an added
+// placeholder — left the hash untouched and the agent never re-rendered the
+// stack environment; the change sat in the checkout until some unrelated
+// compose edit moved the hash. The digests cover the template *text*, i.e.
+// the deployment recipe, not the resolved values: rotating a secret in Vault
+// still does not redeploy anything.
+const schemaVersion = 4
 
 // canonicalStack is the fixed, JSON-serializable projection of a
 // config.Stack that enters the hash. Field order is irrelevant for the hash
@@ -56,8 +65,12 @@ type canonicalStack struct {
 	SopsFiles         []canonicalSopsFile `json:"sops_files"`
 	VaultPaths        []string            `json:"vault_paths"`
 	VaultEnvTemplates []string            `json:"vault_env_templates"`
-	Hooks             canonicalHooks      `json:"hooks"`
-	Compose           []any               `json:"compose"`
+	// VaultEnvTemplateContents carries one SHA-256 hex digest per template,
+	// in VaultEnvTemplates order. Nil when the caller could not supply the
+	// contents (see Compute).
+	VaultEnvTemplateContents []string       `json:"vault_env_template_contents"`
+	Hooks                    canonicalHooks `json:"hooks"`
+	Compose                  []any          `json:"compose"`
 }
 
 // canonicalSopsFile is the hash-relevant projection of config.SopsFile.
@@ -109,6 +122,29 @@ type canonicalHooks struct {
 // mapping keys, alias cycles) or a mismatch between the number of contents
 // and the stack's compose files, with stack and file context.
 func Compute(stack config.Stack, composeContents ...[]byte) (string, error) {
+	return ComputeWithTemplates(stack, nil, composeContents...)
+}
+
+// ComputeWithTemplates is Compute plus the raw contents of the stack's
+// vault_env_templates, one per entry of stack.VaultEnvTemplates in that
+// order. The deploy path passes them, so a template edit redeploys the stack
+// and re-renders its environment; Compute (no contents) hashes the template
+// paths only and is kept for callers that have no access to the files.
+//
+// Only the template text enters the hash, not the values resolved from
+// Vault: rotating a secret must not recreate containers (see schemaVersion).
+// A nil or empty templateContents hashes no digests, so a stack without
+// templates hashes identically either way.
+func ComputeWithTemplates(stack config.Stack, templateContents [][]byte, composeContents ...[]byte) (string, error) {
+	if len(templateContents) != 0 && len(templateContents) != len(stack.VaultEnvTemplates) {
+		return "", fmt.Errorf("stack %s: %d template contents for %d vault_env_templates",
+			stack.Name, len(templateContents), len(stack.VaultEnvTemplates))
+	}
+	digests := make([]string, len(templateContents))
+	for i, content := range templateContents {
+		sum := sha256.Sum256(content)
+		digests[i] = hex.EncodeToString(sum[:])
+	}
 	files := stack.EffectiveComposeFiles()
 	if len(files) != len(composeContents) {
 		return "", fmt.Errorf("stack %s: %d compose contents for %d compose files", stack.Name, len(composeContents), len(files))
@@ -123,17 +159,18 @@ func Compute(stack config.Stack, composeContents ...[]byte) (string, error) {
 	}
 
 	canon := canonicalStack{
-		SchemaVersion:     schemaVersion,
-		Name:              stack.Name,
-		Enabled:           stack.Enabled,
-		ComposeFiles:      nilIfEmpty(files),
-		Profiles:          sorted(stack.Profiles),
-		Services:          sorted(stack.EffectiveServices()),
-		IgnoreServices:    sorted(stack.IgnoreServices),
-		EnvFiles:          nilIfEmpty(stack.EnvFiles),
-		SopsFiles:         canonicalSopsFiles(stack.SopsFiles),
-		VaultPaths:        nilIfEmpty(stack.VaultPaths),
-		VaultEnvTemplates: nilIfEmpty(stack.VaultEnvTemplates),
+		SchemaVersion:            schemaVersion,
+		Name:                     stack.Name,
+		Enabled:                  stack.Enabled,
+		ComposeFiles:             nilIfEmpty(files),
+		Profiles:                 sorted(stack.Profiles),
+		Services:                 sorted(stack.EffectiveServices()),
+		IgnoreServices:           sorted(stack.IgnoreServices),
+		EnvFiles:                 nilIfEmpty(stack.EnvFiles),
+		SopsFiles:                canonicalSopsFiles(stack.SopsFiles),
+		VaultPaths:               nilIfEmpty(stack.VaultPaths),
+		VaultEnvTemplates:        nilIfEmpty(stack.VaultEnvTemplates),
+		VaultEnvTemplateContents: nilIfEmpty(digests),
 		Hooks: canonicalHooks{
 			PreDeploy:  nilIfEmpty(stack.Hooks.PreDeploy),
 			PostDeploy: nilIfEmpty(stack.Hooks.PostDeploy),

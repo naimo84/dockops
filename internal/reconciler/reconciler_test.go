@@ -809,6 +809,50 @@ func TestReconcileVaultEnvTemplates(t *testing.T) {
 	}
 }
 
+// TestReconcileVaultEnvTemplateEditRedeploys pins the schema-4 behaviour end
+// to end: an unchanged compose file plus an edited template must deploy
+// again, because the rendered environment changed. Schema 3 hashed the
+// template path only, so the pass logged "stack unchanged" and the stack kept
+// running with the stale environment.
+func TestReconcileVaultEnvTemplateEditRedeploys(t *testing.T) {
+	f := newFixture(t, defaultRoot)
+	f.vault.client.kv = map[string]map[string]string{
+		"hosts/host-01/traefik": {"db_password": "pg-secret", "db_user": "app"},
+	}
+	stackDir := filepath.Join(f.workDir, "host", "web")
+	f.addLocalStack("web", "name: web\nvault_env_templates: [tpl.env]\n")
+	tpl := filepath.Join(stackDir, "tpl.env")
+	writeFile(t, tpl, "DB_PASSWORD=${VAULT:hosts/host-01/traefik#db_password}\n")
+
+	rec := f.reconciler()
+	if err := rec.Reconcile(context.Background()); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if len(f.compose.ups) != 1 {
+		t.Fatalf("first pass Ups = %d, want 1", len(f.compose.ups))
+	}
+
+	// A second pass without changes must stay idle.
+	if err := rec.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if len(f.compose.ups) != 1 {
+		t.Fatalf("unchanged pass deployed again: Ups = %d, want 1", len(f.compose.ups))
+	}
+
+	// Template edit, compose untouched.
+	writeFile(t, tpl, "DB_PASSWORD=${VAULT:hosts/host-01/traefik#db_password}\nDB_USER=${VAULT:hosts/host-01/traefik#db_user}\n")
+	if err := rec.Reconcile(context.Background()); err != nil {
+		t.Fatalf("third Reconcile() error = %v", err)
+	}
+	if len(f.compose.ups) != 2 {
+		t.Fatalf("template edit did not redeploy: Ups = %d, want 2", len(f.compose.ups))
+	}
+	if got := f.compose.ups[1].env["DB_USER"]; got != "app" {
+		t.Errorf("second deploy env[DB_USER] = %q, want \"app\" (rendered from the edited template)", got)
+	}
+}
+
 func TestReconcileVaultEnvTemplateFailureFailsStack(t *testing.T) {
 	f := newFixture(t, defaultRoot)
 	f.vault.client.kv = map[string]map[string]string{

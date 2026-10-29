@@ -391,7 +391,7 @@ func TestComputeGoldenVector(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Compute() error = %v", err)
 	}
-	const want = "8c7e04c406b8c7a704d75f24d610cb5f295182160bc488e8381018259f646cab"
+	const want = "c517b9f8c9699124cb306e242e832326b5c757900583c67aa0eb18c8f544c642"
 	if got != want {
 		t.Errorf("golden vector hash = %s, want %s (schemaVersion changed?)", got, want)
 	}
@@ -430,5 +430,54 @@ func TestComputeVaultEnvTemplatesAffectHash(t *testing.T) {
 	if one == without || two == one || swapped == two {
 		t.Errorf("hashes without=%s one=%s two=%s swapped=%s; templates must change the hash (order included)",
 			without[:12], one[:12], two[:12], swapped[:12])
+	}
+}
+
+// TestComputeWithTemplatesContentAffectsHash pins the schema-4 rule: the
+// template text is part of the deployment recipe, so two templates with the
+// same path but different content must hash differently, while the identical
+// content must hash identically. The template path alone (schema 3) did not
+// see such an edit.
+func TestComputeWithTemplatesContentAffectsHash(t *testing.T) {
+	stack := baseStack()
+	stack.VaultEnvTemplates = []string{"vault.env"}
+	compose := []byte(baseCompose)
+
+	first, err := ComputeWithTemplates(stack, [][]byte{[]byte("A=1\n")}, compose)
+	if err != nil {
+		t.Fatalf("ComputeWithTemplates() error = %v", err)
+	}
+	same, err := ComputeWithTemplates(stack, [][]byte{[]byte("A=1\n")}, compose)
+	if err != nil {
+		t.Fatalf("ComputeWithTemplates() error = %v", err)
+	}
+	edited, err := ComputeWithTemplates(stack, [][]byte{[]byte("A=1\nB=2\n")}, compose)
+	if err != nil {
+		t.Fatalf("ComputeWithTemplates() error = %v", err)
+	}
+	pathOnly, err := Compute(stack, compose)
+	if err != nil {
+		t.Fatalf("Compute() error = %v", err)
+	}
+
+	if first != same {
+		t.Errorf("identical content hashed differently: %s vs %s", first[:12], same[:12])
+	}
+	if edited == first {
+		t.Errorf("edited template content hashed identically (%s); a template edit must redeploy", first[:12])
+	}
+	if pathOnly == first {
+		t.Errorf("hash without contents equals hash with contents (%s); the digest must enter the hash", first[:12])
+	}
+}
+
+// TestComputeWithTemplatesCountMismatch rejects a contents list that does not
+// line up with the declared templates — silently ignoring an entry would hash
+// a recipe the deployment does not use.
+func TestComputeWithTemplatesCountMismatch(t *testing.T) {
+	stack := baseStack()
+	stack.VaultEnvTemplates = []string{"vault.env"}
+	if _, err := ComputeWithTemplates(stack, [][]byte{[]byte("A=1\n"), []byte("B=2\n")}, []byte(baseCompose)); err == nil {
+		t.Fatal("ComputeWithTemplates() error = nil, want mismatch error")
 	}
 }
