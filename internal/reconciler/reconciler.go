@@ -524,7 +524,33 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		}
 		contents = append(contents, content)
 	}
-	newHash, err := stackhash.Compute(stack, contents...)
+	// The template contents are part of the hash: without them a template
+	// edit (host list, KV key, placeholder) leaves the hash unchanged and the
+	// stack is skipped as "unchanged" while its environment silently rots at
+	// the last render. The generated stack-dir .env is skipped for the same
+	// reason env.MergeStackEnv skips it — hashing dockops' own output would
+	// freeze stale resolved values into the hash.
+	generatedEnv := filepath.Join(stack.Dir, ".env")
+	templateContents := make([][]byte, 0, len(stack.VaultEnvTemplates))
+	for _, rel := range stack.VaultEnvTemplates {
+		path := rel
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(stack.Dir, path)
+		}
+		if filepath.Clean(path) == generatedEnv {
+			// Keep the list aligned with VaultEnvTemplates: the digest of an
+			// empty content hashes "this entry contributes no text", which is
+			// what dockops' own output must contribute.
+			templateContents = append(templateContents, nil)
+			continue
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("stack %s: read vault env template %s: %w", stack.Name, path, err)
+		}
+		templateContents = append(templateContents, content)
+	}
+	newHash, err := stackhash.ComputeWithTemplates(stack, templateContents, contents...)
 	if err != nil {
 		return fmt.Errorf("stack %s: compute hash: %w", stack.Name, err)
 	}
