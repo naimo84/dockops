@@ -35,6 +35,8 @@ jobs:
             dockerfile: Dockerfile
           - image: dockops-sops-sidecar
             dockerfile: cmd/sops-sidecar/Dockerfile.sidecar
+          - image: dockops-fleet
+            dockerfile: cmd/dockops-fleet/Dockerfile
     steps:
       - uses: actions/checkout@v4
 

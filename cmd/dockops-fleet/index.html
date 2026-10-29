@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dockops fleet</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #12151a; --card: #1a1e25; --line: #262c36; --fg: #e6e9ef; --muted: #8b94a3;
+    --ok: #3fb950; --partial: #d29922; --stopped: #8b949e; --unknown: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px; background: var(--bg); color: var(--fg);
+         font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  header.top { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; margin-bottom: 20px; }
+  h1 { font-size: 18px; margin: 0; letter-spacing: .04em; }
+  .summary { color: var(--muted); }
+  .summary b { color: var(--fg); font-weight: 600; }
+  button { margin-left: auto; background: var(--card); color: var(--fg); border: 1px solid var(--line);
+           border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--muted); }
+  main { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .card.error { border-color: #5b2a2a; }
+  .card h2 { font-size: 15px; margin: 0; }
+  .card .head { display: flex; align-items: center; gap: 8px; }
+  .card .url { color: var(--muted); font-size: 11px; margin: 4px 0 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--stopped); }
+  .ok .dot { background: var(--ok); } .partial .dot { background: var(--partial); }
+  .stopped .dot { background: var(--stopped); } .unknown .dot { background: var(--unknown); }
+  .ok .drift { color: var(--ok); } .partial .drift { color: var(--partial); }
+  .stopped .drift { color: var(--stopped); } .unknown .drift { color: var(--unknown); }
+  .drift { margin-left: auto; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  .err { color: #ff9c9c; font-size: 12px; margin: 0 0 10px; word-break: break-word; }
+  ul.stacks { list-style: none; margin: 0; padding: 0; }
+  ul.stacks li { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-top: 1px solid var(--line); }
+  ul.stacks li:first-child { border-top: 0; }
+  .sname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta, .when { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .upd { color: var(--partial); font-size: 11px; white-space: nowrap; }
+  .unmanaged { margin-top: 10px; color: var(--muted); font-size: 11px; }
+  .empty { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header class="top">
+  <h1>dockops fleet</h1>
+  <div class="summary" id="summary">lade …</div>
+  <button id="refresh" type="button">refresh</button>
+</header>
+<main id="hosts"></main>
+<script>
+"use strict";
+
+const SEVERITY = { ok: 0, stopped: 1, partial: 2, unknown: 3 };
+const REFRESH_MS = 30000;
+
+const el = (tag, cls, text) => {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  return node;
+};
+
+// hostDrift: the card ampel. A failed query or a failed container listing on
+// the agent is "unknown" for the whole host; otherwise the worst stack wins.
+function hostDrift(host) {
+  if (!host.ok) return "unknown";
+  const stacks = (host.status && host.status.stacks) || [];
+  if (host.status && host.status.error) return "unknown";
+  if (stacks.length === 0) return "unknown";
+  return stacks.reduce((worst, s) => SEVERITY[s.drift] > SEVERITY[worst] ? s.drift : worst, "ok");
+}
+
+function relTime(iso) {
+  if (!iso) return "";
+  const seconds = Math.round((Date.now() - Date.parse(iso)) / 1000);
+  if (!Number.isFinite(seconds)) return "";
+  if (seconds < 90) return "gerade";
+  const units = [[31536000, "J"], [2592000, "Mon"], [604800, "W"], [86400, "T"], [3600, "h"], [60, "min"]];
+  for (const [size, label] of units) {
+    if (seconds >= size) return `vor ${Math.floor(seconds / size)}${label}`;
+  }
+  return "gerade";
+}
+
+function shortDigest(digest) {
+  if (!digest) return "";
+  const hex = digest.includes(":") ? digest.split(":").pop() : digest;
+  return hex.slice(0, 7);
+}
+
+function renderStack(stack) {
+  const row = el("li");
+  row.append(el("span", "dot"));
+  row.append(el("span", "sname", stack.name));
+
+  const containers = stack.containers || [];
+  const running = containers.filter((c) => c.state === "running").length;
+  const unhealthy = containers.filter((c) => c.health && c.health !== "healthy").length;
+  row.append(el("span", "meta", `${running}/${containers.length}` + (unhealthy ? ` ⚠${unhealthy}` : "")));
+
+  const updates = stack.updates || {};
+  const pending = updates.pending || 0;
+  if (pending > 0) {
+    const candidate = (updates.services || []).find((s) => s.update_available) || {};
+    const digest = shortDigest(candidate.current_digest) && shortDigest(candidate.remote_digest)
+      ? ` ${shortDigest(candidate.current_digest)}→${shortDigest(candidate.remote_digest)}`
+      : "";
+    row.append(el("span", "upd", `${pending} Update${pending > 1 ? "s" : ""}${digest}`));
+  }
+  row.append(el("span", "when", relTime(stack.last_deployed)));
+  return row;
+}
+
+function renderHost(host) {
+  const drift = hostDrift(host);
+  const card = el("article", `card ${drift}`);
+  const head = el("div", "head");
+  head.append(el("span", "dot"));
+  head.append(el("h2", null, host.name));
+  head.append(el("span", "drift", drift));
+  card.append(head);
+  card.append(el("div", "url", host.url));
+
+  if (!host.ok) {
+    card.classList.add("error");
+    card.append(el("p", "err", host.error || "keine Antwort"));
+    return card;
+  }
+  if (host.status.error) card.append(el("p", "err", host.status.error));
+
+  const stacks = (host.status.stacks || []).slice();
+  stacks.sort((a, b) => (SEVERITY[b.drift] - SEVERITY[a.drift]) || a.name.localeCompare(b.name));
+  if (stacks.length === 0) {
+    card.append(el("p", "empty", "keine Stacks verwaltet"));
+  } else {
+    const list = el("ul", "stacks");
+    for (const stack of stacks) list.append(renderStack(stack));
+    card.append(list);
+  }
+
+  const unmanaged = host.status.unmanaged || [];
+  if (unmanaged.length > 0) {
+    card.append(el("div", "unmanaged", "unmanaged: " +
+      unmanaged.map((u) => `${u.project} (${(u.containers || []).length})`).join(", ")));
+  }
+  return card;
+}
+
+function render(doc) {
+  const hostList = document.getElementById("hosts");
+  hostList.replaceChildren();
+
+  const hosts = (doc.hosts || []).slice();
+  // Problems first, then name — the page answers "is anyone broken?" before
+  // "what exactly runs where".
+  hosts.sort((a, b) => (SEVERITY[hostDrift(b)] - SEVERITY[hostDrift(a)]) || a.name.localeCompare(b.name));
+  for (const host of hosts) hostList.append(renderHost(host));
+
+  const broken = hosts.filter((h) => !h.ok).length;
+  const summary = document.getElementById("summary");
+  summary.replaceChildren();
+  summary.append(el("b", null, String(hosts.length)), ` Hosts · `);
+  if (broken > 0) summary.append(el("b", null, `${broken} ohne Antwort`), ` · `);
+  summary.append(`Stand ${new Date(doc.generated_at).toLocaleTimeString()}`);
+}
+
+async function load() {
+  const summary = document.getElementById("summary");
+  try {
+    const res = await fetch("/api/fleet", { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    render(await res.json());
+  } catch (err) {
+    summary.textContent = `Aggregator nicht erreichbar: ${err.message}`;
+  }
+}
+
+document.getElementById("refresh").addEventListener("click", load);
+load();
+setInterval(load, REFRESH_MS);
+</script>
+</body>
+</html>
