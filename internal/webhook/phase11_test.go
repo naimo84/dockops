@@ -44,9 +44,7 @@ func TestStatusReportsApplyState(t *testing.T) {
 			},
 		},
 	}
-	fc := &fakeCompose{containers: map[string][]compose.Container{
-		"web": {{Name: "web-app-1", State: "running"}},
-	}}
+	fc := &fakeCompose{infos: []compose.ContainerInfo{{Project: "web", Name: "web-app-1", State: "running"}}}
 	h := statusFixture(t, map[string]state.State{"web": entry}, fc, nil)
 
 	rec := httptest.NewRecorder()
@@ -105,9 +103,7 @@ func TestStatusPolicyDefaultsToNotify(t *testing.T) {
 			"nginx:latest": {Service: "app", CheckedAt: time.Date(2026, 10, 21, 20, 0, 0, 0, time.UTC)},
 		},
 	}
-	fc := &fakeCompose{containers: map[string][]compose.Container{
-		"web": {{Name: "web-app-1", State: "running"}},
-	}}
+	fc := &fakeCompose{infos: []compose.ContainerInfo{{Project: "web", Name: "web-app-1", State: "running"}}}
 	h := statusFixture(t, map[string]state.State{"web": entry}, fc, nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))

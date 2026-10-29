@@ -1,15 +1,16 @@
 // GET /status — the monitoring surface: it compares the desired state
 // (state.json, written by the reconciler) against the running containers
-// (docker ps / compose ps via ComposeLister), so external watchdogs (Gatus,
+// (one docker ps -a via ComposeLister), so external watchdogs (Gatus,
 // curl, a Telegram bot) can tell drift without docker access of their own.
 //
-// Robustness beats precision here: a broken docker command degrades exactly
-// the affected part of the payload (a stack's drift becomes "unknown", the
-// unmanaged listing becomes a top-level error field) while the report
-// keeps answering — monitoring must not lose every stack because one
-// stack's ps failed. The document assembly lives in the exported
-// BuildStatus so the HTTP handler and the CLI's -print-status mode share
-// one implementation.
+// One docker call, not one per stack: the inventory carries the compose
+// project as a label, so a host with 100 stacks still costs a single
+// subprocess (~150 ms) instead of 100 (~6 s). The price is coarser
+// degradation — a broken docker call is host-wide, so every stack turns
+// "unknown" with the error on the document while the report keeps
+// answering. Monitoring must never fail because of the very thing it
+// measures. The document assembly lives in the exported BuildStatus so the
+// HTTP handler and the CLI's -print-status mode share one implementation.
 package webhook
 
 import (
@@ -88,8 +89,9 @@ type StatusResponse struct {
 	// Unmanaged holds running compose projects without a state entry,
 	// sorted by project.
 	Unmanaged []UnmanagedProject `json:"unmanaged"`
-	// Error names a failed unmanaged listing (top level); per-stack
-	// failures live on the stack entries instead.
+	// Error names a failed container listing (top level). Because that
+	// listing is host-wide, the same failure also appears on every stack
+	// entry (drift "unknown").
 	Error string `json:"error,omitempty"`
 }
 
@@ -222,33 +224,70 @@ func BuildStatus(ctx context.Context, deps StatusDeps) (StatusResponse, error) {
 		Unmanaged: make([]UnmanagedProject, 0),
 	}
 
+	// The single docker call for the whole document: containers grouped by
+	// their compose project label. Containers without a project (plain
+	// docker run) belong to no stack and to no project listing.
+	byProject := make(map[string][]compose.Container)
+	listingErr := error(nil)
+	infos, err := deps.Compose.PsContainers(ctx)
+	if err != nil {
+		logger.Warn("status: listing containers failed", "error", err)
+		listingErr = err
+		resp.Error = fmt.Sprintf("list containers: %v", err)
+	} else {
+		for _, info := range infos {
+			if info.Project == "" {
+				continue
+			}
+			byProject[info.Project] = append(byProject[info.Project], compose.Container{
+				Name:    info.Name,
+				State:   info.State,
+				Health:  info.Health,
+				Service: info.Service,
+			})
+		}
+	}
+
 	// Managed stacks: State.Names() is sorted, so the report is, too.
 	managed := make(map[string]struct{})
 	for _, name := range deps.State.Names() {
 		managed[name] = struct{}{}
 		st, _ := deps.State.Get(name)
-		resp.Stacks = append(resp.Stacks, buildStackStatus(ctx, logger, deps.Compose, name, st))
+		resp.Stacks = append(resp.Stacks, buildStackStatus(byProject[name], listingErr, name, st))
 	}
 
-	// Unmanaged: running compose projects without a state entry; the
-	// agent's own project never counts (it is managed by the operator's
-	// compose invocation, not by itself). A failed listing degrades to the
-	// top-level error field — the stacks part stays usable.
-	refs, err := deps.Compose.PsAllProjects(ctx)
-	if err != nil {
-		logger.Warn("status: listing running compose projects failed", "error", err)
-		resp.Error = fmt.Sprintf("list running projects: %v", err)
-	} else {
-		for _, ref := range refs {
-			if _, ok := managed[ref.Project]; ok {
+	// Unmanaged: compose projects with running containers but no state
+	// entry; the agent's own project never counts (it is managed by the
+	// operator's compose invocation, not by itself). The running filter is
+	// the definition, not an optimization: "unmanaged" has always meant
+	// "something runs here that dockops does not know", and a stopped
+	// foreign project is none of the report's business.
+	if listingErr == nil {
+		projects := make([]string, 0, len(byProject))
+		for project := range byProject {
+			projects = append(projects, project)
+		}
+		sort.Strings(projects)
+		for _, project := range projects {
+			if _, ok := managed[project]; ok {
 				continue
 			}
-			if deps.SelfProject != "" && ref.Project == deps.SelfProject {
+			if deps.SelfProject != "" && project == deps.SelfProject {
 				continue
 			}
+			names := make([]string, 0, len(byProject[project]))
+			for _, container := range byProject[project] {
+				if container.State == "running" {
+					names = append(names, container.Name)
+				}
+			}
+			if len(names) == 0 {
+				continue
+			}
+			sort.Strings(names)
 			resp.Unmanaged = append(resp.Unmanaged, UnmanagedProject{
-				Project:    ref.Project,
-				Containers: ref.Containers,
+				Project:    project,
+				Containers: names,
 			})
 		}
 	}
@@ -281,10 +320,11 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // buildStackStatus builds the report of one managed stack: recorded hash
-// and timestamp from the state entry, live containers from compose ps,
-// drift from the matrix below. A failed ps degrades to drift "unknown" with
-// the error message on the entry — the report keeps going.
-func buildStackStatus(ctx context.Context, logger *slog.Logger, lister ComposeLister, name string, st state.State) StackStatus {
+// and timestamp from the state entry, live containers from the shared
+// inventory, drift from the matrix below. A failed listing degrades every
+// stack to drift "unknown" with the error message on the entry — the report
+// keeps going.
+func buildStackStatus(containers []compose.Container, listingErr error, name string, st state.State) StackStatus {
 	entry := StackStatus{
 		Name:         name,
 		DeployedHash: st.Hash,
@@ -298,11 +338,9 @@ func buildStackStatus(ctx context.Context, logger *slog.Logger, lister ComposeLi
 	if !st.UpdatedAt.IsZero() {
 		entry.LastDeployed = st.UpdatedAt.UTC().Format(time.RFC3339)
 	}
-	containers, err := lister.PsProject(ctx, name)
-	if err != nil {
-		logger.Warn("status: listing containers failed", "stack", name, "error", err)
+	if listingErr != nil {
 		entry.Drift = driftUnknown
-		entry.Error = err.Error()
+		entry.Error = listingErr.Error()
 		return entry
 	}
 	entry.Containers = sortContainers(containers)

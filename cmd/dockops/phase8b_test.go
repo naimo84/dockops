@@ -24,24 +24,15 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// fakeLister implements webhook.ComposeLister with canned results, so the
-// one-shot path is testable without docker.
+// fakeLister implements webhook.ComposeLister with one canned host
+// inventory, so the one-shot path is testable without docker.
 type fakeLister struct {
-	containers map[string][]compose.Container
-	psErrs     map[string]error
-	refs       []compose.ProjectRef
-	refsErr    error
+	infos    []compose.ContainerInfo
+	infosErr error
 }
 
-func (f *fakeLister) PsProject(_ context.Context, project string) ([]compose.Container, error) {
-	if err, ok := f.psErrs[project]; ok {
-		return nil, err
-	}
-	return f.containers[project], nil
-}
-
-func (f *fakeLister) PsAllProjects(_ context.Context) ([]compose.ProjectRef, error) {
-	return f.refs, f.refsErr
+func (f *fakeLister) PsContainers(_ context.Context) ([]compose.ContainerInfo, error) {
+	return f.infos, f.infosErr
 }
 
 func TestParseFlagsPrintStatus(t *testing.T) {
@@ -120,12 +111,11 @@ func TestWriteStatus(t *testing.T) {
 	}
 
 	fl := &fakeLister{
-		containers: map[string][]compose.Container{
-			"alpha": {{Name: "alpha-1", State: "running"}},
+		infos: []compose.ContainerInfo{
+			{Project: "alpha", Name: "alpha-1", Service: "web", State: "running"},
+			{Project: "beta", Name: "beta-1", Service: "db", State: "exited"},
+			{Project: "legacy", Name: "legacy-1", State: "running"},
 		},
-		psErrs:  map[string]error{"beta": errors.New("docker daemon unreachable")},
-		refs:    []compose.ProjectRef{{Project: "legacy", Containers: []string{"legacy-1"}}},
-		refsErr: nil,
 	}
 
 	var buf bytes.Buffer
@@ -149,8 +139,8 @@ func TestWriteStatus(t *testing.T) {
 		t.Errorf("output does not start with two-space indented JSON: %q", out[:min(len(out), 40)])
 	}
 
-	// Structure and tolerance: alpha ok with hash and timestamp, beta
-	// unknown with the ps error, unmanaged from the project listing.
+	// Structure: alpha ok with hash and timestamp, beta stopped, unmanaged
+	// from the same inventory.
 	var doc map[string]any
 	if err := json.Unmarshal([]byte(out), &doc); err != nil {
 		t.Fatalf("decode writeStatus output %q: %v", out, err)
@@ -167,11 +157,8 @@ func TestWriteStatus(t *testing.T) {
 		t.Errorf("alpha = %v, want hash and RFC3339 timestamp from the state entry", alpha)
 	}
 	beta, _ := stacks[1].(map[string]any)
-	if beta["drift"] != "unknown" {
-		t.Errorf("beta drift = %v, want unknown (ps failed)", beta["drift"])
-	}
-	if msg, _ := beta["error"].(string); !strings.Contains(msg, "docker daemon unreachable") {
-		t.Errorf("beta error = %v, want the compose ps error message", beta["error"])
+	if beta["drift"] != "stopped" {
+		t.Errorf("beta drift = %v, want stopped (all containers exited)", beta["drift"])
 	}
 	unmanaged, _ := doc["unmanaged"].([]any)
 	if len(unmanaged) != 1 {
@@ -184,6 +171,47 @@ func TestWriteStatus(t *testing.T) {
 	hostRepo, _ := doc["host_repo"].(map[string]any)
 	if hostRepo["commit"] != "" {
 		t.Errorf("host_repo.commit = %v, want empty string without a HeadCommit callback", hostRepo["commit"])
+	}
+}
+
+// TestWriteStatusListingError: the single docker call fails host-wide, so the
+// document — not the exit code — carries the damage: every stack unknown,
+// top-level error set, output still parseable.
+func TestWriteStatusListingError(t *testing.T) {
+	store, err := state.New(filepath.Join(t.TempDir(), "state.json"), discardLogger())
+	if err != nil {
+		t.Fatalf("state.New() error = %v", err)
+	}
+	if err := store.Set("alpha", state.State{Hash: "h-alpha", Status: state.StatusDeployed}); err != nil {
+		t.Fatalf("state.Set(alpha) error = %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := writeStatus(context.Background(), webhook.StatusDeps{
+		State:   store,
+		Compose: &fakeLister{infosErr: errors.New("docker ps blew up")},
+		Logger:  discardLogger(),
+	}, &buf); err != nil {
+		t.Fatalf("writeStatus() error = %v, want nil (docker failures live in the document)", err)
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatalf("decode writeStatus output %q: %v", buf.String(), err)
+	}
+	if msg, _ := doc["error"].(string); !strings.Contains(msg, "docker ps blew up") {
+		t.Errorf("top-level error = %v, want the listing failure", doc["error"])
+	}
+	stacks, _ := doc["stacks"].([]any)
+	if len(stacks) != 1 {
+		t.Fatalf("stacks = %v, want 1 entry", doc["stacks"])
+	}
+	alpha, _ := stacks[0].(map[string]any)
+	if alpha["drift"] != "unknown" {
+		t.Errorf("alpha drift = %v, want unknown", alpha["drift"])
+	}
+	if msg, _ := alpha["error"].(string); !strings.Contains(msg, "docker ps blew up") {
+		t.Errorf("alpha error = %v, want the listing failure", alpha["error"])
 	}
 }
 
