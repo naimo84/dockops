@@ -55,16 +55,12 @@ const (
 )
 
 // ComposeLister is the subset of compose.Executor GET /status needs: the
-// running containers of one project and the running compose projects of the
-// host. It is an injection point so handler tests run without docker.
+// container inventory of the whole host, one docker call for every project
+// and stack. It is an injection point so handler tests run without docker.
 type ComposeLister interface {
-	// PsProject lists all containers of a compose project
-	// (compose.Executor.PsProject).
-	PsProject(ctx context.Context, project string) ([]compose.Container, error)
-
-	// PsAllProjects lists the running compose projects with their
-	// containers (compose.Executor.PsAllProjects).
-	PsAllProjects(ctx context.Context) ([]compose.ProjectRef, error)
+	// PsContainers lists every container of the host, running or not,
+	// carrying its compose project label (compose.Executor.PsContainers).
+	PsContainers(ctx context.Context) ([]compose.ContainerInfo, error)
 }
 
 // Compile-time assertion that the real executor satisfies the injection

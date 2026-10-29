@@ -58,9 +58,7 @@ func TestStatusReportsImageUpdates(t *testing.T) {
 			},
 		},
 	}
-	fc := &fakeCompose{containers: map[string][]compose.Container{
-		"web": {{Name: "web-app-1", State: "running"}},
-	}}
+	fc := &fakeCompose{infos: []compose.ContainerInfo{{Project: "web", Name: "web-app-1", State: "running"}}}
 	h := statusFixture(t, map[string]state.State{"web": entry}, fc, nil)
 
 	rec := httptest.NewRecorder()
@@ -120,9 +118,7 @@ func TestStatusReportsImageUpdates(t *testing.T) {
 
 func TestStatusOmitsUpdatesWithoutRecords(t *testing.T) {
 	entry := state.State{Hash: "abc123", Status: state.StatusDeployed}
-	fc := &fakeCompose{containers: map[string][]compose.Container{
-		"web": {{Name: "web-app-1", State: "running"}},
-	}}
+	fc := &fakeCompose{infos: []compose.ContainerInfo{{Project: "web", Name: "web-app-1", State: "running"}}}
 	h := statusFixture(t, map[string]state.State{"web": entry}, fc, nil)
 
 	rec := httptest.NewRecorder()
@@ -145,7 +141,7 @@ func TestStatusKeepsUpdatesOnContainerListingError(t *testing.T) {
 			},
 		},
 	}
-	fc := &fakeCompose{psErrs: map[string]error{"web": errTest("ps boom")}}
+	fc := &fakeCompose{infosErr: errTest("ps boom")}
 	h := statusFixture(t, map[string]state.State{"web": entry}, fc, nil)
 
 	rec := httptest.NewRecorder()

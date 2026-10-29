@@ -6,7 +6,6 @@ package webhook
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"path/filepath"
 	"reflect"
@@ -21,25 +20,17 @@ import (
 // BuildStatus over the same collaborators and compares the decoded
 // documents: generated_at necessarily differs (two snapshots), everything
 // else must be byte-equivalent — otherwise -print-status and /status would
-// drift apart. The fixture includes both failure modes (per-stack ps error,
-// failed project listing) so the tolerance contract is part of the
-// comparison.
+// drift apart. The fixture carries managed, self and unmanaged projects in
+// one inventory, because both sides now read the same single docker call.
 func TestBuildStatusMatchesStatusEndpoint(t *testing.T) {
 	deployed := time.Date(2026, 10, 2, 8, 30, 0, 0, time.UTC)
 	fc := &fakeCompose{
-		containers: map[string][]compose.Container{
-			"alpha": {{Name: "alpha-a", State: "running", Health: "healthy"}},
-			"beta":  {{Name: "beta-1", State: "exited"}},
+		infos: []compose.ContainerInfo{
+			{Project: "alpha", Name: "alpha-a", Service: "web", State: "running", Health: "healthy"},
+			{Project: "beta", Name: "beta-1", Service: "db", State: "exited"},
+			{Project: "dockops", Name: "dockops-1", State: "running"},
+			{Project: "legacy", Name: "legacy-1", State: "running"},
 		},
-		psErrs: map[string]error{
-			"gamma": errors.New("docker daemon unreachable"),
-		},
-		refs: []compose.ProjectRef{
-			{Project: "alpha", Containers: []string{"alpha-a"}},     // managed
-			{Project: "dockops", Containers: []string{"dockops-1"}}, // self
-			{Project: "legacy", Containers: []string{"legacy-1"}},   // unmanaged
-		},
-		refsErr: errors.New("docker ps blew up"),
 	}
 
 	store, err := state.New(filepath.Join(t.TempDir(), "state.json"), quietLogger())
@@ -107,17 +98,13 @@ func TestBuildStatusMatchesStatusEndpoint(t *testing.T) {
 		t.Fatalf("decode BuildStatus document %s: %v", raw, err)
 	}
 
-	// The tolerance contract holds on the direct document as well: the
-	// failed stack degrades to unknown with its error, the failed project
-	// listing to the top-level error, and neither fails the call.
-	if got := driftOf(t, direct, "gamma"); got != "unknown" {
-		t.Errorf("gamma drift = %q, want unknown (ps failed)", got)
-	}
-	if got := driftOf(t, direct, "alpha"); got != "ok" {
-		t.Errorf("alpha drift = %q, want ok", got)
-	}
-	if msg, _ := direct["error"].(string); msg == "" {
-		t.Errorf("top-level error = %v, want the listing failure message", direct["error"])
+	// Sanity on the direct document (the deep comparison below is the real
+	// assertion): the recorded stacks land where the inventory puts them,
+	// gamma has no containers at all.
+	for name, want := range map[string]string{"alpha": "ok", "beta": "stopped", "gamma": "stopped"} {
+		if got := driftOf(t, direct, name); got != want {
+			t.Errorf("%s drift = %q, want %q", name, got, want)
+		}
 	}
 
 	delete(endpoint, "generated_at")

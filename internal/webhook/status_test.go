@@ -15,25 +15,16 @@ import (
 	"github.com/local/dockops/internal/state"
 )
 
-// fakeCompose implements ComposeLister with canned results: fixed container
-// lists per project, optional per-project ps errors and a fixed result of the
-// all-projects listing.
+// fakeCompose implements ComposeLister with one canned host inventory: the
+// whole document comes from this single call, so there is no per-stack
+// fixture anymore — only an optional host-wide error.
 type fakeCompose struct {
-	containers map[string][]compose.Container
-	psErrs     map[string]error
-	refs       []compose.ProjectRef
-	refsErr    error
+	infos    []compose.ContainerInfo
+	infosErr error
 }
 
-func (f *fakeCompose) PsProject(_ context.Context, project string) ([]compose.Container, error) {
-	if err, ok := f.psErrs[project]; ok {
-		return nil, err
-	}
-	return f.containers[project], nil
-}
-
-func (f *fakeCompose) PsAllProjects(_ context.Context) ([]compose.ProjectRef, error) {
-	return f.refs, f.refsErr
+func (f *fakeCompose) PsContainers(_ context.Context) ([]compose.ContainerInfo, error) {
+	return f.infos, f.infosErr
 }
 
 // statusFixture is a fully wired handler fixture: a state store with the given
@@ -117,38 +108,33 @@ func driftOf(t *testing.T, resp map[string]any, name string) string {
 func TestStatusDriftMatrixAndUnmanaged(t *testing.T) {
 	deployed := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 	fc := &fakeCompose{
-		containers: map[string][]compose.Container{
+		infos: []compose.ContainerInfo{
 			// alpha: two running → ok (output arrives unsorted, response sorts).
-			"alpha": {
-				{Name: "alpha-b", State: "running", Health: "healthy"},
-				{Name: "alpha-a", State: "running"},
-			},
+			{Project: "alpha", Name: "alpha-b", Service: "web", State: "running", Health: "healthy"},
+			{Project: "alpha", Name: "alpha-a", Service: "db", State: "running"},
 			// beta: everything exited → stopped.
-			"beta": {{Name: "beta-1", State: "exited"}},
+			{Project: "beta", Name: "beta-1", Service: "app", State: "exited"},
 			// gamma: one running, one exited → partial.
-			"gamma": {
-				{Name: "gamma-1", State: "running", Health: "healthy"},
-				{Name: "gamma-2", State: "exited"},
-			},
+			{Project: "gamma", Name: "gamma-1", Service: "app", State: "running", Health: "healthy"},
+			{Project: "gamma", Name: "gamma-2", Service: "worker", State: "exited"},
 			// delta: no containers at all → stopped as well (0 running).
-		},
-		psErrs: map[string]error{
-			// epsilon: compose ps fails → unknown, but listed, endpoint 200.
-			"epsilon": errors.New("docker daemon unreachable"),
-		},
-		refs: []compose.ProjectRef{
-			{Project: "alpha", Containers: []string{"alpha-a", "alpha-b"}}, // managed
-			{Project: "dockops", Containers: []string{"dockops-1"}},        // self
-			{Project: "legacy", Containers: []string{"legacy-1"}},          // unmanaged
-			{Project: "other", Containers: []string{"other-1", "other-2"}}, // unmanaged
+			// Legacy projects: two unmanaged with running containers, one
+			// unmanaged that is fully stopped, one plain docker run.
+			{Project: "legacy", Name: "legacy-1", State: "running"},
+			{Project: "other", Name: "other-1", State: "running"},
+			{Project: "other", Name: "other-2", State: "running"},
+			{Project: "ghost", Name: "ghost-1", State: "exited"},
+			// The agent's own project, never reported as unmanaged.
+			{Project: "dockops", Name: "dockops-1", State: "running"},
+			// No compose project: belongs to no stack and no project listing.
+			{Name: "plain-container", State: "running"},
 		},
 	}
 	h := statusFixture(t, map[string]state.State{
-		"alpha":   {Hash: "h-alpha", Status: state.StatusDeployed, UpdatedAt: deployed},
-		"beta":    {Hash: "h-beta", Status: state.StatusDeployed, UpdatedAt: deployed},
-		"gamma":   {Hash: "h-gamma", Status: state.StatusDeployed, UpdatedAt: deployed},
-		"delta":   {Hash: "h-delta", Status: state.StatusDeployed, UpdatedAt: deployed},
-		"epsilon": {Hash: "h-epsilon", Status: state.StatusFailed, UpdatedAt: deployed},
+		"alpha": {Hash: "h-alpha", Status: state.StatusDeployed, UpdatedAt: deployed},
+		"beta":  {Hash: "h-beta", Status: state.StatusDeployed, UpdatedAt: deployed},
+		"gamma": {Hash: "h-gamma", Status: state.StatusDeployed, UpdatedAt: deployed},
+		"delta": {Hash: "h-delta", Status: state.StatusDeployed, UpdatedAt: deployed},
 	}, fc, nil)
 
 	rec := do(h, http.MethodGet, "/status", nil, nil)
@@ -178,17 +164,20 @@ func TestStatusDriftMatrixAndUnmanaged(t *testing.T) {
 		t.Errorf("host_repo.commit = %v, want HEAD sha from callback", hostRepo["commit"])
 	}
 
-	// Drift matrix, stacks sorted by name (alpha..epsilon).
+	// Drift matrix, stacks sorted by name (alpha..gamma).
 	for name, want := range map[string]string{
-		"alpha":   "ok",
-		"beta":    "stopped",
-		"gamma":   "partial",
-		"delta":   "stopped",
-		"epsilon": "unknown",
+		"alpha": "ok",
+		"beta":  "stopped",
+		"gamma": "partial",
+		"delta": "stopped",
 	} {
 		if got := driftOf(t, resp, name); got != want {
 			t.Errorf("stack %s drift = %q, want %q", name, got, want)
 		}
+	}
+	// A healthy host reports no top-level error.
+	if msg, _ := resp["error"].(string); msg != "" {
+		t.Errorf("top-level error = %q, want empty", msg)
 	}
 
 	// The ok stack: hash, last_deployed and the sorted container list.
@@ -207,29 +196,17 @@ func TestStatusDriftMatrixAndUnmanaged(t *testing.T) {
 		t.Fatalf("alpha containers = %v, want 2 entries", alpha["containers"])
 	}
 	first, _ := containers[0].(map[string]any)
-	if first["name"] != "alpha-a" || first["state"] != "running" {
-		t.Errorf("alpha containers[0] = %v, want alpha-a/running (sorted by name)", first)
+	if first["name"] != "alpha-a" || first["state"] != "running" || first["service"] != "db" {
+		t.Errorf("alpha containers[0] = %v, want alpha-a/running/db (sorted by name)", first)
 	}
 	second, _ := containers[1].(map[string]any)
 	if second["name"] != "alpha-b" || second["health"] != "healthy" {
 		t.Errorf("alpha containers[1] = %v, want alpha-b/healthy", second)
 	}
 
-	// The failed-ps stack: error message set, containers empty, still 200.
-	// Sorted order is alpha, beta, delta, epsilon, gamma.
-	epsilon := statusStack(t, resp, 3)
-	if epsilon["name"] != "epsilon" {
-		t.Fatalf("stacks[3].name = %v, want epsilon", epsilon["name"])
-	}
-	if msg, _ := epsilon["error"].(string); !strings.Contains(msg, "docker daemon unreachable") {
-		t.Errorf("epsilon error = %v, want the compose ps error message", epsilon["error"])
-	}
-	if cs, _ := epsilon["containers"].([]any); len(cs) != 0 {
-		t.Errorf("epsilon containers = %v, want empty array", epsilon["containers"])
-	}
-
 	// Unmanaged: legacy and other (alpha is managed, dockops is the agent's
-	// own project), sorted by project with their container names.
+	// own project, ghost is fully stopped), sorted by project with their
+	// running container names.
 	unmanaged, _ := resp["unmanaged"].([]any)
 	if len(unmanaged) != 2 {
 		t.Fatalf("unmanaged = %v, want 2 entries (legacy, other)", resp["unmanaged"])
@@ -251,7 +228,7 @@ func TestStatusDriftMatrixAndUnmanaged(t *testing.T) {
 }
 
 func TestStatusEmptyStateYieldsEmptyArrays(t *testing.T) {
-	h := statusFixture(t, nil, &fakeCompose{containers: map[string][]compose.Container{}}, nil)
+	h := statusFixture(t, nil, &fakeCompose{}, nil)
 
 	rec := do(h, http.MethodGet, "/status", nil, nil)
 	if rec.Code != http.StatusOK {
@@ -267,30 +244,38 @@ func TestStatusEmptyStateYieldsEmptyArrays(t *testing.T) {
 	}
 }
 
-func TestStatusUnmanagedListingErrorKeeps200(t *testing.T) {
+// TestStatusListingErrorMarksEveryStackUnknown pins the coarser degradation
+// the single-call design buys: one failed docker ps is host-wide, so every
+// stack says "unknown" with the error and the document still answers 200.
+func TestStatusListingErrorMarksEveryStackUnknown(t *testing.T) {
 	fc := &fakeCompose{
-		containers: map[string][]compose.Container{
-			"alpha": {{Name: "alpha-1", State: "running"}},
-		},
-		refsErr: errors.New("docker ps blew up"),
+		infos:    []compose.ContainerInfo{{Project: "alpha", Name: "alpha-1", State: "running"}},
+		infosErr: errors.New("docker ps blew up"),
 	}
 	h := statusFixture(t, map[string]state.State{
 		"alpha": {Hash: "h", Status: state.StatusDeployed, UpdatedAt: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)},
+		"beta":  {Hash: "h", Status: state.StatusDeployed, UpdatedAt: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)},
 	}, fc, nil)
 
 	rec := do(h, http.MethodGet, "/status", nil, nil)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /status status = %d, want 200 even when the project listing fails", rec.Code)
+		t.Fatalf("GET /status status = %d, want 200 even when the container listing fails", rec.Code)
 	}
 	resp := decodeStatus(t, rec)
-	if got := driftOf(t, resp, "alpha"); got != "ok" {
-		t.Errorf("alpha drift = %q, want ok (stack part unaffected)", got)
+	for _, name := range []string{"alpha", "beta"} {
+		if got := driftOf(t, resp, name); got != "unknown" {
+			t.Errorf("%s drift = %q, want unknown (host-wide failure)", name, got)
+		}
 	}
 	if msg, _ := resp["error"].(string); !strings.Contains(msg, "docker ps blew up") {
 		t.Errorf("top-level error = %v, want the listing failure", resp["error"])
 	}
 	if arr, _ := resp["unmanaged"].([]any); len(arr) != 0 {
 		t.Errorf("unmanaged = %v, want empty array on listing failure", resp["unmanaged"])
+	}
+	stack := statusStack(t, resp, 0)
+	if msg, _ := stack["error"].(string); !strings.Contains(msg, "docker ps blew up") {
+		t.Errorf("stacks[0].error = %v, want the listing failure", stack["error"])
 	}
 }
 

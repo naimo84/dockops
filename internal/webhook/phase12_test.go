@@ -40,9 +40,7 @@ func TestStatusReportsSelfUpdatePending(t *testing.T) {
 			},
 		},
 	}
-	fc := &fakeCompose{containers: map[string][]compose.Container{
-		"dockops": {{Name: "dockops-1", State: "running"}},
-	}}
+	fc := &fakeCompose{infos: []compose.ContainerInfo{{Project: "dockops", Name: "dockops-1", State: "running"}}}
 	h := statusFixture(t, map[string]state.State{"dockops": entry}, fc, nil)
 
 	rec := httptest.NewRecorder()
@@ -98,9 +96,7 @@ func TestStatusOmitsSelfUpdatePendingWhenIdle(t *testing.T) {
 			},
 		},
 	}
-	fc := &fakeCompose{containers: map[string][]compose.Container{
-		"web": {{Name: "web-app-1", State: "running"}},
-	}}
+	fc := &fakeCompose{infos: []compose.ContainerInfo{{Project: "web", Name: "web-app-1", State: "running"}}}
 	h := statusFixture(t, map[string]state.State{"web": entry}, fc, nil)
 
 	rec := httptest.NewRecorder()
