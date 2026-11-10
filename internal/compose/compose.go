@@ -11,6 +11,7 @@ package compose
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -35,6 +36,11 @@ const maxErrorOutput = 512
 type Executor struct {
 	binary string
 	logger *slog.Logger
+	// selfContainer is the name (or ID) of the agent's own container, used to
+	// read the mount mappings that translate container paths into the
+	// daemon's namespace (see bindOverrideArgs). Empty means "runs on the
+	// host": no translation, container paths are already host paths.
+	selfContainer string
 }
 
 // New creates an Executor invoking binary ("docker" when empty). A nil
@@ -48,6 +54,17 @@ func New(logger *slog.Logger, binary string) *Executor {
 		logger = slog.Default()
 	}
 	return &Executor{binary: binary, logger: logger}
+}
+
+// WithSelfContainer returns a copy of the executor that knows the name (or ID)
+// of the agent's own container. With it, deploys rewrite relative bind sources
+// to absolute host paths (see bindOverrideArgs); without it the container paths
+// are passed through unchanged, which is correct when dockops runs on the host
+// and wrong when it runs in a container.
+func (e *Executor) WithSelfContainer(name string) *Executor {
+	copy := *e
+	copy.selfContainer = name
+	return &copy
 }
 
 // Up brings the stack up detached:
@@ -67,9 +84,14 @@ func (e *Executor) Up(ctx context.Context, stack config.Stack, stackDir, envFile
 	if err != nil {
 		return err
 	}
+	fileArgs, bindCleanup, err := e.bindOverrideArgs(ctx, stack, stackDir)
+	if err != nil {
+		return err
+	}
+	defer bindCleanup()
 	args, err := upSpec{
 		project:  stack.Name,
-		fileArgs: composeFileArgs(stack, stackDir),
+		fileArgs: fileArgs,
 		stackDir: stackDir,
 		profiles: stack.Profiles,
 		envFile:  envFile,
@@ -78,6 +100,78 @@ func (e *Executor) Up(ctx context.Context, stack config.Stack, stackDir, envFile
 		return err
 	}
 	return e.run(ctx, append(args, services...))
+}
+
+// bindOverrideFilePattern names the generated bind override in the stack
+// directory. A file rather than a temp dir on purpose: the name tells an
+// operator where a source came from, and a crashed agent leaves an artifact
+// that is obviously dockops's own (the same reasoning as the rollback
+// override). It is rewritten on every deploy and removed afterwards.
+const bindOverrideFilePattern = "dockops-binds-%s.yaml"
+
+// bindOverrideTempName is the file the override is written to first and then
+// renamed over its final name. A torn -f file would fail the compose call, and
+// the deploy helper runs the same code on a shared volume.
+func bindOverrideTempName(path string) string { return path + ".tmp" }
+
+// bindOverrideArgs returns the -f arguments for a deploy: the stack's compose
+// files, followed by a generated override that rewrites relative bind sources
+// to absolute host paths (see binds.go) when there is anything to rewrite.
+//
+// The daemon resolves the paths in a compose file in its own namespace; a
+// relative source would point into the container-only stack directory and
+// silently mount an empty directory. The override makes the source explicit.
+// Cleanup removes the generated file again — it must not look like part of
+// the stack on the next pass (the checkout is cleaned, a stale file would
+// confuse the hash and the operator alike).
+func (e *Executor) bindOverrideArgs(ctx context.Context, stack config.Stack, stackDir string) ([]string, func(), error) {
+	fileArgs := composeFileArgs(stack, stackDir)
+	cleanup := func() {}
+	files := stack.EffectiveComposeFiles()
+	resolved := make([]string, 0, len(files))
+	for _, f := range files {
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(stackDir, f)
+		}
+		resolved = append(resolved, f)
+	}
+	// Own mounts are read lazily per deploy (one docker inspect per deploy,
+	// not per pass): the mapping only changes when the agent container is
+	// recreated, and a failed lookup must not keep a stack undeployed — it
+	// only means "no translation available" (host mode keeps the container
+	// path).
+	var roots []BindRoot
+	if name := e.selfContainer; name != "" {
+		var err error
+		roots, err = e.OwnMounts(ctx, name)
+		if err != nil {
+			e.logger.Warn("bind override: cannot read the agent's own mounts; relative bind sources stay container paths",
+				"stack", stack.Name, "error", err.Error())
+		}
+	}
+	raw, count, err := RewriteRelativeBinds(resolved, stackDir, roots)
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("stack %s: %w", stack.Name, err)
+	}
+	if count == 0 {
+		return fileArgs, cleanup, nil
+	}
+	path := filepath.Join(stackDir, fmt.Sprintf(bindOverrideFilePattern, stack.Name))
+	tmp := bindOverrideTempName(path)
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return nil, cleanup, fmt.Errorf("stack %s: write bind override: %w", stack.Name, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return nil, cleanup, fmt.Errorf("stack %s: write bind override: %w", stack.Name, err)
+	}
+	e.logger.Info("bind override: rewrote relative bind sources to host paths",
+		"stack", stack.Name, "file", path, "sources", count)
+	return append(fileArgs, "-f", path), func() {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			e.logger.Warn("bind override: remove failed", "stack", stack.Name, "file", path, "error", err.Error())
+		}
+	}, nil
 }
 
 // Pull fetches the images of the named services (the whole project for an
@@ -409,4 +503,23 @@ func snippet(out []byte) string {
 		s = s[:maxErrorOutput] + "..."
 	}
 	return s
+}
+
+// UpArgsWithOverrides is UpArgs with additional compose files appended after
+// the stack's own files (overrideFiles), used by the phase-13 deploy helper to
+// pass the generated bind override (and, on a rollback, the image pin).
+func UpArgsWithOverrides(req Request, overrideFiles []string, profiles []string, envFile string, noDeps bool, services []string) ([]string, error) {
+	args, err := upSpec{
+		project:       req.Project,
+		fileArgs:      req.fileArgs(),
+		overrideFiles: overrideFiles,
+		stackDir:      req.StackDir,
+		profiles:      profiles,
+		envFile:       envFile,
+		noDeps:        noDeps,
+	}.args()
+	if err != nil {
+		return nil, err
+	}
+	return append(args, services...), nil
 }

@@ -126,6 +126,16 @@ type ComposeExecutor interface {
 	PsProject(ctx context.Context, project string) ([]compose.Container, error)
 }
 
+// SelfContainerBinder is implemented by a compose executor that needs the
+// agent's own container to translate container paths into the daemon's
+// namespace (compose.Executor.WithSelfContainer). Deliberately a separate,
+// optional interface: the test doubles of a pass must not grow a method for a
+// detail only the real executor needs, and an executor without it simply keeps
+// passing container paths through.
+type SelfContainerBinder interface {
+	WithSelfContainer(name string) *compose.Executor
+}
+
 // Restarter restarts the containers of an already deployed stack
 // (compose.Executor.Restart). It is deliberately not part of
 // ComposeExecutor: that interface is what a reconcile pass needs, while the
@@ -463,6 +473,13 @@ func New(deps Deps) *Reconciler {
 		if host, err := os.Hostname(); err == nil {
 			selfContainer = host
 		}
+	}
+	// The bind-mount translation needs the agent's own container too: it is
+	// the only source of the container→host path mapping (see
+	// compose.Executor.WithSelfContainer). Only the executor dockops built
+	// itself is wrapped — an injected one (tests) keeps its behaviour.
+	if binder, ok := composeExec.(SelfContainerBinder); ok {
+		composeExec = binder.WithSelfContainer(selfContainer)
 	}
 	// The restart endpoint reuses the compose executor unless a separate
 	// restarter is injected; a pass-only fake simply has no Restart, and

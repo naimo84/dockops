@@ -77,6 +77,9 @@ func TestUpArguments(t *testing.T) {
 		Profiles:    []string{"debug", "extra"},
 		Services:    []string{"api", "worker"},
 	}
+	// The bind rewrite reads the compose file; a file without volumes yields
+	// no override and the command line stays exactly as before.
+	writeStackFile(t, stackDir, "compose.yaml", "services:\n  api:\n    image: alpine\n")
 	if err := e.Up(context.Background(), stack, stackDir, envFile); err != nil {
 		t.Fatalf("Up() error = %v", err)
 	}
@@ -103,6 +106,7 @@ func TestUpMinimalArguments(t *testing.T) {
 	envFile := filepath.Join(t.TempDir(), "stack.env")
 
 	stack := config.Stack{Name: "solo", ComposeFile: "compose.yml"}
+	writeStackFile(t, stackDir, "compose.yml", "services:\n  solo:\n    image: alpine\n")
 	if err := e.Up(context.Background(), stack, stackDir, envFile); err != nil {
 		t.Fatalf("Up() error = %v", err)
 	}
@@ -287,6 +291,12 @@ func TestUpServicesMinusIgnore(t *testing.T) {
 	argsFile := fakeDocker(t)
 	e := quietExecutor()
 	stackDir := t.TempDir()
+	// The bind rewrite reads the compose file (relative sources are resolved
+	// against it), so the file has to exist even when the services are given
+	// explicitly.
+	if err := os.WriteFile(filepath.Join(stackDir, "compose.yaml"), []byte("services:\n  api:\n    image: alpine\n"), 0o644); err != nil {
+		t.Fatalf("write compose file: %v", err)
+	}
 	// Hand-constructed stack (the loader would reject the overlap): the
 	// executor still subtracts defensively.
 	stack := config.Stack{

@@ -498,6 +498,19 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
   dieses Deploys liest — dokumentierte Ausnahme von der Spec-Regel
   „unbekanntes Image = harter Fehler“, siehe `deployStack`.
 
+- Relative Bind-Quellen (Issue #18/#23): Jeder Deploy schreibt ein
+  generiertes Override `<stackDir>/dockops-binds-<stack>.yaml` mit absoluten
+  **Host**-Pfaden und übergibt es als zusätzliches `-f` nach den Stack-Dateien
+  (`internal/compose/binds.go`, `Executor.bindOverrideArgs`). Der Daemon
+  löst Pfade in seinem eigenen Namespace auf — der Container-Stack-Pfad
+  `/var/lib/dockops/repos/…` existiert dort nicht, compose's relative Quelle
+  würde als leeres Verzeichnis gemountet. Die Zuordnung kommt aus
+  `docker inspect` des **eigenen** Containers (tiefster Mount gewinnt, weil
+  State-Volume und Checkout-Bind ineinander liegen); der Helper bekommt sie
+  als `-selfupdate-mounts` (argv, nicht Env: der Helper wird vom Agenten
+  gestartet). Nicht auflösbar = harter Fehler vor dem ersten Compose-Aufruf.
+  Absolute Quellen und Named Volumes bleiben unangetastet.
+
 ## Checks vor jedem Commit
 
     export PATH=$HOME/.local/go/bin:$PATH

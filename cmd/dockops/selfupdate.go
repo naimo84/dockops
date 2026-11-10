@@ -63,12 +63,16 @@ type helper struct {
 	sleep func(ctx context.Context, d time.Duration) error
 	// now is the clock of the result timestamp; nil selects time.Now.
 	now func() time.Time
+	// mounts are the agent's container→host mount mappings from
+	// -selfupdate-mounts: a deploy plan rewrites its stack's relative bind
+	// sources through them (issues #18/#23).
+	mounts []selfupdate.Mount
 }
 
 // runSelfUpdateHelper is the entire -selfupdate-helper mode: read the plan,
 // execute it, write the result, exit. No reconciler, no HTTP server, no
 // repository access.
-func runSelfUpdateHelper(ctx context.Context, planPath string, logger *slog.Logger) error {
+func runSelfUpdateHelper(ctx context.Context, planPath, mountSpecs string, logger *slog.Logger) error {
 	if planPath == "" {
 		return fmt.Errorf("-selfupdate-helper requires -selfupdate-plan")
 	}
@@ -85,6 +89,7 @@ func runSelfUpdateHelper(ctx context.Context, planPath string, logger *slog.Logg
 
 	h := &helper{
 		plan:     plan,
+		mounts:   selfupdate.ParseMountSpecs(mountSpecs),
 		stateDir: stateDir,
 		logger:   logger,
 		log:      logFile,
@@ -160,7 +165,24 @@ func (h *helper) runDeploy(ctx context.Context) error {
 		DeployHash: h.plan.DeployHash,
 		At:         h.now().UTC(),
 	}
-	args, err := deployUpArgs(h.plan)
+	// Relative bind sources of the stack's compose files must become host
+	// paths here too: the helper recreated the stack with the same container
+	// paths the agent would have used, and the daemon resolves them in its
+	// own namespace (issues #18/#23). The helper runs as the agent's own
+	// container, so its mounts are the agent's mounts — no docker inspect
+	// needed, -selfupdate-mounts already carries them.
+	bindFiles, cleanup, err := h.bindOverrideFiles(h.plan)
+	if err != nil {
+		res.Status = selfupdate.StatusFailed
+		res.Error = err.Error()
+		h.logf("deploy failed: %v", err)
+		return h.writeResult(res)
+	}
+	defer cleanup()
+	var args []string
+	if err == nil {
+		args, err = deployUpArgsWithBindFiles(h.plan, bindFiles)
+	}
 	if err == nil {
 		h.logf("running: %s %s", helperDockerBinary, strings.Join(args, " "))
 		var out []byte
@@ -187,11 +209,59 @@ func (h *helper) runDeploy(ctx context.Context) error {
 // helper runs the same flag set as the agent's own Up instead of a second,
 // slowly drifting copy of it.
 func deployUpArgs(p selfupdate.Plan) ([]string, error) {
-	return compose.UpArgs(compose.Request{
+	return deployUpArgsWithBindFiles(p, nil)
+}
+
+// deployUpArgsWithBindFiles is deployUpArgs with the generated bind override
+// (or the rollback override) appended after the stack's own files.
+func deployUpArgsWithBindFiles(p selfupdate.Plan, extraFiles []string) ([]string, error) {
+	return compose.UpArgsWithOverrides(compose.Request{
 		Project:      p.Project,
 		StackDir:     p.StackDir,
 		ComposeFiles: p.ComposeFiles,
-	}, p.Profiles, p.EnvFile, false, p.Services)
+	}, extraFiles, p.Profiles, p.EnvFile, false, p.Services)
+}
+
+// bindOverrideFiles renders the agent's bind override for a deploy plan and
+// returns the -f argument list plus the cleanup. The rewrite runs against the
+// helper's own mount mappings, which are the agent's: -selfupdate-mounts is
+// filled from docker inspect of the agent container (see selfupdate.HelperArgs
+// and cmd/dockops' DOCKOPS_SELF_MOUNTS fallback).
+//
+// A rewrite error aborts the deploy instead of falling through to compose: an
+// unresolvable relative source is exactly the silent empty-mount failure the
+// override exists to prevent.
+func (h *helper) bindOverrideFiles(p selfupdate.Plan) ([]string, func(), error) {
+	cleanup := func() {}
+	files := make([]string, 0, len(p.ComposeFiles))
+	for _, f := range p.ComposeFiles {
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(p.StackDir, f)
+		}
+		files = append(files, f)
+	}
+	roots := make([]compose.BindRoot, 0, len(h.mounts))
+	for _, m := range h.mounts {
+		roots = append(roots, compose.BindRoot{Container: m.Path, Host: m.Host})
+	}
+	raw, count, err := compose.RewriteRelativeBinds(files, p.StackDir, roots)
+	if err != nil {
+		return nil, cleanup, err
+	}
+	if count == 0 {
+		return nil, cleanup, nil
+	}
+	path := filepath.Join(p.StackDir, fmt.Sprintf("dockops-binds-%s.yaml", p.Project))
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return nil, cleanup, fmt.Errorf("write bind override: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return nil, cleanup, fmt.Errorf("write bind override: %w", err)
+	}
+	h.logf("bind override: rewrote %d relative bind source(s) to host paths: %s", count, path)
+	return []string{path}, func() { _ = os.Remove(path) }, nil
 }
 
 // writeResult persists the helper's verdict and reports a write failure as a

@@ -101,6 +101,11 @@ type options struct {
 	SelfUpdateHelper bool
 	// SelfUpdatePlan is the plan file path of the helper mode.
 	SelfUpdatePlan string
+	// SelfUpdateMounts is the mount mapping of the agent's container
+	// (-selfupdate-mounts, "container=host;…"), handed to the helper so a
+	// deploy plan can rewrite relative bind sources to host paths. Set by
+	// the agent when it starts the helper; empty in every other mode.
+	SelfUpdateMounts string
 }
 
 // boolFromEnv parses an optional boolean environment variable: empty counts
@@ -150,6 +155,8 @@ func parseFlags(args []string, getenv func(string) string) (options, error) {
 		"run as the self-update helper: execute the plan given by -selfupdate-plan and exit (no repository, no server)")
 	fs.StringVar(&opts.SelfUpdatePlan, "selfupdate-plan", "",
 		"path of the self-update plan (-selfupdate-helper only)")
+	fs.StringVar(&opts.SelfUpdateMounts, "selfupdate-mounts", "",
+		"mount mapping of the agent's container as \"container=host;…\" (-selfupdate-helper only; used to rewrite relative bind sources)")
 
 	if err := fs.Parse(args); err != nil {
 		return opts, err
@@ -255,7 +262,7 @@ func run(opts options, logger *slog.Logger) error {
 		if opts.PrintStatus || opts.Once {
 			logger.Info("-selfupdate-helper wins over -print-status/-once; running the helper plan only")
 		}
-		return runSelfUpdateHelper(ctx, opts.SelfUpdatePlan, logger)
+		return runSelfUpdateHelper(ctx, opts.SelfUpdatePlan, opts.SelfUpdateMounts, logger)
 	}
 
 	// -print-status wins over every other mode: no reconcile pass, no

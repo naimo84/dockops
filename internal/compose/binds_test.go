@@ -1,0 +1,238 @@
+package compose
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// writeStackFile writes one compose file into dir.
+func writeStackFile(t *testing.T, dir, name, content string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	return path
+}
+
+// TestRewriteRelativeBindsTranslatesThroughMounts is the issue-#18 repro: a
+// relative bind source in the container's stack directory must be rewritten to
+// the host path of the same file, not passed through unchanged.
+func TestRewriteRelativeBindsTranslatesThroughMounts(t *testing.T) {
+	stackDir := "/var/lib/dockops/repos/infrastructure/litellm"
+	file := writeStackFile(t, t.TempDir(), "compose.yaml", `
+services:
+  litellm:
+    image: ghcr.io/x/litellm:latest
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+  db:
+    image: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+`)
+	roots := []BindRoot{
+		{Container: "/var/lib/dockops/repos/infrastructure", Host: "/home/docker/infrastructure"},
+		{Container: "/var/lib/dockops", Host: "/home/docker/dockops"},
+	}
+	raw, count, err := RewriteRelativeBinds([]string{file}, stackDir, roots)
+	if err != nil {
+		t.Fatalf("RewriteRelativeBinds() error = %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
+	}
+	got := string(raw)
+	want := "/home/docker/infrastructure/litellm/config.yaml:/app/config.yaml:ro"
+	if !strings.Contains(got, want) {
+		t.Errorf("override = %q, want it to contain %q", got, want)
+	}
+	if strings.Contains(got, "./config.yaml") {
+		t.Errorf("override = %q, want the relative source gone", got)
+	}
+	if strings.Contains(got, "pgdata") {
+		t.Errorf("override = %q, want named volumes untouched", got)
+	}
+}
+
+// TestRewriteRelativeBindsDeepestMountWins: the state volume and the checkout
+// bind nest, so the shallow root must not win.
+func TestRewriteRelativeBindsDeepestMountWins(t *testing.T) {
+	stackDir := "/var/lib/dockops/repos/host/app"
+	file := writeStackFile(t, t.TempDir(), "compose.yaml", `
+services:
+  a:
+    image: alpine
+    volumes:
+      - ../data/x.txt:/x.txt
+`)
+	roots := []BindRoot{
+		{Container: "/var/lib/dockops", Host: "/home/docker/dockops"},
+		{Container: "/var/lib/dockops/repos/host", Host: "/home/docker/apps"},
+	}
+	raw, count, err := RewriteRelativeBinds([]string{file}, stackDir, roots)
+	if err != nil {
+		t.Fatalf("RewriteRelativeBinds() error = %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
+	}
+	if want := "/home/docker/apps/data/x.txt:/x.txt"; !strings.Contains(string(raw), want) {
+		t.Errorf("override = %q, want %q (deepest mount wins)", raw, want)
+	}
+}
+
+// TestRewriteRelativeBindsNothingToDo: an absolute source is left alone — the
+// documented workaround stays valid, it is just no longer required.
+func TestRewriteRelativeBindsNothingToDo(t *testing.T) {
+	stackDir := "/s"
+	file := writeStackFile(t, t.TempDir(), "compose.yaml", `
+services:
+  a:
+    image: alpine
+    volumes:
+      - /srv/app/config.yaml:/app/config.yaml:ro
+      - named:/data
+`)
+	raw, count, err := RewriteRelativeBinds([]string{file}, stackDir, []BindRoot{{Container: "/s", Host: "/host/s"}})
+	if err != nil {
+		t.Fatalf("RewriteRelativeBinds() error = %v", err)
+	}
+	if count != 0 || raw != nil {
+		t.Errorf("count = %d, raw = %q, want no override", count, raw)
+	}
+}
+
+// TestRewriteRelativeBindsOutsideMountsIsAnError: a relative source dockops
+// cannot translate is refused — the alternative is the silent empty-directory
+// mount the whole feature exists to prevent.
+func TestRewriteRelativeBindsOutsideMountsIsAnError(t *testing.T) {
+	stackDir := "/opt/not-mounted/stack"
+	file := writeStackFile(t, t.TempDir(), "compose.yaml", `
+services:
+  a:
+    image: alpine
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+`)
+	_, _, err := RewriteRelativeBinds([]string{file}, stackDir, []BindRoot{{Container: "/var/lib/dockops", Host: "/home/docker/dockops"}})
+	if err == nil {
+		t.Fatal("RewriteRelativeBinds() error = nil, want a refusal")
+	}
+	for _, want := range []string{"./config.yaml", "outside every mount", "/opt/not-mounted/stack/config.yaml"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
+// TestRewriteRelativeBindsHostMode: without mounts (agent on the host) the
+// container-absolute path already is the daemon's path — no translation, but
+// still an absolute rewrite, which is what compose needs for -f consistency.
+func TestRewriteRelativeBindsHostMode(t *testing.T) {
+	stackDir := "/home/docker/apps/stack"
+	file := writeStackFile(t, t.TempDir(), "compose.yaml", `
+services:
+  a:
+    image: alpine
+    volumes:
+      - ./conf.d:/etc/conf.d:ro
+`)
+	raw, count, err := RewriteRelativeBinds([]string{file}, stackDir, nil)
+	if err != nil {
+		t.Fatalf("RewriteRelativeBinds() error = %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
+	}
+	if want := "/home/docker/apps/stack/conf.d:/etc/conf.d:ro"; !strings.Contains(string(raw), want) {
+		t.Errorf("override = %q, want %q", raw, want)
+	}
+}
+
+// TestRewriteRelativeBindsLaterFileWins: compose merges volumes per target and
+// the later file wins, so the override must state the effective source.
+func TestRewriteRelativeBindsLaterFileWins(t *testing.T) {
+	dir := t.TempDir()
+	base := writeStackFile(t, dir, "compose.yaml", `
+services:
+  a:
+    image: alpine
+    volumes:
+      - ./base.yaml:/app/config.yaml:ro
+`)
+	override := writeStackFile(t, dir, "prod.yaml", `
+services:
+  a:
+    volumes:
+      - ./prod.yaml:/app/config.yaml
+`)
+	raw, count, err := RewriteRelativeBinds([]string{base, override}, "/s", nil)
+	if err != nil {
+		t.Fatalf("RewriteRelativeBinds() error = %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1 (one target, one effective source)", count)
+	}
+	got := string(raw)
+	if !strings.Contains(got, "/s/prod.yaml:/app/config.yaml") {
+		t.Errorf("override = %q, want the later file's source", got)
+	}
+	if strings.Contains(got, "base.yaml") {
+		t.Errorf("override = %q, want the superseded source gone", got)
+	}
+}
+
+// TestRewriteRelativeBindsLongSyntax: the long mapping form is resolved too,
+// so a stack does not have to know which syntax dockops understands.
+func TestRewriteRelativeBindsLongSyntax(t *testing.T) {
+	stackDir := "/var/lib/dockops/repos/host/x"
+	file := writeStackFile(t, t.TempDir(), "compose.yaml", `
+services:
+  a:
+    image: alpine
+    volumes:
+      - type: bind
+        source: ./cfg
+        target: /etc/cfg
+        read_only: true
+`)
+	raw, count, err := RewriteRelativeBinds([]string{file}, stackDir, []BindRoot{{Container: "/var/lib/dockops/repos/host", Host: "/home/docker/apps"}})
+	if err != nil {
+		t.Fatalf("RewriteRelativeBinds() error = %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
+	}
+	if want := "/home/docker/apps/x/cfg:/etc/cfg:ro"; !strings.Contains(string(raw), want) {
+		t.Errorf("override = %q, want %q", raw, want)
+	}
+}
+
+// TestTranslate: the pure mapping rules, including the exact-root case and the
+// prefix trap (/var/lib/dockopsX must not match /var/lib/dockops).
+func TestTranslate(t *testing.T) {
+	roots := []BindRoot{
+		{Container: "/var/lib/dockops", Host: "/home/docker/dockops"},
+		{Container: "/srv/apps/", Host: "/home/docker/apps"},
+	}
+	cases := []struct{ in, want string }{
+		{"/var/lib/dockops/state.json", "/home/docker/dockops/state.json"},
+		{"/var/lib/dockops", "/home/docker/dockops"},
+		{"/srv/apps/x/config.yaml", "/home/docker/apps/x/config.yaml"},
+	}
+	for _, c := range cases {
+		got, ok := translate(c.in, roots)
+		if !ok || got != c.want {
+			t.Errorf("translate(%q) = %q, %v, want %q, true", c.in, got, ok, c.want)
+		}
+	}
+	if _, ok := translate("/var/lib/dockopsX/y", roots); ok {
+		t.Error("translate() matched a sibling directory sharing the prefix")
+	}
+	if _, ok := translate("/nowhere/x", roots); ok {
+		t.Error("translate() matched an unrelated path")
+	}
+}
