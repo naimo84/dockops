@@ -142,6 +142,17 @@ type StackUpdates struct {
 	Pending int `json:"pending"`
 	// Services lists one entry per checked image, sorted by service.
 	Services []ServiceUpdate `json:"services"`
+	// CheckError is the reason the last check could not resolve the stack's
+	// compose configuration (issue #18's side finding: a stack whose
+	// env_file the daemon cannot read silently never gets records). When it
+	// is set the stack is *blind*: Services carries the last known picture
+	// and nothing here says whether an update exists. Empty when the last
+	// attempt resolved the configuration.
+	CheckError string `json:"check_error,omitempty"`
+	// CheckErrorAt is when that attempt failed (RFC3339, empty when the
+	// last attempt succeeded). The interval applies to failed attempts
+	// too, so this is also when the next one is due.
+	CheckErrorAt string `json:"check_error_at,omitempty"`
 }
 
 // ServiceUpdate is the update state of one image of a stack.
@@ -353,7 +364,7 @@ func buildStackStatus(containers []compose.Container, listingErr error, name str
 // empty object pretending a check happened). The state is the only source:
 // no docker, no registry, no configuration.
 func buildStackUpdates(st state.State) *StackUpdates {
-	if len(st.Images) == 0 {
+	if len(st.Images) == 0 && st.ImageCheckError == "" {
 		return nil
 	}
 	policy := st.UpdatePolicy
@@ -392,6 +403,10 @@ func buildStackUpdates(st state.State) *StackUpdates {
 	if !newest.IsZero() {
 		updates.CheckedAt = newest.UTC().Format(time.RFC3339)
 	}
+	// Readiness, not cosmetics: a blind stack must never look like a
+	// healthy one that simply has no update.
+	updates.CheckError = st.ImageCheckError
+	updates.CheckErrorAt = formatTime(st.ImageCheckErrorAt)
 	// Deterministic order: service first (the operator-facing name), the
 	// image reference as the tiebreaker for a service using several images.
 	sort.Slice(updates.Services, func(i, j int) bool {

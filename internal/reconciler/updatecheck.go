@@ -96,9 +96,18 @@ func (r *Reconciler) checkImageUpdates(ctx context.Context, cfg *config.Config, 
 		resolved, err := r.compose.Images(ctx, compose.RequestFor(stack, stack.Dir))
 		if err != nil {
 			// The compose configuration could not be resolved (broken
-			// file, docker problem): degrade to "not checked this round"
-			// instead of inventing records.
+			// file, docker problem, an env_file only the daemon's
+			// namespace can serve): never invent records — but do not
+			// swallow the blindness either. Without the stored reason such
+			// a stack is indistinguishable from "never checked" in
+			// GET /status, which is exactly the stack an operator must
+			// see. The warning stays for the log stream.
 			r.logger.Warn("image update check: cannot resolve stack images", "stack", stack.Name, "error", err)
+			if serr := r.state.SetImageCheckError(stack.Name, err.Error(), now); serr != nil {
+				r.logger.Error("image update check: cannot record the unresolved configuration", "stack", stack.Name, "error", serr)
+				continue
+			}
+			changed = true
 			continue
 		}
 		recs := r.checkStackImages(ctx, stack, resolved, st, resolver, now, pn)
@@ -273,6 +282,12 @@ func checkableServices(stack config.Stack, images map[string]string) []string {
 // all images of a stack are checked together once per interval.
 func updateDue(st state.State, interval time.Duration, now time.Time) bool {
 	var newest time.Time
+	// A failed resolve counts as an attempt: without it a stack whose
+	// configuration cannot be read would run one compose call on every
+	// poll (5m) instead of once per interval.
+	if st.ImageCheckErrorAt.After(newest) {
+		newest = st.ImageCheckErrorAt
+	}
 	for _, rec := range st.Images {
 		if rec.CheckedAt.After(newest) {
 			newest = rec.CheckedAt

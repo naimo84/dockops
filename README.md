@@ -791,6 +791,31 @@ Ohne Records fehlt `updates` ganz (kein Check gelaufen oder `pinned`);
 `services` ist immer ein Array, sortiert nach Service. Ein kaputter
 Image-Record ändert die Drift-Aussage nicht und umgekehrt.
 
+**Blinde Stacks** (Issue #18): Lässt sich die Compose-Konfiguration eines
+Stacks beim Check nicht auflösen — kaputte Datei, Docker-Problem, oder ein
+`env_file`, das nur im Daemon-Namespace existiert —, gibt es keine Records.
+Statt den Stack wie „nie geprüft" aussehen zu lassen, steht der Grund im
+`updates`-Block:
+
+```json
+"updates": {
+  "policy": "notify",
+  "checked_at": "2026-11-10T09:00:00Z",
+  "pending": 0,
+  "services": [],
+  "check_error": "env file /var/lib/dockops/repos/infrastructure/alloy/.env not found",
+  "check_error_at": "2026-11-10T09:00:00Z"
+}
+```
+
+`check_error` heißt: dieser Stack ist **blind** — das letzte bekannte Bild
+steht in `services`, aber ob ein Update existiert, ist unbekannt. Die
+Meldung verschwindet mit dem nächsten erfolgreichen Check. Der
+`update_check_interval` gilt auch für den Fehlschlag (ein Compose-Aufruf pro
+Intervall, nicht pro Poll), `check_error_at` ist damit auch der nächste
+Versuch. `pending: 0` bei gesetztem `check_error` ist bewusst: ein blinder
+Stack weiß von keinem Update.
+
 **Benachrichtigung**: `update_available` ist ein Ereignis des
 Phase-9-Notifiers, aber **opt-in** — der Default
 (`[deploy_failed, prune_failed, repo_failed, update_failed]`, Phase 11 nimmt

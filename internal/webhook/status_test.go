@@ -360,3 +360,52 @@ func TestStatusNotConfigured(t *testing.T) {
 		t.Errorf("GET /status without status dependencies status = %d, want 503", rec.Code)
 	}
 }
+
+// TestStatusBlindStackIsVisible is the issue-#18 side finding as a contract: a
+// stack whose compose configuration the update check cannot resolve has no
+// image records, and without the stored reason it would look exactly like a
+// stack that was never checked — the blind one would be the invisible one.
+func TestStatusBlindStackIsVisible(t *testing.T) {
+	checkedAt := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
+	h := statusFixture(t, map[string]state.State{
+		"alloy": {
+			Status:            state.StatusDeployed,
+			ImageCheckError:   "env file .../alloy/.env.default not found",
+			ImageCheckErrorAt: checkedAt,
+		},
+	}, &fakeCompose{}, nil)
+
+	resp := decodeStatus(t, do(h, http.MethodGet, "/status", nil, nil))
+	updates, ok := statusStack(t, resp, 0)["updates"].(map[string]any)
+	if !ok {
+		t.Fatalf("stacks[0].updates = %v, want a block even without records (blindness must be visible)", statusStack(t, resp, 0)["updates"])
+	}
+	if got, _ := updates["check_error"].(string); !strings.Contains(got, ".env.default not found") {
+		t.Errorf("updates.check_error = %q, want the resolve failure", got)
+	}
+	if got, _ := updates["check_error_at"].(string); got != "2026-11-10T09:00:00Z" {
+		t.Errorf("updates.check_error_at = %q, want the RFC3339 attempt time", got)
+	}
+	if pending, _ := updates["pending"].(float64); pending != 0 {
+		t.Errorf("updates.pending = %v, want 0 — a blind stack knows of no update", pending)
+	}
+}
+
+// TestStatusHealthyStackHasNoCheckError pins the other side: a stack with
+// records renders no blind marker (the fields stay out of the document).
+func TestStatusHealthyStackHasNoCheckError(t *testing.T) {
+	h := statusFixture(t, map[string]state.State{
+		"pag": {Status: state.StatusDeployed, Images: map[string]state.ImageRecord{
+			"nginx:1": {Service: "web", CheckedAt: time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)},
+		}},
+	}, &fakeCompose{}, nil)
+
+	resp := decodeStatus(t, do(h, http.MethodGet, "/status", nil, nil))
+	updates, ok := statusStack(t, resp, 0)["updates"].(map[string]any)
+	if !ok {
+		t.Fatal("stacks[0].updates missing for a checked stack")
+	}
+	if _, present := updates["check_error"]; present {
+		t.Errorf("updates.check_error = %v, want the field omitted for a healthy stack", updates["check_error"])
+	}
+}
