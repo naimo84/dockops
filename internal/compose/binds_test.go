@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // writeStackFile writes one compose file into dir.
@@ -209,6 +211,86 @@ services:
 	if want := "/home/docker/apps/x/cfg:/etc/cfg:ro"; !strings.Contains(string(raw), want) {
 		t.Errorf("override = %q, want %q", raw, want)
 	}
+}
+
+// TestRewriteDocumentShape pins the YAML the override must have: the volumes
+// under an explicit `volumes:` key. The first implementation rendered
+// `services.<svc>: [- /x:/y]` (a bare sequence), which compose rejects with
+// "volumes must be a mapping" — the override then failed the very deploy it
+// was meant to repair.
+func TestRewriteDocumentShape(t *testing.T) {
+	stackDir := "/var/lib/dockops/repos/host/x"
+	file := writeStackFile(t, t.TempDir(), "compose.yaml", `
+services:
+  a:
+    image: alpine
+    volumes:
+      - ./cfg:/etc/cfg
+`)
+	raw, count, err := RewriteRelativeBinds([]string{file}, stackDir, []BindRoot{{Container: "/var/lib/dockops/repos/host", Host: "/home/docker/apps"}})
+	if err != nil || count != 1 {
+		t.Fatalf("RewriteRelativeBinds() = %d, %v; want 1, nil", count, err)
+	}
+	var doc struct {
+		Services map[string]struct {
+			Volumes []string `yaml:"volumes"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("override is not the shape compose reads: %v\n%s", err, raw)
+	}
+	if got := doc.Services["a"].Volumes; len(got) != 1 || got[0] != "/home/docker/apps/x/cfg:/etc/cfg" {
+		t.Errorf("override volumes = %v, want the rewritten entry under services.a.volumes", got)
+	}
+}
+
+// TestRewriteDropsEmptyOptionSection: `source:target:` (trailing colon from an
+// empty option string) is rejected by compose as "empty section between
+// colons" — the entry has to end at the target when it carries no options.
+func TestRewriteDropsEmptyOptionSection(t *testing.T) {
+	stackDir := "/var/lib/dockops/repos/host/x"
+	file := writeStackFile(t, t.TempDir(), "compose.yaml", `
+services:
+  a:
+    image: alpine
+    volumes:
+      - ./cfg:/etc/cfg
+      - ./ro:/etc/ro:ro
+`)
+	raw, _, err := RewriteRelativeBinds([]string{file}, stackDir, []BindRoot{{Container: "/var/lib/dockops/repos/host", Host: "/home/docker/apps"}})
+	if err != nil {
+		t.Fatalf("RewriteRelativeBinds() error = %v", err)
+	}
+	if strings.Contains(string(raw), ":/etc/cfg:") {
+		t.Errorf("override = %q, want no trailing empty option section", raw)
+	}
+	if !strings.Contains(string(raw), "/home/docker/apps/x/cfg:/etc/cfg\n") {
+		t.Errorf("override = %q, want the optionless entry to end at the target", raw)
+	}
+	if !strings.Contains(string(raw), "/home/docker/apps/x/ro:/etc/ro:ro") {
+		t.Errorf("override = %q, want the options of a short entry kept", raw)
+	}
+}
+
+// TestRewriteRefusesInterpolatedSource: ${CONF_DIR:-./config} looks like a
+// named volume to a naive classifier and would pass through untouched — the
+// exact silent failure the rewrite exists to stop. The value is only known
+// after interpolation, so the entry is an error, not a guess.
+func TestRewriteRefusesInterpolatedSource(t *testing.T) {
+	stackDir := "/var/lib/dockops/repos/host/x"
+	file := writeStackFile(t, t.TempDir(), "compose.yaml", `
+services:
+  a:
+    image: alpine
+    volumes:
+      - ${CONF_DIR:-./config}:/etc/cfg
+`)
+	_, _, err := RewriteRelativeBinds([]string{file}, stackDir, []BindRoot{{Container: "/var/lib/dockops/repos/host", Host: "/home/docker/apps"}})
+	if err == nil || !strings.Contains(err.Error(), "interpolated") {
+		t.Fatalf("err = %v, want a refusal for the interpolated source", err)
+	}
+	// A named volume with a $ would be caught too, but that is not valid
+	// compose either — the rule errs on the loud side.
 }
 
 // TestTranslate: the pure mapping rules, including the exact-root case and the

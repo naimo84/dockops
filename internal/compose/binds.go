@@ -127,7 +127,7 @@ func RewriteRelativeBinds(files []string, stackDir string, roots []BindRoot) ([]
 	}
 	sort.Strings(targets)
 
-	doc := bindDocument{Services: map[string][]string{}}
+	doc := bindDocument{Services: map[string]bindService{}}
 	rewritten := 0
 	for _, target := range targets {
 		entry := effective[target]
@@ -145,16 +145,21 @@ func RewriteRelativeBinds(files []string, stackDir string, roots []BindRoot) ([]
 		if !ok {
 			return nil, 0, fmt.Errorf("stack %s: bind source %q (target %s) resolves to %s, which is outside every mount of the dockops container; mount the stack checkout at an identical path or declare the source as an absolute host path", stackDir, entry.source, target, absolute)
 		}
-		doc.Services[entry.service] = append(doc.Services[entry.service],
-			strings.Join([]string{hostPath, target, entry.options}, ":"))
+		line := hostPath + ":" + target
+		if entry.options != "" {
+			line += ":" + entry.options
+		}
+		svc := doc.Services[entry.service]
+		svc.Volumes = append(svc.Volumes, line)
+		doc.Services[entry.service] = svc
 		rewritten++
 	}
 	if rewritten == 0 {
 		return nil, 0, nil
 	}
-	for service, volumes := range doc.Services {
-		sort.Strings(volumes)
-		doc.Services[service] = volumes
+	for service, svc := range doc.Services {
+		sort.Strings(svc.Volumes)
+		doc.Services[service] = svc
 	}
 	raw, err := yaml.Marshal(doc)
 	if err != nil {
@@ -167,7 +172,16 @@ func RewriteRelativeBinds(files []string, stackDir string, roots []BindRoot) ([]
 // rewritten entry replaces exactly its own target (compose merges volumes by
 // target, and the later file wins).
 type bindDocument struct {
-	Services map[string][]string `yaml:"services"`
+	Services map[string]bindService `yaml:"services"`
+}
+
+// bindService is a service in the override. The volumes live under an
+// explicit `volumes:` key: a map[string][]string would marshal as a bare
+// sequence under the service name (`s1: [- /x:/y]`), which compose rejects as
+// "volumes must be a mapping" — the override would fail the deploy it repairs.
+// Pinned by TestRewriteDocumentShape.
+type bindService struct {
+	Volumes []string `yaml:"volumes"`
 }
 
 // bindEntry is one volume line of a service, in its short syntax split into
@@ -250,6 +264,14 @@ func parseVolume(service string, v any, file string, index int) (bindEntry, bool
 		}
 		source, target := parts[0], parts[1]
 		if !looksLikePath(source) {
+			// A source carrying ${...} or $VAR can still resolve to a
+			// relative path (./config via ${CONF_DIR:-./config}). It is
+			// neither a named volume nor rewritable here — the value is
+			// only known after interpolation — so it must not pass
+			// silently as "named volume".
+			if strings.Contains(source, "$") {
+				return bindEntry{}, false, fmt.Errorf("%s: service %s: volumes[%d]: bind source %q is interpolated; dockops cannot resolve a variable source — declare it as a literal relative or absolute path", file, service, index, source)
+			}
 			return bindEntry{}, false, nil
 		}
 		return bindEntry{
