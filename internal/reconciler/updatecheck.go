@@ -110,6 +110,12 @@ func (r *Reconciler) checkImageUpdates(ctx context.Context, cfg *config.Config, 
 			changed = true
 			continue
 		}
+		// Non-portable absolute bind sources (issue #18, suggestion 3):
+		// reported here because this is the only step that reads the
+		// compose files without deploying, and the finding belongs next to
+		// the image situation in GET /status. Purely informational — the
+		// deploy already succeeded or failed on its own terms.
+		r.recordNonPortableBinds(stack)
 		recs := r.checkStackImages(ctx, stack, resolved, st, resolver, now, pn)
 		if len(recs) == 0 {
 			r.logger.Debug("image update check: stack has no checkable images", "stack", stack.Name)
@@ -356,4 +362,59 @@ func registryCredentials(creds []config.Registry) []registry.Credentials {
 		out = append(out, registry.Credentials{Host: c.Host, Username: c.Username, Password: c.Password})
 	}
 	return out
+}
+
+// recordNonPortableBinds refreshes the stored bind findings of one stack.
+// Failures degrade to a warning: a bind source that cannot be classified must
+// not stop the image check, and the last known findings stay until a later
+// pass can read the files again.
+func (r *Reconciler) recordNonPortableBinds(stack config.Stack) {
+	roots := r.resolveBindRoots(stack)
+	if len(roots) == 0 {
+		// Host mode (no container namespace to translate) or an unreadable
+		// mount list: there is nothing to compare against, and an empty
+		// roots list deliberately means "on the host everything is
+		// portable". Leave the state alone rather than flag everything.
+		return
+	}
+	findings, err := compose.NonPortableBinds(stack.EffectiveComposeFiles(), stack.Dir, roots)
+	if err != nil {
+		r.logger.Warn("non-portable bind check: cannot read compose files", "stack", stack.Name, "error", err)
+		return
+	}
+	if err := r.state.SetNonPortableBinds(stack.Name, findings); err != nil {
+		r.logger.Warn("non-portable bind check: cannot record findings", "stack", stack.Name, "error", err)
+		return
+	}
+	if len(findings) > 0 {
+		r.logger.Warn("non-portable bind sources: outside every mount of the container, the daemon may mount an empty directory",
+			"stack", stack.Name, "sources", findings)
+	}
+}
+
+// resolveBindRoots returns the agent's mount mappings for the non-portable
+// check, reading them at most once per pass. A read failure degrades to nil
+// for this pass: a missing mapping must never turn into "every absolute bind
+// is non-portable", which would be a false alarm on every stacked host.
+func (r *Reconciler) resolveBindRoots(stack config.Stack) []compose.BindRoot {
+	if r.bindRoots != nil {
+		return r.bindRoots
+	}
+	type mountReader interface {
+		OwnMounts(ctx context.Context, name string) ([]compose.BindRoot, error)
+	}
+	reader, ok := r.compose.(mountReader)
+	if !ok || r.selfContainer == "" {
+		// Injected test double or no container: nothing to read.
+		r.bindRoots = []compose.BindRoot{}
+		return nil
+	}
+	roots, err := reader.OwnMounts(context.Background(), r.selfContainer)
+	if err != nil {
+		r.logger.Warn("non-portable bind check: cannot read the agent's own mounts", "container", r.selfContainer, "error", err)
+		r.bindRoots = []compose.BindRoot{}
+		return nil
+	}
+	r.bindRoots = roots
+	return roots
 }

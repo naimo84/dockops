@@ -808,6 +808,27 @@ Statt den Stack wie „nie geprüft" aussehen zu lassen, steht der Grund im
 }
 ```
 
+**Nicht portable Binds** (Issue #18, Vorschlag 3): Absolute Bind-Quellen
+werden nie umgeschrieben — wer sie schreibt, kennt den Host-Namespace. Liegt
+so ein Pfad aber außerhalb **jeder** Mount des Agenten, meldet `/status` ihn,
+statt es dem Betreiber beim Debuggen zu überlassen:
+
+```json
+"non_portable_binds": [
+  "litellm: /srv/conf/config.yaml (target /app/config.yaml)"
+]
+```
+
+Das ist derselbe stille Leer-Mount wie bei relativen Quellen, nur mit dem
+eigenen Pfad des Autors. Deshalb der Name: **nicht portabel**, nicht falsch.
+Geprüft wird in beide Namespaces — ein Pfad, der im Container-Namespace
+*oder* als Host-Pfad eines Mounts liegt, ist portabel (der dokumentierte
+Workaround bleibt also still). Der Eintrag wird nie erzwungen: der Stack
+deployt weiter. Er entsteht im Image-Update-Check (der einzige Schritt, der
+die Compose-Dateien ohne Deploy liest) und verschwindet mit der Korrektur.
+Läuft dockops direkt auf dem Host oder ist die Mount-Liste nicht lesbar,
+schweigt die Prüfung — statt jeden absoluten Pfad zu melden.
+
 `check_error` heißt: dieser Stack ist **blind** — das letzte bekannte Bild
 steht in `services`, aber ob ein Update existiert, ist unbekannt. Die
 Meldung verschwindet mit dem nächsten erfolgreichen Check. Der

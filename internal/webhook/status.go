@@ -119,6 +119,14 @@ type StackStatus struct {
 	Drift string `json:"drift"`
 	// Error carries the container listing failure when Drift is "unknown".
 	Error string `json:"error,omitempty"`
+	// NonPortableBinds lists absolute bind sources of the stack's compose
+	// files that lie outside every mount of the agent's container (issue
+	// #18, suggestion 3), as "service: source (target tgt)". Such a source
+	// is mounted from a path the daemon may not see — the silent
+	// empty-directory mount with the author's own path. Reported, never
+	// enforced: the stack keeps deploying. Omitted when the last check
+	// found none (or none ran).
+	NonPortableBinds []string `json:"non_portable_binds,omitempty"`
 	// Updates reports the last image update check of this stack (phase 10).
 	// Nil when the stack has no records — no check ran yet, or its
 	// update_policy is pinned. Built exclusively from the state: /status
@@ -345,6 +353,9 @@ func buildStackStatus(containers []compose.Container, listingErr error, name str
 		// the recorded image situation, and a broken image record must not
 		// change the drift statement.
 		Updates: buildStackUpdates(st),
+		// Recorded by the update check; never derived here, so the report
+		// stays free of docker and file access.
+		NonPortableBinds: append([]string(nil), st.NonPortableBinds...),
 	}
 	if !st.UpdatedAt.IsZero() {
 		entry.LastDeployed = st.UpdatedAt.UTC().Format(time.RFC3339)

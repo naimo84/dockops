@@ -378,7 +378,13 @@ type Reconciler struct {
 	// selfContainer is the agent's own container, the --volumes-from
 	// source of the helper.
 	selfContainer string
-	runHelper     func(ctx context.Context, args []string) error
+	// bindRoots are the agent's container→host mount mappings, read once
+	// per pass from `docker inspect` of selfContainer. They feed both the
+	// bind rewrite (compose.Executor.WithSelfContainer does its own read,
+	// since Up also runs outside a pass) and the read-only non-portable
+	// check. Empty while unknown — see resolveBindRoots.
+	bindRoots []compose.BindRoot
+	runHelper func(ctx context.Context, args []string) error
 
 	// selfImage is the image a phase-13 deploy helper runs (Deps.SelfImage,
 	// filled by cmd/dockops from DOCKOPS_SELF_IMAGE or the agent's own

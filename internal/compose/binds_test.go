@@ -3,6 +3,7 @@ package compose
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -316,5 +317,114 @@ func TestTranslate(t *testing.T) {
 	}
 	if _, ok := translate("/nowhere/x", roots); ok {
 		t.Error("translate() matched an unrelated path")
+	}
+}
+
+// TestNonPortableBindsReportsAbsoluteOutsideMounts is issue #18's suggestion 3:
+// an absolute source the operator wrote themselves is passed through (they
+// know the host namespace), but one outside every mount is still reported —
+// it is the same silent empty-directory mount with the author's own path.
+func TestNonPortableBindsReportsAbsoluteOutsideMounts(t *testing.T) {
+	stackDir := "/var/lib/dockops/repos/host/x"
+	file := writeStackFile(t, t.TempDir(), "compose.yaml", `
+services:
+  b:
+    image: alpine
+    volumes:
+      - /home/docker/apps/x/good.conf:/etc/good.conf:ro
+      - /nowhere/else/bad.conf:/etc/bad.conf:ro
+      - ./rel.conf:/etc/rel.conf
+      - named:/named
+  a:
+    image: alpine
+    volumes:
+      - /srv/other/deep.conf:/etc/deep.conf
+`)
+	roots := []BindRoot{{Container: "/var/lib/dockops/repos/host", Host: "/home/docker/apps"}}
+	got, err := NonPortableBinds([]string{file}, stackDir, roots)
+	if err != nil {
+		t.Fatalf("NonPortableBinds() error = %v", err)
+	}
+	want := []string{
+		"a: /srv/other/deep.conf (target /etc/deep.conf)",
+		"b: /nowhere/else/bad.conf (target /etc/bad.conf)",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("NonPortableBinds() = %v, want %v (relative and mapped sources are not findings)", got, want)
+	}
+}
+
+// TestNonPortableBindsHostModeStaysQuiet: without container mounts every path
+// the agent names is in the daemon's namespace — reporting them would be a
+// false alarm on every host-mode deployment.
+func TestNonPortableBindsHostModeStaysQuiet(t *testing.T) {
+	file := writeStackFile(t, t.TempDir(), "compose.yaml", `
+services:
+  a:
+    image: alpine
+    volumes:
+      - /srv/anywhere:/data
+`)
+	got, err := NonPortableBinds([]string{file}, "/srv/stack", nil)
+	if err != nil {
+		t.Fatalf("NonPortableBinds() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("NonPortableBinds() = %v, want none in host mode", got)
+	}
+}
+
+// TestNonPortableBindsSeesEffectiveTarget pins that the report follows
+// compose's merge rule: a later file that overrides the source of a target
+// decides the finding, not the earlier one.
+func TestNonPortableBindsSeesEffectiveTarget(t *testing.T) {
+	dir := t.TempDir()
+	first := writeStackFile(t, dir, "compose.yaml", `
+services:
+  a:
+    image: alpine
+    volumes:
+      - /home/docker/apps/x/ok.conf:/etc/c.conf
+`)
+	second := writeStackFile(t, dir, "override.yaml", `
+services:
+  a:
+    volumes:
+      - /nowhere/c.conf:/etc/c.conf
+`)
+	roots := []BindRoot{{Container: "/var/lib/dockops/repos/host", Host: "/home/docker/apps"}}
+	got, err := NonPortableBinds([]string{first, second}, dir, roots)
+	if err != nil {
+		t.Fatalf("NonPortableBinds() error = %v", err)
+	}
+	want := []string{"a: /nowhere/c.conf (target /etc/c.conf)"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("NonPortableBinds() = %v, want %v", got, want)
+	}
+}
+
+// TestReverseTranslate: the host→container direction, including the prefix
+// trap (a sibling directory must not match) and the exact-root case.
+func TestReverseTranslate(t *testing.T) {
+	roots := []BindRoot{
+		{Container: "/var/lib/dockops/repos/host", Host: "/home/docker/apps"},
+		{Container: "/var/lib/dockops", Host: "/home/docker/dockops"},
+	}
+	cases := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{"/home/docker/apps/x/c.conf", "/var/lib/dockops/repos/host/x/c.conf", true},
+		{"/home/docker/apps", "/var/lib/dockops/repos/host", true},
+		// Sibling with the same prefix is not inside the mount.
+		{"/home/docker/apps2/c.conf", "", false},
+		{"/nowhere/c.conf", "", false},
+	}
+	for _, tc := range cases {
+		got, ok := reverseTranslate(tc.in, roots)
+		if ok != tc.ok || got != tc.want {
+			t.Errorf("reverseTranslate(%q) = %q, %v; want %q, %v", tc.in, got, ok, tc.want, tc.ok)
+		}
 	}
 }

@@ -409,3 +409,34 @@ func TestStatusHealthyStackHasNoCheckError(t *testing.T) {
 		t.Errorf("updates.check_error = %v, want the field omitted for a healthy stack", updates["check_error"])
 	}
 }
+
+// TestStatusNonPortableBinds is issue #18's suggestion 3 on the wire: the
+// recorded findings appear on the stack entry, and a stack without findings
+// keeps the key out of the document.
+func TestStatusNonPortableBinds(t *testing.T) {
+	h := statusFixture(t, map[string]state.State{
+		"web": {
+			Status:           state.StatusDeployed,
+			NonPortableBinds: []string{"app: /nowhere/app.conf (target /etc/app.conf)"},
+		},
+		"clean": {Status: state.StatusDeployed},
+	}, &fakeCompose{}, nil)
+
+	resp := decodeStatus(t, do(h, http.MethodGet, "/status", nil, nil))
+	stacks, _ := resp["stacks"].([]any)
+	if len(stacks) != 2 {
+		t.Fatalf("stacks = %d entries, want 2 (sorted: clean, web)", len(stacks))
+	}
+	web, _ := stacks[1].(map[string]any)
+	findings, ok := web["non_portable_binds"].([]any)
+	if !ok || len(findings) != 1 {
+		t.Fatalf("web.non_portable_binds = %v, want one entry", web["non_portable_binds"])
+	}
+	if got, _ := findings[0].(string); !strings.Contains(got, "/nowhere/app.conf") {
+		t.Errorf("finding = %q, want the source named", got)
+	}
+	clean, _ := stacks[0].(map[string]any)
+	if _, present := clean["non_portable_binds"]; present {
+		t.Errorf("clean.non_portable_binds = %v, want the key omitted without findings", clean["non_portable_binds"])
+	}
+}

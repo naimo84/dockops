@@ -87,6 +87,16 @@ type State struct {
 	// its configuration is re-attempted once per interval, not on every
 	// poll.
 	ImageCheckErrorAt time.Time `json:"image_check_error_at,omitempty"`
+	// NonPortableBinds lists absolute bind sources of the stack's compose
+	// files that lie outside every mount of the agent's container (issue
+	// #18, suggestion 3): "service: source (target tgt)" strings, sorted.
+	// Such a source is mounted from a path the daemon may not see, which is
+	// the silent empty-directory failure with the author's own path.
+	// Reported, never enforced — an adopted stack whose host path differs
+	// from the container path keeps deploying. Stored rather than computed
+	// on demand so GET /status stays free of docker and file access;
+	// refreshed by the update check, cleared when the stack has none.
+	NonPortableBinds []string `json:"non_portable_binds,omitempty"`
 	// UpdatePolicy is the stack's update_policy at deploy time ("notify",
 	// "pinned" or "apply"). Phase 11 stores it because GET /status must
 	// report the effective policy exclusively from the state: the phase-10
@@ -314,6 +324,28 @@ func (s *Store) SetImageCheckError(stack, reason string, at time.Time) error {
 	st.ImageCheckError = reason
 	if !at.IsZero() {
 		st.ImageCheckErrorAt = at.UTC()
+	}
+	s.stacks[stack] = st
+	return nil
+}
+
+// SetNonPortableBinds records the non-portable absolute bind sources of a
+// stack (see State.NonPortableBinds). A nil/empty list clears the entry: a
+// fixed compose file must stop being flagged.
+func (s *Store) SetNonPortableBinds(stack string, findings []string) error {
+	if stack == "" {
+		return fmt.Errorf("state: stack name must not be empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.stacks[stack]
+	if !ok {
+		return fmt.Errorf("state: stack %s: no state entry to attach the bind findings to", stack)
+	}
+	if len(findings) == 0 {
+		st.NonPortableBinds = nil
+	} else {
+		st.NonPortableBinds = append([]string(nil), findings...)
 	}
 	s.stacks[stack] = st
 	return nil

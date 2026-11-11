@@ -103,22 +103,9 @@ func translate(p string, roots []BindRoot) (string, bool) {
 // keeps the earlier source (compose's own rule, mirrored here so the override
 // states the effective value).
 func RewriteRelativeBinds(files []string, stackDir string, roots []BindRoot) ([]byte, int, error) {
-	effective := map[string]bindEntry{}
-	for _, file := range files {
-		path := file
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(stackDir, path)
-		}
-		entries, err := readBindEntries(path)
-		if err != nil {
-			return nil, 0, err
-		}
-		for target, entry := range entries {
-			if prev, ok := effective[target]; ok {
-				entry.mergeOver(prev)
-			}
-			effective[target] = entry
-		}
+	effective, err := effectiveBindEntries(files, stackDir)
+	if err != nil {
+		return nil, 0, err
 	}
 
 	targets := make([]string, 0, len(effective))
@@ -249,6 +236,31 @@ func readBindEntries(path string) (map[string]bindEntry, error) {
 	return entries, nil
 }
 
+// effectiveBindEntries merges the bind entries of all compose files in -f
+// order into the entry set compose itself would resolve. Shared by the
+// rewrite and the read-only non-portability check, so both see exactly the
+// same picture.
+func effectiveBindEntries(files []string, stackDir string) (map[string]bindEntry, error) {
+	effective := map[string]bindEntry{}
+	for _, file := range files {
+		path := file
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(stackDir, path)
+		}
+		entries, err := readBindEntries(path)
+		if err != nil {
+			return nil, err
+		}
+		for target, entry := range entries {
+			if prev, ok := effective[target]; ok {
+				entry.mergeOver(prev)
+			}
+			effective[target] = entry
+		}
+	}
+	return effective, nil
+}
+
 // parseVolume normalizes one volumes element (short string syntax or long
 // mapping syntax). ok is false for named volumes and anonymous volumes, which
 // carry no host-relative source.
@@ -360,4 +372,88 @@ func (e *Executor) OwnMounts(ctx context.Context, name string) ([]BindRoot, erro
 		roots = append(roots, BindRoot{Container: m.Destination, Host: m.Source})
 	}
 	return roots, nil
+}
+
+// reverseTranslate maps a host path back into the container namespace through
+// the deepest matching bind root — the direction NonPortableBinds needs: an
+// absolute source written against the host (`docker compose up` from the host)
+// is portable even though translate() cannot resolve it.
+func reverseTranslate(p string, roots []BindRoot) (string, bool) {
+	clean := filepath.Clean(p)
+	var best BindRoot
+	found := false
+	for _, root := range roots {
+		h := filepath.Clean(root.Host)
+		if h == "" || h == "." || root.Container == "" || !filepath.IsAbs(h) {
+			continue
+		}
+		if clean != h && !strings.HasPrefix(clean, h+string(filepath.Separator)) {
+			continue
+		}
+		if !found || len(h) > len(filepath.Clean(best.Host)) {
+			best, found = root, true
+		}
+	}
+	if !found {
+		return "", false
+	}
+	rel, err := filepath.Rel(filepath.Clean(best.Host), clean)
+	if err != nil {
+		return "", false
+	}
+	if rel == "." {
+		return filepath.Clean(best.Container), true
+	}
+	return filepath.Join(best.Container, rel), true
+}
+
+// NonPortableBinds lists the bind sources of the stack's compose files that
+// look portable but are not (issue #18, suggestion 3 — the read-only twin of
+// the rewrite above).
+//
+// A relative source is already handled: RewriteRelativeBinds translates it or
+// fails the deploy. Absolute sources are passed through untouched, because an
+// operator who writes one knows the host namespace — but "knows" is not
+// "correct", and an absolute source that lies outside every mount of the agent
+// is mounted from a path the daemon sees differently from the stack definition
+// that declared it. That is exactly the silent empty-directory mount, just
+// with the author's own path.
+//
+// The check only reports, it never blocks a deploy: an adopted stack whose
+// host path differs from the container path keeps working exactly as before,
+// and the operator gets the statement instead of a guess. An empty roots list
+// means the agent runs on the host — then every path it can name is in the
+// daemon's namespace and nothing is reported.
+//
+// Returns "service: source (target tgt)" per finding, sorted; the stack dir is
+// stripped so the message names the source as it is written in the compose
+// file rather than an absolute rebuild of it.
+func NonPortableBinds(files []string, stackDir string, roots []BindRoot) ([]string, error) {
+	if len(roots) == 0 {
+		return nil, nil
+	}
+	effective, err := effectiveBindEntries(files, stackDir)
+	if err != nil {
+		return nil, err
+	}
+	var findings []string
+	for target, entry := range effective {
+		if entry.source == "" || !filepath.IsAbs(entry.source) {
+			continue
+		}
+		// Portable in either namespace: the source may name the container
+		// path (translate() finds it) or, just as legitimately, the host
+		// path the operator sees with `docker compose up` (the documented
+		// workaround — reverseTranslate() finds that). Only a path in
+		// neither is a finding.
+		if _, ok := translate(entry.source, roots); ok {
+			continue
+		}
+		if _, ok := reverseTranslate(entry.source, roots); ok {
+			continue
+		}
+		findings = append(findings, fmt.Sprintf("%s: %s (target %s)", entry.service, entry.source, target))
+	}
+	sort.Strings(findings)
+	return findings, nil
 }
