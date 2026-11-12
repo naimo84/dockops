@@ -561,7 +561,60 @@ func HelperArgs(p Plan, image, stateDir, suffix, selfContainer string, mounts []
 		// TestHelperArgsMatchTheCLIFlags guards the name.
 		"-selfupdate-plan", PlanPath(stateDir),
 	)
+	// The helper needs the mount mappings for the bind-source rewrite of a
+	// deploy plan (issues #18/#23): the same list it receives as -v
+	// arguments, in the "container=host" spelling MountFlag renders. Passed
+	// as an argument, not as an environment variable: the helper is started
+	// from the agent's process, and the argument list is already the one
+	// place where the two sides agree on a contract.
+	if flag := MountSpecs(mounts); flag != "" {
+		args = append(args, "-selfupdate-mounts", flag)
+	}
 	return args, nil
+}
+
+// MountSep separates the entries of the -selfupdate-mounts argument and
+// MountPairSep the container path from the host path inside one entry. Chosen
+// so neither character can appear in a Linux path or in docker's mount
+// spelling.
+const (
+	MountSep     = ";"
+	MountPairSep = "="
+)
+
+// MountSpecs renders the mount mappings as the -selfupdate-mounts value:
+// container=host entries joined by MountSep, container-only when host and
+// path are identical. Empty renders as an empty string (flag omitted).
+func MountSpecs(mounts []Mount) string {
+	entries := make([]string, 0, len(mounts))
+	for _, m := range mounts {
+		host, path := strings.TrimSpace(m.Host), strings.TrimSpace(m.Path)
+		if host == "" || path == "" || host == path {
+			continue
+		}
+		entries = append(entries, path+MountPairSep+host)
+	}
+	return strings.Join(entries, MountSep)
+}
+
+// ParseMountSpecs reads the -selfupdate-mounts value back into BindRoot pairs.
+// Malformed entries are skipped: a mapping is an optimization of the bind
+// rewrite, and dropping one degrades that rewrite to a clear error instead of
+// silently translating into the wrong namespace.
+func ParseMountSpecs(v string) []Mount {
+	var mounts []Mount
+	for _, entry := range strings.Split(v, MountSep) {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		path, host, ok := strings.Cut(entry, MountPairSep)
+		if !ok || path == "" || host == "" {
+			continue
+		}
+		mounts = append(mounts, Mount{Path: path, Host: host})
+	}
+	return mounts
 }
 
 // rollbackDocument mirrors the in-process rollback override (see

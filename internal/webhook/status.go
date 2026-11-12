@@ -119,6 +119,14 @@ type StackStatus struct {
 	Drift string `json:"drift"`
 	// Error carries the container listing failure when Drift is "unknown".
 	Error string `json:"error,omitempty"`
+	// NonPortableBinds lists absolute bind sources of the stack's compose
+	// files that lie outside every mount of the agent's container (issue
+	// #18, suggestion 3), as "service: source (target tgt)". Such a source
+	// is mounted from a path the daemon may not see — the silent
+	// empty-directory mount with the author's own path. Reported, never
+	// enforced: the stack keeps deploying. Omitted when the last check
+	// found none (or none ran).
+	NonPortableBinds []string `json:"non_portable_binds,omitempty"`
 	// Updates reports the last image update check of this stack (phase 10).
 	// Nil when the stack has no records — no check ran yet, or its
 	// update_policy is pinned. Built exclusively from the state: /status
@@ -142,6 +150,17 @@ type StackUpdates struct {
 	Pending int `json:"pending"`
 	// Services lists one entry per checked image, sorted by service.
 	Services []ServiceUpdate `json:"services"`
+	// CheckError is the reason the last check could not resolve the stack's
+	// compose configuration (issue #18's side finding: a stack whose
+	// env_file the daemon cannot read silently never gets records). When it
+	// is set the stack is *blind*: Services carries the last known picture
+	// and nothing here says whether an update exists. Empty when the last
+	// attempt resolved the configuration.
+	CheckError string `json:"check_error,omitempty"`
+	// CheckErrorAt is when that attempt failed (RFC3339, empty when the
+	// last attempt succeeded). The interval applies to failed attempts
+	// too, so this is also when the next one is due.
+	CheckErrorAt string `json:"check_error_at,omitempty"`
 }
 
 // ServiceUpdate is the update state of one image of a stack.
@@ -334,6 +353,9 @@ func buildStackStatus(containers []compose.Container, listingErr error, name str
 		// the recorded image situation, and a broken image record must not
 		// change the drift statement.
 		Updates: buildStackUpdates(st),
+		// Recorded by the update check; never derived here, so the report
+		// stays free of docker and file access.
+		NonPortableBinds: append([]string(nil), st.NonPortableBinds...),
 	}
 	if !st.UpdatedAt.IsZero() {
 		entry.LastDeployed = st.UpdatedAt.UTC().Format(time.RFC3339)
@@ -353,7 +375,7 @@ func buildStackStatus(containers []compose.Container, listingErr error, name str
 // empty object pretending a check happened). The state is the only source:
 // no docker, no registry, no configuration.
 func buildStackUpdates(st state.State) *StackUpdates {
-	if len(st.Images) == 0 {
+	if len(st.Images) == 0 && st.ImageCheckError == "" {
 		return nil
 	}
 	policy := st.UpdatePolicy
@@ -392,6 +414,10 @@ func buildStackUpdates(st state.State) *StackUpdates {
 	if !newest.IsZero() {
 		updates.CheckedAt = newest.UTC().Format(time.RFC3339)
 	}
+	// Readiness, not cosmetics: a blind stack must never look like a
+	// healthy one that simply has no update.
+	updates.CheckError = st.ImageCheckError
+	updates.CheckErrorAt = formatTime(st.ImageCheckErrorAt)
 	// Deterministic order: service first (the operator-facing name), the
 	// image reference as the tiebreaker for a service using several images.
 	sort.Slice(updates.Services, func(i, j int) bool {

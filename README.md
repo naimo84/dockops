@@ -791,6 +791,52 @@ Ohne Records fehlt `updates` ganz (kein Check gelaufen oder `pinned`);
 `services` ist immer ein Array, sortiert nach Service. Ein kaputter
 Image-Record ändert die Drift-Aussage nicht und umgekehrt.
 
+**Blinde Stacks** (Issue #18): Lässt sich die Compose-Konfiguration eines
+Stacks beim Check nicht auflösen — kaputte Datei, Docker-Problem, oder ein
+`env_file`, das nur im Daemon-Namespace existiert —, gibt es keine Records.
+Statt den Stack wie „nie geprüft" aussehen zu lassen, steht der Grund im
+`updates`-Block:
+
+```json
+"updates": {
+  "policy": "notify",
+  "checked_at": "2026-11-10T09:00:00Z",
+  "pending": 0,
+  "services": [],
+  "check_error": "env file /var/lib/dockops/repos/infrastructure/alloy/.env not found",
+  "check_error_at": "2026-11-10T09:00:00Z"
+}
+```
+
+**Nicht portable Binds** (Issue #18, Vorschlag 3): Absolute Bind-Quellen
+werden nie umgeschrieben — wer sie schreibt, kennt den Host-Namespace. Liegt
+so ein Pfad aber außerhalb **jeder** Mount des Agenten, meldet `/status` ihn,
+statt es dem Betreiber beim Debuggen zu überlassen:
+
+```json
+"non_portable_binds": [
+  "litellm: /srv/conf/config.yaml (target /app/config.yaml)"
+]
+```
+
+Das ist derselbe stille Leer-Mount wie bei relativen Quellen, nur mit dem
+eigenen Pfad des Autors. Deshalb der Name: **nicht portabel**, nicht falsch.
+Geprüft wird in beide Namespaces — ein Pfad, der im Container-Namespace
+*oder* als Host-Pfad eines Mounts liegt, ist portabel (der dokumentierte
+Workaround bleibt also still). Der Eintrag wird nie erzwungen: der Stack
+deployt weiter. Er entsteht im Image-Update-Check (der einzige Schritt, der
+die Compose-Dateien ohne Deploy liest) und verschwindet mit der Korrektur.
+Läuft dockops direkt auf dem Host oder ist die Mount-Liste nicht lesbar,
+schweigt die Prüfung — statt jeden absoluten Pfad zu melden.
+
+`check_error` heißt: dieser Stack ist **blind** — das letzte bekannte Bild
+steht in `services`, aber ob ein Update existiert, ist unbekannt. Die
+Meldung verschwindet mit dem nächsten erfolgreichen Check. Der
+`update_check_interval` gilt auch für den Fehlschlag (ein Compose-Aufruf pro
+Intervall, nicht pro Poll), `check_error_at` ist damit auch der nächste
+Versuch. `pending: 0` bei gesetztem `check_error` ist bewusst: ein blinder
+Stack weiß von keinem Update.
+
 **Benachrichtigung**: `update_available` ist ein Ereignis des
 Phase-9-Notifiers, aber **opt-in** — der Default
 (`[deploy_failed, prune_failed, repo_failed, update_failed]`, Phase 11 nimmt
@@ -1061,6 +1107,66 @@ Historische Notiz: Der frühere Workaround, die Datei einmalig per
 `chmod 644` (im Container oder auf dem Host) weltlesbar zu machen, ist damit
 **obsolet** — er macht Secrets weltlesbar und war schlimmer als das Problem.
 Wer ihn in alten Runbooks findet: nicht mehr anwenden.
+
+## Relative Bind-Quellen (Issue #18/#23)
+
+dockops fährt compose **im Container**, aber der Docker-Daemon löst die Pfade
+in **seinem** Namespace (Host) auf. Eine relative Bind-Quelle wie
+
+```yaml
+services:
+  litellm:
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+```
+
+wird von compose gegen das Verzeichnis der compose-Datei aufgelöst — also
+gegen `/var/lib/dockops/repos/<remote>/<stack>`, ein Pfad, den es auf dem Host
+nicht gibt. Der Daemon legt dort ein **leeres Verzeichnis** an und mountet es
+auf das Datei-Ziel: kein Deploy-Fehler, aber ein Container, der später stirbt
+(`is a directory`, `image update check: cannot resolve stack images` für
+Stacks mit `env_file: ./.env.default`).
+
+**Verhalten:** Vor jedem Deploy einer Stack-Definition prüft dockops die
+Bind-Quellen aller Compose-Dateien (Short- und Long-Syntax, `-f`-Reihenfolge
+inkl. Compose-Merge-Regeln für gleiche `target`). Jede **relative** Quelle
+wird über die Mounts des eigenen Containers (`docker inspect .Mounts`, tiefster
+Treffer gewinnt) auf den absoluten **Host-Pfad** abgebildet und in ein
+generiertes Override `<stackDir>/dockops-binds-<stack>.yaml` geschrieben:
+
+```yaml
+services:
+  litellm:
+    volumes:
+      - /home/docker/infrastructure/litellm/config.yaml:/app/config.yaml:ro
+```
+
+Das Override wird als zusätzliches `-f` **nach** den Stack-Dateien übergeben
+(späteres File gewinnt, Compose merged Volumes über `target`) und nach dem
+Deploy wieder entfernt. Der Deploy-Helper (Phase 13) macht dasselbe — er
+bekommt die Mount-Zuordnung als `-selfupdate-mounts` mit, weil er die Mounts
+des Agenten erbt.
+
+Regeln:
+
+- **Absolute Quellen bleiben unverändert.** Wer sie deklariert, kennt den
+  Host-Namespace; der bisherige Workaround funktioniert weiter.
+- **Named Volumes werden nicht angefasst** (kein Host-Pfad, per Konstruktion
+  portabel).
+- **Nicht auflösbar = harter Fehler.** Liegt die aufgelöste Quelle außerhalb
+  aller Mounts des Agenten, bricht der Deploy *vor* dem ersten
+  Compose-Kommando ab, mit Quelle, `target` und dem aufgelösten Pfad in der
+  Meldung. Der stille Leer-Mount ist genau das, was diese Prüfung abschafft.
+- **Läuft dockops direkt auf dem Host** (kein Container), ist der
+  Container-Pfad schon der Daemon-Pfad: die Quelle wird trotzdem absolut
+  geschrieben, aber nicht übersetzt.
+- Das Override ist eine Datei im Checkout und übersteht keinen
+  Checkout-Update (`git clean -fd`) — es wird pro Deploy neu erzeugt, und ein
+  liegengebliebenes Artefakt nach einem Absturz wird beim nächsten Deploy
+  überschrieben bzw. aufgeräumt.
+
+Damit ist der alte Ratschlag „alle Bind-Quellen als absolute Host-Pfade
+schreiben“ eine Option, keine Voraussetzung mehr.
 
 ## CLI
 

@@ -69,7 +69,10 @@ func TestPhase13HelperArgsCarryMounts(t *testing.T) {
 		" --volumes-from abc123" +
 		" -v /home/docker/dockops:/var/lib/dockops" +
 		" -v /var/run/docker.sock:/var/run/docker.sock:ro" +
-		" " + image + " -selfupdate-helper -selfupdate-plan " + PlanPath("/var/lib/dockops")
+		" " + image + " -selfupdate-helper -selfupdate-plan " + PlanPath("/var/lib/dockops") +
+		// The same mappings as an argument: the deploy plan rewrites relative
+		// bind sources through them (issues #18/#23).
+		" -selfupdate-mounts /var/lib/dockops=/home/docker/dockops"
 	if joined != want {
 		t.Errorf("HelperArgs() = %q, want %q", joined, want)
 	}

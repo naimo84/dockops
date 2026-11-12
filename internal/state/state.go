@@ -71,6 +71,32 @@ type State struct {
 	// deployment depends on it (it neither triggers nor blocks one), so a
 	// migration or a schema bump would be noise.
 	Images map[string]ImageRecord `json:"images,omitempty"`
+	// ImageCheckError carries the reason the image update check could not
+	// resolve the stack's compose configuration (broken file, docker
+	// problem, missing env a service's env_file needs). Without it such a
+	// stack is invisible in GET /status: no records, no block, no
+	// difference from "never checked" — the blind stack is the one that
+	// needs attention most. Set instead of the records, cleared by the
+	// next successful check; UpdatePolicy keeps the due-date basis (the
+	// interval applies to the failed attempt as well — one compose call
+	// per interval, never per poll).
+	ImageCheckError string `json:"image_check_error,omitempty"`
+	// ImageCheckErrorAt is when that attempt failed (UTC). It is the
+	// due-date basis of a blind stack: updateDue falls back to it when the
+	// stack has records but none newer, so a stack that can never resolve
+	// its configuration is re-attempted once per interval, not on every
+	// poll.
+	ImageCheckErrorAt time.Time `json:"image_check_error_at,omitempty"`
+	// NonPortableBinds lists absolute bind sources of the stack's compose
+	// files that lie outside every mount of the agent's container (issue
+	// #18, suggestion 3): "service: source (target tgt)" strings, sorted.
+	// Such a source is mounted from a path the daemon may not see, which is
+	// the silent empty-directory failure with the author's own path.
+	// Reported, never enforced — an adopted stack whose host path differs
+	// from the container path keeps deploying. Stored rather than computed
+	// on demand so GET /status stays free of docker and file access;
+	// refreshed by the update check, cleared when the stack has none.
+	NonPortableBinds []string `json:"non_portable_binds,omitempty"`
 	// UpdatePolicy is the stack's update_policy at deploy time ("notify",
 	// "pinned" or "apply"). Phase 11 stores it because GET /status must
 	// report the effective policy exclusively from the state: the phase-10
@@ -281,6 +307,50 @@ func (s *Store) Set(name string, st State) error {
 // belongs to a deployment (it compares that deployment's digests), so there
 // is nothing to attach it to otherwise — the caller logs and skips. Hash,
 // status, timestamps and compose traces stay untouched; call Save to persist.
+// SetImageCheckError records that the image update check of stack could not
+// run, and when — the pair that makes a blind stack visible in GET /status.
+// recs are left untouched: the last known records stay, so an operator still
+// sees the previous picture next to the reason it is not updating.
+func (s *Store) SetImageCheckError(stack, reason string, at time.Time) error {
+	if stack == "" {
+		return fmt.Errorf("state: stack name must not be empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.stacks[stack]
+	if !ok {
+		return fmt.Errorf("state: stack %s: no state entry to attach the image check error to", stack)
+	}
+	st.ImageCheckError = reason
+	if !at.IsZero() {
+		st.ImageCheckErrorAt = at.UTC()
+	}
+	s.stacks[stack] = st
+	return nil
+}
+
+// SetNonPortableBinds records the non-portable absolute bind sources of a
+// stack (see State.NonPortableBinds). A nil/empty list clears the entry: a
+// fixed compose file must stop being flagged.
+func (s *Store) SetNonPortableBinds(stack string, findings []string) error {
+	if stack == "" {
+		return fmt.Errorf("state: stack name must not be empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.stacks[stack]
+	if !ok {
+		return fmt.Errorf("state: stack %s: no state entry to attach the bind findings to", stack)
+	}
+	if len(findings) == 0 {
+		st.NonPortableBinds = nil
+	} else {
+		st.NonPortableBinds = append([]string(nil), findings...)
+	}
+	s.stacks[stack] = st
+	return nil
+}
+
 func (s *Store) SetImages(stack string, recs map[string]ImageRecord) error {
 	if stack == "" {
 		return fmt.Errorf("state: stack name must not be empty")
@@ -301,6 +371,10 @@ func (s *Store) SetImages(stack string, recs map[string]ImageRecord) error {
 		}
 		st.Images = copied
 	}
+	// A successful resolve ends the blindness: the error describes the
+	// last failed attempt, not a permanent property of the stack.
+	st.ImageCheckError = ""
+	st.ImageCheckErrorAt = time.Time{}
 	s.stacks[stack] = st
 	return nil
 }

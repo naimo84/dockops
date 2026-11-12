@@ -20,6 +20,12 @@ import (
 func deployHelperPlan(t *testing.T) selfupdate.Plan {
 	t.Helper()
 	dir := t.TempDir()
+	// The deploy path reads the compose file to rewrite relative bind sources
+	// (issues #18/#23), so the plan's file has to exist — without volumes the
+	// rewrite yields no override and the command line stays as before.
+	if err := os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte("services:\n  dockops:\n    image: dockops:latest\n"), 0o644); err != nil {
+		t.Fatalf("write compose file: %v", err)
+	}
 	return selfupdate.Plan{
 		Version:              selfupdate.Version,
 		Kind:                 selfupdate.KindDeploy,

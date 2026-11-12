@@ -338,6 +338,66 @@ func TestPhase10ConfigErrorsDegrade(t *testing.T) {
 	if calls := resolver.called(); len(calls) != 0 {
 		t.Errorf("registry calls = %v, want none", calls)
 	}
+	// The degradation is no longer silent: the reason is stored, so
+	// GET /status can tell a blind stack from an unchecked one.
+	st, _ := f.state.Get("web")
+	if !strings.Contains(st.ImageCheckError, "compose config boom") {
+		t.Errorf("ImageCheckError = %q, want the resolve failure", st.ImageCheckError)
+	}
+	if st.ImageCheckErrorAt.IsZero() {
+		t.Error("ImageCheckErrorAt is zero, want the attempt time (it gates the next try)")
+	}
+}
+
+// TestPhase10BlindStackRespectsInterval: storing the failure must not turn the
+// 5-minute poll into one compose call per poll. The failed attempt counts as an
+// attempt, so with the default interval the second pass is not due.
+func TestPhase10BlindStackRespectsInterval(t *testing.T) {
+	f := newFixture(t, defaultRoot)
+	f.addLocalStack("web", "name: web\n")
+	f.compose.imagesErr = fmt.Errorf("compose config boom")
+
+	r := f.phase10Reconciler(&fakeResolver{}, &recordingNotifier{})
+	for pass := 1; pass <= 2; pass++ {
+		if err := r.Reconcile(context.Background()); err != nil {
+			t.Fatalf("pass %d: Reconcile() error = %v", pass, err)
+		}
+	}
+	if f.compose.imagesCall != 1 {
+		t.Errorf("compose Images calls = %d, want 1 (a failed attempt is an attempt)", f.compose.imagesCall)
+	}
+}
+
+// TestPhase10RecoveryClearsBlindMarker: once the configuration resolves again
+// the marker must disappear — a stale error would claim a blindness that no
+// longer exists.
+func TestPhase10RecoveryClearsBlindMarker(t *testing.T) {
+	f := newFixture(t, updateRoot)
+	f.addLocalStack("web", "name: web\n")
+	f.compose.imagesErr = fmt.Errorf("compose config boom")
+	f.compose.digests = map[string]string{"ghcr.io/x/app:latest": "sha256:same"}
+	resolver := &fakeResolver{digests: map[string]string{"ghcr.io/x/app:latest": "sha256:same"}}
+	r := f.phase10Reconciler(resolver, &recordingNotifier{})
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("first pass: Reconcile() error = %v", err)
+	}
+	if st, _ := f.state.Get("web"); st.ImageCheckError == "" {
+		t.Fatal("first pass did not record the blind marker")
+	}
+
+	f.compose.imagesErr = nil
+	f.compose.images = map[string]string{"app": "ghcr.io/x/app:latest"}
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second pass: Reconcile() error = %v", err)
+	}
+	st, _ := f.state.Get("web")
+	if st.ImageCheckError != "" || !st.ImageCheckErrorAt.IsZero() {
+		t.Errorf("marker survived a successful check: %q / %v", st.ImageCheckError, st.ImageCheckErrorAt)
+	}
+	if recs := imageState(t, f, "web"); len(recs) != 1 {
+		t.Errorf("records = %+v, want the resolved image after recovery", recs)
+	}
 }
 
 // TestPhase10Helpers covers the pure helpers of the update check: which
