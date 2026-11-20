@@ -131,3 +131,25 @@ func TestRetryNowSkipsTheBackOff(t *testing.T) {
 		t.Errorf("Up calls = %d, want the forced retry", got)
 	}
 }
+
+// The state keeps why the last attempt failed (GET /status shows it) and
+// forgets it with the next successful deploy.
+func TestFailedDeployRecordsTheReason(t *testing.T) {
+	f := newFixture(t, defaultRoot)
+	f.addLocalStack("web", "name: web\n")
+	f.compose.failUpFor = "web"
+	r := f.reconciler()
+	_ = r.Reconcile(context.Background())
+
+	st, _ := f.state.Get("web")
+	if !strings.Contains(st.LastError, "compose up boom") {
+		t.Errorf("LastError = %q, want the compose failure", st.LastError)
+	}
+	f.compose.failUpFor = ""
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if st, _ := f.state.Get("web"); st.LastError != "" || st.Status != state.StatusDeployed {
+		t.Errorf("state after the fix = %+v, want deployed without an error", st)
+	}
+}

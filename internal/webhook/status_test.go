@@ -440,3 +440,55 @@ func TestStatusNonPortableBinds(t *testing.T) {
 		t.Errorf("clean.non_portable_binds = %v, want the key omitted without findings", clean["non_portable_binds"])
 	}
 }
+
+// A crash loop or an unhealthy container is what a watchdog exists for: it
+// must never read as ok. The values stay the four the fleet page knows.
+func TestDriftMatrixFlagsTroubledContainers(t *testing.T) {
+	cases := []struct {
+		name       string
+		containers []compose.Container
+		want       string
+	}{
+		{"all running", []compose.Container{{State: "running"}, {State: "running", Health: "healthy"}}, driftOK},
+		{"unhealthy", []compose.Container{{State: "running"}, {State: "running", Health: "unhealthy"}}, driftPartial},
+		{"crash loop next to a running one", []compose.Container{{State: "running"}, {State: "restarting"}}, driftPartial},
+		{"crash loop alone", []compose.Container{{State: "restarting"}}, driftPartial},
+		{"exited next to running", []compose.Container{{State: "running"}, {State: "exited"}}, driftPartial},
+		{"all exited", []compose.Container{{State: "exited"}}, driftStopped},
+		{"none", nil, driftStopped},
+	}
+	for _, tc := range cases {
+		if got := driftFor(tc.containers); got != tc.want {
+			t.Errorf("%s: driftFor() = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A failed deploy is visible even when the previous containers keep running
+// (drift ok): status, consecutive failures and the reason.
+func TestStatusReportsFailedDeploy(t *testing.T) {
+	entry := state.State{
+		Hash:      "h2",
+		Status:    state.StatusFailed,
+		Failures:  3,
+		LastError: "stack web: up: docker compose ...: pull access denied",
+		StackDir:  "/stacks/web",
+	}
+	fc := &fakeCompose{infos: []compose.ContainerInfo{{Project: "web", Name: "web-app-1", State: "running"}}}
+	h := statusFixture(t, map[string]state.State{"web": entry}, fc, nil)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+	resp := decodeStatus(t, rec)
+	stacks, _ := resp["stacks"].([]any)
+	if len(stacks) != 1 {
+		t.Fatalf("stacks = %v, want one", resp["stacks"])
+	}
+	web, _ := stacks[0].(map[string]any)
+	if web["status"] != "failed" || web["failures"] != float64(3) || !strings.Contains(web["last_error"].(string), "pull access denied") {
+		t.Errorf("stack entry = %v, want status failed, failures 3 and the error", web)
+	}
+	if web["drift"] != driftOK {
+		t.Errorf("drift = %v, want ok (the old containers still run)", web["drift"])
+	}
+}

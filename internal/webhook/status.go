@@ -107,8 +107,19 @@ type HostRepo struct {
 type StackStatus struct {
 	// Name is the stack (and compose project) name.
 	Name string `json:"name"`
-	// DeployedHash is the stack hash of the last recorded deploy.
+	// DeployedHash is the stack hash of the last recorded attempt — of the
+	// failed one when Status is "failed" (the name predates Status).
 	DeployedHash string `json:"deployed_hash"`
+	// Status is the outcome of the last deploy attempt: "deployed" or
+	// "failed". A failed stack may still run its previous containers, so
+	// the drift alone can look fine — this is where a broken deploy shows.
+	Status string `json:"status"`
+	// Failures counts the consecutive failed attempts with this hash
+	// (omitted while deployed); the retry back-off grows with it.
+	Failures int `json:"failures,omitempty"`
+	// LastError is the failure text of the last attempt while Status is
+	// "failed".
+	LastError string `json:"last_error,omitempty"`
 	// LastDeployed is the RFC3339 timestamp of the last state change
 	// (omitted only for a zero timestamp, which the store never persists).
 	LastDeployed string `json:"last_deployed,omitempty"`
@@ -347,6 +358,9 @@ func buildStackStatus(containers []compose.Container, listingErr error, name str
 	entry := StackStatus{
 		Name:         name,
 		DeployedHash: st.Hash,
+		Status:       st.Status,
+		Failures:     st.Failures,
+		LastError:    st.LastError,
 		Containers:   make([]compose.Container, 0),
 		// The update block comes from the state alone and is therefore
 		// independent of the container listing: a broken ps must not hide
@@ -440,31 +454,37 @@ func formatTime(t time.Time) string {
 
 // driftFor classifies a stack's containers per the drift matrix:
 //
-//	ok      ≥1 container running, none exited
-//	stopped 0 containers running (all exited or none at all)
-//	partial ≥1 running but ≥1 exited
+//	ok      ≥1 container running, none exited, restarting or unhealthy
+//	stopped nothing running and nothing restarting (all exited or none)
+//	partial something runs or restarts, but ≥1 container is exited,
+//	        restarting (a crash loop) or running unhealthy
 //	unknown listing failed (set by the caller, never returned here)
 //
 // The state store records no expected-service list yet, so the comparison
 // the briefing describes ("mind. 1 Service des Stacks fehlt") runs in its
-// documented fallback form: running > 0 and no exited container suffice for
-// ok, an exited container next to running ones means partial. States other
-// than running/exited (created, paused, restarting) count as neither —
-// conservative, they are transient by nature.
+// documented fallback form. A crash-looping or unhealthy container is the
+// failure a watchdog exists for, so it never reads as ok; the values stay
+// the four the consumers (fleet page) know. Other states (created, paused)
+// count as neither — they are transient by nature.
 func driftFor(containers []compose.Container) string {
-	running, exited := 0, 0
+	running, exited, troubled := 0, 0, 0
 	for _, c := range containers {
 		switch c.State {
 		case "running":
 			running++
+			if c.Health == "unhealthy" {
+				troubled++
+			}
 		case "exited":
 			exited++
+		case "restarting":
+			troubled++
 		}
 	}
 	switch {
-	case running == 0:
+	case running == 0 && troubled == 0:
 		return driftStopped
-	case exited > 0:
+	case exited > 0 || troubled > 0:
 		return driftPartial
 	default:
 		return driftOK

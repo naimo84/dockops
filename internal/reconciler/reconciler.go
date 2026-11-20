@@ -841,7 +841,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		if err != nil {
 			err = fmt.Errorf("stack %s: vault: %w", stack.Name, err)
 			pn.deployFailed(ctx, stack.Name, stageSecrets, newHash, err)
-			r.markFailed(stack, newHash)
+			r.markFailed(stack, newHash, err)
 			return err
 		}
 	}
@@ -852,7 +852,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	if err != nil {
 		err = fmt.Errorf("stack %s: resolve environment: %w", stack.Name, err)
 		pn.deployFailed(ctx, stack.Name, stageSecrets, newHash, err)
-		r.markFailed(stack, newHash)
+		r.markFailed(stack, newHash, err)
 		return err
 	}
 
@@ -862,7 +862,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		// failure here aborts the deployment just like a resolution error.
 		err = fmt.Errorf("stack %s: write env file: %w", stack.Name, err)
 		pn.deployFailed(ctx, stack.Name, stageSecrets, newHash, err)
-		r.markFailed(stack, newHash)
+		r.markFailed(stack, newHash, err)
 		return err
 	}
 	defer cleanup()
@@ -871,7 +871,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	if err := r.hooks.Run(ctx, stack.Hooks.PreDeploy, stack.Dir, hookEnv, hookTimeout); err != nil {
 		err = fmt.Errorf("stack %s: pre_deploy: %w", stack.Name, err)
 		pn.deployFailed(ctx, stack.Name, stagePreDeploy, newHash, err)
-		r.markFailed(stack, newHash)
+		r.markFailed(stack, newHash, err)
 		return err
 	}
 
@@ -888,7 +888,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	if err != nil {
 		err = fmt.Errorf("stack %s: write stack env file: %w", stack.Name, err)
 		pn.deployFailed(ctx, stack.Name, stageSecrets, newHash, err)
-		r.markFailed(stack, newHash)
+		r.markFailed(stack, newHash, err)
 		return err
 	}
 	r.logger.Debug("wrote stack env file", "stack", stack.Name, "path", stackEnvPath)
@@ -907,7 +907,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 			rollbackStackEnv()
 			err = fmt.Errorf("stack %s: up: %w", stack.Name, err)
 			pn.deployFailed(ctx, stack.Name, stageComposeUp, newHash, err)
-			r.markFailed(stack, newHash)
+			r.markFailed(stack, newHash, err)
 			return err
 		}
 		// No rollbackStackEnv from here on: the helper reads the generated
@@ -939,7 +939,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		rollbackStackEnv()
 		err = fmt.Errorf("stack %s: up: %w", stack.Name, err)
 		pn.deployFailed(ctx, stack.Name, stageComposeUp, newHash, err)
-		r.markFailed(stack, newHash)
+		r.markFailed(stack, newHash, err)
 		return err
 	}
 
@@ -986,7 +986,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 // non-deployed status as changed), and persists the record immediately (see
 // the per-stack save in deployStack). The bookkeeping itself must never mask
 // the original failure, so Set and Save errors are only logged.
-func (r *Reconciler) markFailed(stack config.Stack, newHash string) {
+func (r *Reconciler) markFailed(stack config.Stack, newHash string, cause error) {
 	failures := 1
 	if prev, ok := r.state.Get(stack.Name); ok && prev.Status == state.StatusFailed && prev.Hash == newHash {
 		failures = prev.Failures + 1
@@ -995,6 +995,7 @@ func (r *Reconciler) markFailed(stack config.Stack, newHash string) {
 		Hash:         newHash,
 		Status:       state.StatusFailed,
 		Failures:     failures,
+		LastError:    lastError(cause),
 		StackDir:     stack.Dir,
 		ComposeFile:  stack.ComposeFile,
 		ComposeFiles: stack.ComposeFiles,
@@ -1006,6 +1007,23 @@ func (r *Reconciler) markFailed(stack config.Stack, newHash string) {
 	if err := r.state.Save(); err != nil {
 		r.logger.Error("cannot persist failed state", "stack", stack.Name, "error", err)
 	}
+}
+
+// maxLastError bounds the failure text kept in the state (and shown in
+// GET /status): enough for the compose or hook message, not a log dump.
+const maxLastError = 1024
+
+// lastError renders a deployment failure for State.LastError, bounded to
+// maxLastError bytes.
+func lastError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := err.Error()
+	if len(text) > maxLastError {
+		text = text[:maxLastError] + "..."
+	}
+	return text
 }
 
 // maxRetryDelay caps the back-off of a failing stack. Some fixes do not

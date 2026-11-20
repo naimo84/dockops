@@ -407,6 +407,10 @@ func (r *Reconciler) bookDeploy(ctx context.Context, project string, st state.St
 	st.Status = status
 	st.DeployPendingHash = ""
 	st.DeployPendingAt = time.Time{}
+	st.LastError = ""
+	if errText != "" {
+		st.LastError = lastError(errors.New(errText))
+	}
 	if err := r.state.Set(project, st); err != nil {
 		r.logger.Error("self deploy: cannot record the outcome", "stack", project, "error", err)
 		return
