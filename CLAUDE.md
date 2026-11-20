@@ -237,6 +237,10 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
   (dirty tracked File im Stash + Reset + INFO-Log, untracked File per
   `stash pop` verifiziert, clean Worktree ohne Stash-Eintrag, Stash-Failure
   via git-PATH-Wrapper ohne EnsureRepo-Fehler)
+- `internal/hash/` — `ComputeWithInputs` nimmt zusätzlich die Inhalte von
+  `env_files` und Vault-Templates (SHA-256-Digests); `env_file_contents` ist
+  additiv mit `omitempty`, daher **ohne** Schema-Bump (Stacks ohne env_files
+  behalten ihren Hash, Golden-Vektor unverändert)
 - `internal/hash/` — Deterministisches Stack-Hashing (Package `stackhash`,
   Schema-Version 3): kanonische Serialisierung von Stack (inkl. Compose-
   File-Liste, effective Services, ignore_services und

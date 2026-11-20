@@ -95,3 +95,24 @@ func TestPruneUsesTheGeneratedStackEnv(t *testing.T) {
 		t.Errorf("Down calls = %+v, want one with the stack's generated .env", f.compose.downs)
 	}
 }
+
+// Editing a plaintext env file (an image tag, a flag) redeploys the stack —
+// the same class as the vault template edit of #22: before, the hash only
+// covered the path, and the change sat in the checkout.
+func TestEnvFileEditRedeploys(t *testing.T) {
+	f := newFixture(t, defaultRoot)
+	f.addLocalStack("web", "name: web\nenv_files:\n  - config.env\n")
+	envFile := filepath.Join(f.workDir, "host", "web", "config.env")
+	writeFile(t, envFile, "TAG=1.0\n")
+	r := f.reconciler()
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	writeFile(t, envFile, "TAG=1.1\n")
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if got := f.upNames(); !reflect.DeepEqual(got, []string{"web", "web"}) {
+		t.Errorf("Ups = %v, want a redeploy after the env file edit", got)
+	}
+}

@@ -290,7 +290,9 @@ gemergte Umgebung des Stacks (inkl. Secrets) sowie `STACK_NAME`,
    diesem Durchlauf ausgesetzt**, weil ein kaputter Stack sonst wie ein
    entfernter aussähe.
 4. **Pro aktivem Stack deployen**, wenn sich sein deterministischer Hash
-   (Stack-Definition + normalisierte Compose-Datei) gegen den State geändert
+   (Stack-Definition + normalisierte Compose-Datei + Inhalte der
+   `env_files` und Vault-Templates — nicht die aufgelösten Secrets) gegen den
+   State geändert
    hat oder der letzte Versuch fehlschlug. Scheitert ein Stack mit
    unveränderter Konfiguration wiederholt, folgt nach dem sofortigen ersten
    Retry ein Backoff (1, 2, 4 … bis 30 Minuten); eine Konfigurationsänderung

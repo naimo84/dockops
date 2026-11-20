@@ -800,7 +800,29 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		}
 		templateContents = append(templateContents, content)
 	}
-	newHash, err := stackhash.ComputeWithTemplates(stack, templateContents, contents...)
+	// env_files are plaintext deployment recipe (an image tag, a flag): an
+	// edit must redeploy. The generated .env contributes nothing, as above —
+	// the merge skips it as a source for the same reason.
+	envFileContents := make([][]byte, 0, len(stack.EnvFiles))
+	for _, rel := range stack.EnvFiles {
+		path := rel
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(stack.Dir, path)
+		}
+		if filepath.Clean(path) == generatedEnv {
+			envFileContents = append(envFileContents, nil)
+			continue
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("stack %s: read env file %s: %w", stack.Name, path, err)
+		}
+		envFileContents = append(envFileContents, content)
+	}
+	newHash, err := stackhash.ComputeWithInputs(stack, stackhash.Inputs{
+		VaultEnvTemplates: templateContents,
+		EnvFiles:          envFileContents,
+	}, contents...)
 	if err != nil {
 		return fmt.Errorf("stack %s: compute hash: %w", stack.Name, err)
 	}
