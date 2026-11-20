@@ -652,13 +652,24 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		remotePaths[name] = p
 	}
 
-	// 3. Full configuration: local stack discovery plus import merge.
-	cfg, err := config.Load(rootFile)
+	// 3. Full configuration: local stack discovery plus import merge. A
+	// broken stack definition only takes itself out (LoadLenient): it is
+	// reported, the other stacks deploy, and the prune is suspended below.
+	cfg, err := config.LoadLenient(rootFile)
 	if err != nil {
 		err = fmt.Errorf("reconciler: %w", err)
 		pn.repoFailed(ctx, HostRepoName, stageConfig, err)
 		errs = append(errs, err)
 		return errors.Join(errs...)
+	}
+	if len(cfg.StackErrors) > 0 {
+		for _, stackErr := range cfg.StackErrors {
+			r.logger.Error("stack definition cannot be loaded; the stack is skipped", "error", stackErr)
+		}
+		err := fmt.Errorf("reconciler: %d stack definition(s) cannot be loaded: %w",
+			len(cfg.StackErrors), errors.Join(cfg.StackErrors...))
+		pn.repoFailed(ctx, HostRepoName, stageConfig, err)
+		errs = append(errs, err)
 	}
 	// POST /restart acts on exactly this set: the freshly loaded stacks are
 	// cached so the endpoint needs neither git nor a second configuration
@@ -708,8 +719,16 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		}
 	}
 
-	// 5. Prune stacks that disappeared from the configuration.
-	if cfg.Global.PruneRemovedStacks {
+	// 5. Prune stacks that disappeared from the configuration — but never in
+	// a pass whose configuration is incomplete: a stack whose definition
+	// could not be loaded is missing from cfg.Stacks exactly like a removed
+	// one, and tearing it down over a typo is the worst possible outcome.
+	switch {
+	case !cfg.Global.PruneRemovedStacks:
+	case len(cfg.StackErrors) > 0:
+		r.logger.Warn("prune suspended: the configuration is incomplete",
+			"broken_stack_definitions", len(cfg.StackErrors))
+	default:
 		errs = append(errs, r.prune(ctx, cfg, pn)...)
 	}
 
