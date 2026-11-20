@@ -372,6 +372,28 @@ Variablen und ist ebenfalls `0600` — Mode und Gruppe sind über
 `global.env_file` konfigurierbar (siehe
 [Wer darf host-seitig deployen](#wer-darf-host-seitig-deployen-phase-14)).
 
+### Sonderzeichen in Werten
+
+docker compose liest Env-Dateien mit eigener Syntax: in unquotierten Werten
+startet `$` eine Interpolation, ` #` einen Kommentar, Anführungszeichen
+werden entfernt. dockops trennt deshalb zwei Arten von Werten:
+
+- **Von Menschen für compose geschriebener Text** — `env_files`, entschlüsselte
+  `sops_files` und der feste Text der Vault-Templates — geht unverändert in die
+  generierten Dateien und bedeutet dort, was er in jeder compose-`.env`
+  bedeutet (`"…"`, `$$` für ein literales `$`, `${ANDERE}`, ` # Kommentar`).
+- **Werte, die dockops einsetzt** — Vault-Werte aus `vault_paths`, die
+  aufgelösten `${VAULT:…}`-Platzhalter in Templates, `STACK_DIR` usw. —
+  kommen **wörtlich** an: enthält ein Wert `$`, `#`, Quotes, Backslashes,
+  Zeilenumbrüche oder Randleerzeichen, schreibt dockops ihn gequotet und
+  escaped. Ein Vault-Passwort `pa$word` erreicht den Container also als
+  `pa$word` (früher als `pa`), ein mehrzeiliger Schlüssel bleibt ein Wert.
+  Steht ein Platzhalter unquotiert in einem Template, wird die ganze Zeile
+  in Anführungszeichen gesetzt (ein ` # Kommentar` am Zeilenende fällt dabei
+  weg, wie compose ihn ohnehin entfernt hätte).
+
+Hooks bekommen dieselben Werte als Prozessumgebung, ohne dotenv-Escaping.
+
 ## SOPS decryption
 
 dockops kennt zwei Modi, `sops_files` zu entschlüsseln:

@@ -818,7 +818,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 
 	sysEnv := env.SystemVars{GitCommit: commitFor(stack.Dir, commits)}
 	resolver := &stackResolver{stack: stack, decrypt: r.sops, vault: vaultClient}
-	merged, err := env.MergeStackEnv(ctx, stack, resolver, stack.Dir, sysEnv)
+	merged, err := env.Merge(ctx, stack, resolver, stack.Dir, sysEnv)
 	if err != nil {
 		err = fmt.Errorf("stack %s: resolve environment: %w", stack.Name, err)
 		pn.deployFailed(ctx, stack.Name, stageSecrets, newHash, err)
@@ -826,7 +826,9 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		return err
 	}
 
-	envFile, cleanup, err := env.WriteShm(merged)
+	// The env files carry the dotenv text (Vault values escaped so compose
+	// reads them verbatim), the hooks the plain values.
+	envFile, cleanup, err := env.WriteShm(merged.Dotenv)
 	if err != nil {
 		// The generated environment is part of the secret pipeline; a
 		// failure here aborts the deployment just like a resolution error.
@@ -837,7 +839,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	}
 	defer cleanup()
 
-	hookEnv := envList(merged)
+	hookEnv := envList(merged.Values)
 	if err := r.hooks.Run(ctx, stack.Hooks.PreDeploy, stack.Dir, hookEnv, hookTimeout); err != nil {
 		err = fmt.Errorf("stack %s: pre_deploy: %w", stack.Name, err)
 		pn.deployFailed(ctx, stack.Name, stagePreDeploy, newHash, err)
@@ -854,7 +856,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	// remove or revert it, and the next deployment regenerates it. It is
 	// deliberately not part of the stack hash: a changed secret value must
 	// not trigger a redeployment (Komodo reality; see env.WriteStackEnv).
-	stackEnvPath, rollbackStackEnv, err := env.WriteStackEnv(stack.Dir, merged, envFileOpts)
+	stackEnvPath, rollbackStackEnv, err := env.WriteStackEnv(stack.Dir, merged.Dotenv, envFileOpts)
 	if err != nil {
 		err = fmt.Errorf("stack %s: write stack env file: %w", stack.Name, err)
 		pn.deployFailed(ctx, stack.Name, stageSecrets, newHash, err)
