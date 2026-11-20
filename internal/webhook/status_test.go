@@ -440,3 +440,19 @@ func TestStatusNonPortableBinds(t *testing.T) {
 		t.Errorf("clean.non_portable_binds = %v, want the key omitted without findings", clean["non_portable_binds"])
 	}
 }
+
+// The status document is often readable without a token; a repository URL
+// with an access token must not hand that token out.
+func TestStatusMasksRepoURLCredentials(t *testing.T) {
+	h := statusFixture(t, nil, &fakeCompose{}, func(d *Deps) {
+		d.RepoURL = "https://deploy:ghp_topsecret@github.com/homelab/host.git"
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+	if strings.Contains(rec.Body.String(), "ghp_topsecret") {
+		t.Fatalf("status leaks the repository token:\n%s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "https://deploy:***@github.com/homelab/host.git") {
+		t.Errorf("status lacks the masked repository URL:\n%s", rec.Body.String())
+	}
+}

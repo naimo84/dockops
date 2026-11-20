@@ -34,9 +34,49 @@ func New(logger *slog.Logger) *Engine {
 	return &Engine{logger: logger}
 }
 
+// PassthroughEnv names the environment variable that lists (comma-separated)
+// further variables of the agent's environment a hook inherits, on top of
+// the allowlist (see baseEnv).
+const PassthroughEnv = "DOCKOPS_HOOK_PASSTHROUGH"
+
+// inheritedEnv are the variables of the agent's own environment every hook
+// inherits: what a shell and the docker CLI need, nothing that could be a
+// credential. Variables starting with "LC_" are inherited as well.
+var inheritedEnv = map[string]bool{
+	"PATH": true, "HOME": true, "USER": true, "LOGNAME": true, "SHELL": true,
+	"HOSTNAME": true, "TZ": true, "LANG": true, "LANGUAGE": true, "TMPDIR": true,
+	"DOCKER_HOST": true, "DOCKER_CONFIG": true, "DOCKER_CONTEXT": true,
+	"DOCKER_TLS_VERIFY": true, "DOCKER_CERT_PATH": true, "DOCKER_API_VERSION": true,
+}
+
+// baseEnv returns the part of the agent's environment a hook inherits. Hooks
+// come from the repositories — imported remotes included — so they must not
+// see the agent's own credentials: the Vault token or AppRole secret, the
+// webhook, status and logs tokens, and the registry and notification secrets
+// the root configuration references as ${VAR} under names of its choosing.
+// An allowlist is the only safe shape for that; PassthroughEnv opens it for
+// named variables an operator wants hooks to see.
+func baseEnv(environ []string, passthrough string) []string {
+	extra := make(map[string]bool)
+	for _, name := range strings.Split(passthrough, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			extra[name] = true
+		}
+	}
+	out := make([]string, 0, len(inheritedEnv))
+	for _, kv := range environ {
+		name, _, _ := strings.Cut(kv, "=")
+		if inheritedEnv[name] || extra[name] || strings.HasPrefix(name, "LC_") {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
 // Run executes commands sequentially, each as `sh -c <command>` in dir with
-// env (KEY=VALUE entries) appended to the process environment. timeout is
-// per command; a non-positive value falls back to defaultTimeout.
+// env (KEY=VALUE entries) appended to the allowlisted part of the agent's
+// environment (see baseEnv). timeout is per command; a non-positive value
+// falls back to defaultTimeout.
 //
 // stdout and stderr of every command are relayed to the logger at Info
 // level, line by line, with the command as an attribute. A command failing
@@ -64,7 +104,7 @@ func (e *Engine) runOne(ctx context.Context, command, dir string, env []string, 
 
 	cmd := exec.CommandContext(cmdCtx, "sh", "-c", command)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = append(baseEnv(os.Environ(), os.Getenv(PassthroughEnv)), env...)
 	// Each hook runs in its own process group, and a timeout kills the
 	// whole group: `sh -c` forks, so killing only sh would leave
 	// grandchildren running while they keep the output pipes open — Wait

@@ -16,9 +16,11 @@ import (
 // bring them back" that needs no repository change — no pull, no up, no hash
 // and no state update, exactly one `docker compose restart` per selected
 // stack (see reconciler.Reconciler.Restart and compose.Executor.Restart).
-// Authentication is the webhook's (GitHub HMAC, Gitea HMAC or GitLab token,
-// see authorized), and the body is optional: without one every configured
-// stack is restarted.
+// Authentication is the restart token (Authorization: Bearer, see
+// Deps.RestartToken); while it is unset the webhook's authentication (GitHub
+// HMAC, Gitea HMAC or GitLab token, see authorized) stands in, and with
+// neither configured the endpoint is disabled. The body is optional: without
+// one every configured stack is restarted.
 //
 // RestartFunc restarts stacks of the host configuration and reports the
 // outcome: the names restarted (request order for an explicit selection,
@@ -34,6 +36,9 @@ import (
 // last reconcile pass — the /restart endpoint therefore knows no deployment
 // details of its own.
 type RestartFunc func(ctx context.Context, stacks []string) (restarted []string, failed map[string]string, unknown []string, err error)
+
+// restartDisabledBody is answered by POST /restart without any credential.
+const restartDisabledBody = "restart endpoint disabled: set DOCKOPS_RESTART_TOKEN"
 
 // restartRequest is the optional POST /restart body. A missing body, an empty
 // object and an empty "stacks" array all mean "every configured stack".
@@ -72,11 +77,23 @@ func (h *Handler) handleRestart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cannot read request body", http.StatusBadRequest)
 		return
 	}
-	// Same authentication as /webhook, over the same raw bytes: a restart
-	// reuses the sender's existing HMAC/token setup unchanged.
-	if !h.authorized(r, body) {
-		h.logAuthenticationFailure(r)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	switch {
+	case h.restartToken != "":
+		if !tokenMatches(r.Header.Get("Authorization"), h.restartToken) {
+			h.logger.Warn("restart rejected: authentication failed", "remote", r.RemoteAddr)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	case h.secret != "":
+		// Fallback while no restart token is configured: the webhook's
+		// authentication over the same raw bytes.
+		if !h.authorized(r, body) {
+			h.logAuthenticationFailure(r)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	default:
+		http.Error(w, restartDisabledBody, http.StatusServiceUnavailable)
 		return
 	}
 	req, err := parseRestartRequest(body)

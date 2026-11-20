@@ -235,6 +235,11 @@ type Deps struct {
 	// has no effect while Sops is injected.
 	SopsSidecarURL string
 
+	// SopsSidecarToken authenticates the decrypt requests to the sidecar
+	// (env DOCKOPS_SOPS_SIDECAR_TOKEN, matching SOPS_SIDECAR_TOKEN of the
+	// sidecar). Empty sends no credential.
+	SopsSidecarToken string
+
 	// NewVault, nil → vault.New. Called at most once per pass, and only
 	// when a stack actually has vault paths or vault templates.
 	NewVault VaultFactory
@@ -447,7 +452,7 @@ func New(deps Deps) *Reconciler {
 			// Sidecar mode: decrypt via the HTTP service instead of the
 			// local sops binary (fleet reality: the sops credentials live in
 			// the sidecar container, not in the dockops image).
-			sopsFn = sops.NewSidecar(deps.SopsSidecarURL, nil).DecryptFileKeyfile
+			sopsFn = sops.NewSidecar(deps.SopsSidecarURL, nil).WithToken(deps.SopsSidecarToken).DecryptFileKeyfile
 		} else {
 			sopsFn = sops.DecryptFileKeyfile
 		}

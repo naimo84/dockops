@@ -101,10 +101,12 @@ func TestWebhookProviderSignatures(t *testing.T) {
 			want:    http.StatusUnauthorized,
 		},
 		{
+			// No secret, no endpoint: an unauthenticated trigger is never
+			// served.
 			name:    "no secret configured",
 			secret:  "",
 			headers: nil,
-			want:    http.StatusOK,
+			want:    http.StatusServiceUnavailable,
 		},
 	}
 	for _, tc := range tests {
