@@ -1331,8 +1331,8 @@ anderen Modi.
 
 - `POST /webhook` — authentifiziert via GitHub
   (`X-Hub-Signature-256: sha256=<hex>` HMAC-SHA256 über den Body), Gitea
-  (`X-Gitea-Signature` — derselbe HMAC-SHA256 über den Body, nur unter
-  anderem Header-Namen) **oder** GitLab (`X-Gitlab-Token`); alle Vergleiche
+  (`X-Gitea-Signature` — derselbe HMAC-SHA256 über den Body, als reiner
+  Hex-Wert ohne `sha256=`) **oder** GitLab (`X-Gitlab-Token`); alle Vergleiche
   in konstanter Zeit. Ohne `DOCKOPS_WEBHOOK_SECRET` antwortet der Endpunkt
   mit **503** statt jeden Aufrufer durchzulassen. Die Signaturen haben keinen
   Zeitstempel: ein mitgeschnittener Request lässt sich wiederholen (beim

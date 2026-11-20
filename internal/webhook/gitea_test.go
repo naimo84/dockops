@@ -5,28 +5,27 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
-	"strings"
 	"testing"
 )
 
-// giteaSig computes the X-Gitea-Signature header value for body under secret:
-// Gitea signs the raw body with the same HMAC-SHA256 scheme as GitHub, only
-// under a different header name.
+// giteaSig computes the X-Gitea-Signature header value for body under secret
+// exactly like Gitea does (services/webhook/deliver.go): the bare hex
+// HMAC-SHA256 of the raw body, without the "sha256=" prefix GitHub uses.
 func giteaSig(secret string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
-	return signaturePrefix + hex.EncodeToString(mac.Sum(nil))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // TestWebhookProviderSignatures is the authentication matrix of POST /webhook:
-// a valid Gitea signature is accepted, a wrong digest, a missing header and
-// any foreign algorithm prefix are rejected, and the GitHub and GitLab paths
+// a valid Gitea signature is accepted in the bare-hex form Gitea sends (and
+// with a "sha256=" prefix), a wrong digest, a missing header and any foreign
+// algorithm prefix are rejected, and the GitHub and GitLab paths
 // keep working exactly as before.
 func TestWebhookProviderSignatures(t *testing.T) {
 	const secret = "s3cr3t"
 	body := []byte(`{"ref":"refs/heads/main","repository":{"name":"host"}}`)
-	valid := giteaSig(secret, body)
-	digest := strings.TrimPrefix(valid, signaturePrefix)
+	digest := giteaSig(secret, body)
 
 	tests := []struct {
 		name    string
@@ -35,10 +34,28 @@ func TestWebhookProviderSignatures(t *testing.T) {
 		want    int
 	}{
 		{
-			name:    "gitea valid signature",
+			// The form Gitea actually sends, and the only header that
+			// counts here: X-Hub-Signature-256 is deliberately absent.
+			name:    "gitea valid signature (bare hex)",
 			secret:  secret,
-			headers: map[string]string{giteaSignatureHeader: valid},
+			headers: map[string]string{giteaSignatureHeader: digest},
 			want:    http.StatusOK,
+		},
+		{
+			name:    "gitea signature with sha256= prefix",
+			secret:  secret,
+			headers: map[string]string{giteaSignatureHeader: signaturePrefix + digest},
+			want:    http.StatusOK,
+		},
+		{
+			// A real Gitea delivery carries both headers.
+			name:   "gitea delivery with both headers",
+			secret: secret,
+			headers: map[string]string{
+				giteaSignatureHeader:  digest,
+				githubSignatureHeader: signaturePrefix + digest,
+			},
+			want: http.StatusOK,
 		},
 		{
 			name:    "gitea wrong secret",
@@ -59,12 +76,6 @@ func TestWebhookProviderSignatures(t *testing.T) {
 			want:    http.StatusUnauthorized,
 		},
 		{
-			name:    "gitea prefix missing",
-			secret:  secret,
-			headers: map[string]string{giteaSignatureHeader: digest},
-			want:    http.StatusUnauthorized,
-		},
-		{
 			name:    "gitea foreign algorithm prefix",
 			secret:  secret,
 			headers: map[string]string{giteaSignatureHeader: "sha1=" + digest},
@@ -73,7 +84,7 @@ func TestWebhookProviderSignatures(t *testing.T) {
 		{
 			name:    "gitea digest not hex",
 			secret:  secret,
-			headers: map[string]string{giteaSignatureHeader: signaturePrefix + "not-hex"},
+			headers: map[string]string{giteaSignatureHeader: "not-hex"},
 			want:    http.StatusUnauthorized,
 		},
 		{

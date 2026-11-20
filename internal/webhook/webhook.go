@@ -44,12 +44,12 @@ const maxBody = 1 << 20 // 1 MiB
 const (
 	// githubSignatureHeader carries the GitHub HMAC as "sha256=<hex>".
 	githubSignatureHeader = "X-Hub-Signature-256"
-	// giteaSignatureHeader carries the Gitea HMAC as "sha256=<hex>".
-	// Gitea schickt denselben HMAC wie GitHub, nur unter anderem
-	// Header-Namen — derselbe Verifier (matchHMAC) deckt beide ab.
+	// giteaSignatureHeader carries the Gitea HMAC as bare hex, without the
+	// "sha256=" prefix (Gitea's services/webhook/deliver.go). Gitea also
+	// sends X-Hub-Signature-256 in GitHub form; both headers are checked.
 	giteaSignatureHeader = "X-Gitea-Signature"
-	// signaturePrefix separates the algorithm from the hex digest; GitHub
-	// and Gitea use the identical scheme.
+	// signaturePrefix separates the algorithm from the hex digest in
+	// X-Hub-Signature-256; X-Gitea-Signature accepts it optionally.
 	signaturePrefix = "sha256="
 	// gitlabTokenHeader carries the GitLab shared secret in plain text.
 	gitlabTokenHeader = "X-Gitlab-Token"
@@ -295,11 +295,8 @@ func (h *Handler) authorized(r *http.Request, body []byte) bool {
 	if h.secret == "" {
 		return false
 	}
-	// GitHub und Gitea nutzen dasselbe HMAC-Verfahren unter unterschiedlichen
-	// Header-Namen; ein Verifier deckt beide ab. GitLab bleibt der
-	// Klartext-Token-Vergleich.
-	return h.matchHMAC(r, body, githubSignatureHeader) ||
-		h.matchHMAC(r, body, giteaSignatureHeader) ||
+	return h.matchHMAC(body, r.Header.Get(githubSignatureHeader), true) ||
+		h.matchHMAC(body, r.Header.Get(giteaSignatureHeader), false) ||
 		h.matchGitLab(r)
 }
 
@@ -314,17 +311,21 @@ func (h *Handler) logAuthenticationFailure(r *http.Request) {
 		"gitlab_header", r.Header.Get(gitlabTokenHeader) != "")
 }
 
-// matchHMAC verifies an HMAC signature header (GitHub's
-// X-Hub-Signature-256 and Gitea's X-Gitea-Signature are the same scheme):
-// the header value after the "sha256=" prefix must be the hex-encoded
-// HMAC-SHA256 of the body under the secret. hmac.Equal compares in constant
-// time; wrong-length digests fail without leaking which bytes differ.
-func (h *Handler) matchHMAC(r *http.Request, body []byte, headerName string) bool {
-	header := r.Header.Get(headerName)
-	if !strings.HasPrefix(header, signaturePrefix) {
+// matchHMAC verifies an HMAC signature header value: the hex-encoded
+// HMAC-SHA256 of the body under the secret. requirePrefix demands the
+// "sha256=" prefix (GitHub's X-Hub-Signature-256); without it the prefix is
+// optional (Gitea's X-Gitea-Signature is bare hex). Any other algorithm
+// prefix fails the hex decode. hmac.Equal compares in constant time;
+// wrong-length digests fail without leaking which bytes differ.
+func (h *Handler) matchHMAC(body []byte, header string, requirePrefix bool) bool {
+	if header == "" {
 		return false
 	}
-	got, err := hex.DecodeString(strings.TrimPrefix(header, signaturePrefix))
+	digest, hasPrefix := strings.CutPrefix(header, signaturePrefix)
+	if requirePrefix && !hasPrefix {
+		return false
+	}
+	got, err := hex.DecodeString(digest)
 	if err != nil {
 		return false
 	}
