@@ -737,14 +737,14 @@ func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconcil
 
 	// First pass immediately: deploy the current state on startup; it also
 	// loads the config and thereby the poll interval.
-	runPass := func() {
+	runPass := func(passCtx context.Context) {
 		passes.start(time.Now())
 		defer passes.finish()
-		if err := rec.Reconcile(ctx); err != nil {
+		if err := rec.Reconcile(passCtx); err != nil {
 			logger.Error("reconcile pass failed", "error", err)
 		}
 	}
-	runPass()
+	runPass(ctx)
 
 	interval := intervals.effective(opts)
 	ticker := time.NewTicker(interval)
@@ -768,9 +768,12 @@ func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconcil
 			}
 			return nil
 		case <-triggers:
+			// An explicit trigger means "try now": failed stacks skip
+			// their retry back-off in this pass.
+			runPass(reconciler.RetryNow(ctx))
 		case <-ticker.C:
+			runPass(ctx)
 		}
-		runPass()
 		// Re-arm when a config reload changed the poll interval and no
 		// -interval override pins it.
 		if next := intervals.effective(opts); next != interval {

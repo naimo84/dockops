@@ -283,10 +283,18 @@ gemergte Umgebung des Stacks (inkl. Secrets) sowie `STACK_NAME`,
    **Shared-Remotes** nach `<work_dir>/<remote>` bzw. dem konfigurierten
    `remotes.<remote>.checkout` clone-odern/updaten.
 3. **Komplette Config laden**: lokale Stacks via Include-Globs entdecken,
-   Imports laden und mergen, Validierung (u. a. doppelne Stack-Namen).
+   Imports laden und mergen, Validierung (u. a. doppelne Stack-Namen). Eine
+   einzelne kaputte Stack-Definition (Tippfehler, fehlender Import-Checkout)
+   nimmt nur sich selbst heraus: sie wird gemeldet (`repo_failed`, Stage
+   `config`), alle anderen Stacks deployen weiter — und **Prune ist in
+   diesem Durchlauf ausgesetzt**, weil ein kaputter Stack sonst wie ein
+   entfernter aussähe.
 4. **Pro aktivem Stack deployen**, wenn sich sein deterministischer Hash
    (Stack-Definition + normalisierte Compose-Datei) gegen den State geändert
-   hat oder der letzte Versuch fehlschlug:
+   hat oder der letzte Versuch fehlschlug. Scheitert ein Stack mit
+   unveränderter Konfiguration wiederholt, folgt nach dem sofortigen ersten
+   Retry ein Backoff (1, 2, 4 … bis 30 Minuten); eine Konfigurationsänderung
+   oder ein per Webhook ausgelöster Durchlauf versucht es sofort:
    1. Hash berechnen und gegen State vergleichen — unverändert und
       deployed ⇒ überspringen.
    2. Vault-Client bauen und einmal pro Durchlauf einloggen (nur wenn
@@ -879,8 +887,10 @@ in einem Pass, in dem die Prüfung für den Stack fällig war:
    gescheitert, `apply` degradiert für ihn zu `notify`, bis der Tag auf einen
    anderen Digest wandert.
 2. **Pull**: `docker compose -p <stack> -f … pull <services…>`, nur die
-   betroffenen Services. Ein Pull-Fehler blockiert den Digest und meldet
-   `update_failed` mit Stage `pull` — es wird nichts recreated.
+   betroffenen Services. Ein Pull-Fehler meldet `update_failed` mit Stage
+   `pull`, es wird nichts recreated — der Digest wird dabei **nicht**
+   blockiert (ein Pull scheitert meist an Registry oder Netz, nicht am Image);
+   der nächste fällige Check versucht es erneut.
 3. **Recreate**: `up -d --no-deps <services…>` (derselbe Pfad wie `Up`,
    inklusive `--remove-orphans`), damit Nachbarn nicht mitgerissen werden.
    Der bisherige Digest wird vorher als `previous_digest` festgehalten.
@@ -1251,7 +1261,11 @@ anderen Modi.
   wird nichts neu gestartet), eine falsche Methode mit **405**, fehlende
   Authentifizierung mit **401**.
 
-- `GET /healthz` — Liveness.
+- `GET /healthz` — Liveness: `200 ok`, solange der Reconcile-Loop arbeitet;
+  **503** mit Grund, wenn ein Durchlauf länger als max(3× Poll-Intervall, 1 h)
+  läuft. Jeder externe Aufruf hat eine Frist (git 10 min, docker ändernd
+  30 min / lesend 2 min, Vault 30 s, sops 2 min, Hooks 5 min), ein hängender
+  Durchlauf ist also ein echtes Symptom.
 
 - `GET /status` — Soll-vs-Ist-Snapshot für Monitoring (Drift-Matrix,
   Container, unmanaged Projekte, optional Bearer-Token); Details siehe

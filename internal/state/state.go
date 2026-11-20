@@ -51,6 +51,11 @@ type State struct {
 	Hash string `json:"hash"`
 	// Status is one of the Status constants.
 	Status string `json:"status"`
+	// Failures counts the consecutive failed attempts with this Hash (0 when
+	// the last attempt deployed). It drives the retry back-off of a stack
+	// that keeps failing with the same configuration. Additive and
+	// omitempty; fileVersion stays 1.
+	Failures int `json:"failures,omitempty"`
 	// UpdatedAt is the UTC time of the last state change.
 	UpdatedAt time.Time `json:"updated_at"`
 	// StackDir is the directory the stack definition lived in at deploy

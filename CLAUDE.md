@@ -426,6 +426,15 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
   Fehler → ein POST, Prune-Fehler → `prune_failed`, Repo-Fehler →
   `repo_failed`, kein Notifier-Bau ohne Block, `notifications active` einmal
   pro Pass
+- `internal/reconciler/isolation_test.go`/`backoff_test.go` — Robustheit:
+  `config.LoadLenient` isoliert kaputte Stack-Definitionen
+  (`Config.StackErrors`, Prune in dem Pass ausgesetzt; `config.Load` bleibt
+  strikt); fehlgeschlagene Stacks mit gleichem Hash werden mit Backoff
+  wiederholt (`State.Failures`, `retryDelay`: sofort, dann 1 min verdoppelnd
+  bis 30 min; `RetryNow(ctx)` für Webhook-Pässe); Pull-Fehler blockieren den
+  Digest nicht. Alle externen Aufrufe haben Fristen (compose `command` mit
+  Prozessgruppen-Kill, git `runGit`, Vault 30 s, sops 2 min); `/healthz`
+  meldet 503 bei hängendem Durchlauf (`webhook.Deps.Liveness`)
 - `internal/reconciler/phase6c_test.go` — Phase-6c-Regressionstests: die
   drei Prune-Fälle (a/b/c), Skip-über-Prune-Pass (identischer Hash deployt
   nicht neu) und der unterbrochene Pass (State-Dir wird mid-Pass read-only,

@@ -102,10 +102,12 @@ func (r *Reconciler) applyUpdates(ctx context.Context, stack config.Stack, pn *p
 	if err := r.compose.Pull(ctx, req, services); err != nil {
 		r.logger.Error("image update apply: pull failed", "stack", stack.Name, "services", services, "error", err)
 		text := fmt.Sprintf("%s: %s pull failed: %v", strings.Join(candidateServices(cands), ", "), candidateRefs(cands), err)
+		// A failed pull says nothing about the image (a registry hiccup, a
+		// full disk): the digest stays unblocked, and the next due check —
+		// one per update_check_interval — tries again.
 		for _, c := range cands {
 			rec := recs[c.ref]
 			rec.ApplyError = fmt.Sprintf("pull: %v", err)
-			rec.ApplyBlockedDigest = rec.RemoteDigest
 			recs[c.ref] = rec
 		}
 		pn.updateFailed(ctx, stack.Name, st.Hash, stagePull, text)

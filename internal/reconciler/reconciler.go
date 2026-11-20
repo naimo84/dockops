@@ -819,6 +819,17 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		r.logger.Debug("stack unchanged, skipping", "stack", stack.Name, "hash", newHash)
 		return nil
 	}
+	// A stack that keeps failing with the same configuration is retried
+	// with a growing pause instead of on every poll (hooks, compose up and
+	// notifications included). A changed configuration has a new hash and
+	// is tried at once.
+	if st, ok := r.state.Get(stack.Name); ok && st.Status == state.StatusFailed && st.Hash == newHash && !retryNow(ctx) {
+		if remaining := retryDelay(st.Failures) - time.Since(st.UpdatedAt); remaining > 0 {
+			r.logger.Info("stack failed with this configuration before; backing off",
+				"stack", stack.Name, "failures", st.Failures, "retry_in", remaining.Round(time.Second))
+			return nil
+		}
+	}
 	r.logger.Info("deploying stack", "stack", stack.Name, "hash", newHash)
 
 	// Secrets: the Vault client is built and logged in lazily, at most once
@@ -976,9 +987,14 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 // the per-stack save in deployStack). The bookkeeping itself must never mask
 // the original failure, so Set and Save errors are only logged.
 func (r *Reconciler) markFailed(stack config.Stack, newHash string) {
+	failures := 1
+	if prev, ok := r.state.Get(stack.Name); ok && prev.Status == state.StatusFailed && prev.Hash == newHash {
+		failures = prev.Failures + 1
+	}
 	if err := r.state.Set(stack.Name, state.State{
 		Hash:         newHash,
 		Status:       state.StatusFailed,
+		Failures:     failures,
 		StackDir:     stack.Dir,
 		ComposeFile:  stack.ComposeFile,
 		ComposeFiles: stack.ComposeFiles,
@@ -990,6 +1006,42 @@ func (r *Reconciler) markFailed(stack config.Stack, newHash string) {
 	if err := r.state.Save(); err != nil {
 		r.logger.Error("cannot persist failed state", "stack", stack.Name, "error", err)
 	}
+}
+
+// maxRetryDelay caps the back-off of a failing stack. Some fixes do not
+// change the stack hash — a secret added in Vault, an image pushed again —
+// and must still land without an operator: half an hour at most.
+const maxRetryDelay = 30 * time.Minute
+
+// retryDelay is the pause before the next attempt of a stack whose last
+// failures attempts with the same configuration failed: the first retry runs
+// on the next pass (a transient failure heals quickly), then the pause
+// doubles from one minute up to maxRetryDelay.
+func retryDelay(failures int) time.Duration {
+	if failures <= 1 {
+		return 0
+	}
+	if failures-2 >= 6 {
+		return maxRetryDelay
+	}
+	return min(time.Minute<<(failures-2), maxRetryDelay)
+}
+
+// retryNowKey marks a pass whose failed stacks skip their back-off.
+type retryNowKey struct{}
+
+// RetryNow returns a context for a pass that retries failed stacks
+// immediately, back-off or not. The CLI uses it for passes a webhook
+// triggered: an explicit request means "try now" — after fixing a secret in
+// Vault, say, which no hash change announces.
+func RetryNow(ctx context.Context) context.Context {
+	return context.WithValue(ctx, retryNowKey{}, true)
+}
+
+// retryNow reports whether ctx carries RetryNow.
+func retryNow(ctx context.Context) bool {
+	v, _ := ctx.Value(retryNowKey{}).(bool)
+	return v
 }
 
 // prune tears down every state entry whose stack no longer exists in the
