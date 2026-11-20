@@ -19,7 +19,9 @@ jobs:
           go-version: "1.25"
       - run: go build ./...
       - run: go vet ./...
-      - run: go test ./... -count=1
+      # -race: the state store, the status endpoint and the reconcile loop
+      # share data across goroutines; the suite is race-clean.
+      - run: go test -race ./... -count=1
 
   docker:
     needs: test
