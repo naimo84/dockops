@@ -369,6 +369,11 @@ type Reconciler struct {
 	// would invite per-stack configuration without a need.
 	healthPoll time.Duration
 
+	// healthStable is how long the health gate wants the services green
+	// before it passes (defaultHealthStable; tests shrink it). Unexported
+	// like healthPoll.
+	healthStable time.Duration
+
 	// Phase-12 self update: the self project, whether the detached helper
 	// path is enabled, and the docker run injection point. runHelper is
 	// unexported and defaults to the plain docker CLI in New; the tests
@@ -516,6 +521,7 @@ func New(deps Deps) *Reconciler {
 		injectedReg:   deps.Registry != nil,
 		newRegistry:   newRegistry,
 		healthPoll:    defaultHealthPoll,
+		healthStable:  defaultHealthStable,
 		selfProject:   deps.SelfProject,
 		selfUpdate:    deps.SelfUpdate,
 		selfContainer: selfContainer,

@@ -23,6 +23,12 @@ const (
 	// services with. The reconciler field healthPoll carries it; tests
 	// shrink it to a millisecond.
 	defaultHealthPoll = 3 * time.Second
+	// defaultHealthStable is how long the affected services must stay
+	// green before the gate passes. Without a healthcheck "running" at one
+	// poll proves little: a broken image often starts, runs for a moment and
+	// then crash-loops. The reconciler field healthStable carries it; tests
+	// set it to zero or a few milliseconds.
+	defaultHealthStable = 10 * time.Second
 	// rollbackFilePattern is the name of the generated compose override in
 	// the stack directory. It is written right before the rollback up and
 	// removed again by a defer, so it never outlives the attempt; the name
@@ -269,14 +275,26 @@ func (r *Reconciler) waitHealthy(ctx context.Context, project string, services [
 	if poll <= 0 {
 		poll = defaultHealthPoll
 	}
+	// The stability window never eats more than half of the gate's time.
+	stable := min(r.healthStable, timeout/2)
 	deadline := time.Now().Add(timeout)
+	var greenSince time.Time
 	for {
 		ready, hard, soft := r.gateStatus(ctx, project, services)
-		if ready {
-			return nil
-		}
 		if hard != nil {
 			return hard
+		}
+		if ready {
+			if greenSince.IsZero() {
+				greenSince = time.Now()
+			}
+			up := time.Since(greenSince)
+			if up >= stable {
+				return nil
+			}
+			soft = fmt.Errorf("services green for %s, waiting for %s", up.Round(time.Millisecond), stable)
+		} else {
+			greenSince = time.Time{}
 		}
 		if !time.Now().Before(deadline) {
 			if soft != nil {

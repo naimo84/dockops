@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/local/dockops/internal/compose"
 	"github.com/local/dockops/internal/state"
 )
 
@@ -151,5 +152,34 @@ func TestFailedDeployRecordsTheReason(t *testing.T) {
 	}
 	if st, _ := f.state.Get("web"); st.LastError != "" || st.Status != state.StatusDeployed {
 		t.Errorf("state after the fix = %+v, want deployed without an error", st)
+	}
+}
+
+// Without a healthcheck "running" at the first poll is no proof: a broken
+// image often runs for a moment and then crash-loops. The gate only passes
+// once the services stayed up for the stability window.
+func TestHealthGateWaitsForStability(t *testing.T) {
+	f, resolver, rec := applyFixture(t, applyStackYAML)
+	forward := true
+	f.compose.onUpOverride = func(call int) { forward = call == 1 }
+	f.compose.psFn = func(call int) []compose.Container {
+		if forward && call > 1 {
+			// Up at the first poll, crash-looping from the second on.
+			return []compose.Container{{Service: "app", Name: "web-app-1", State: "restarting"}}
+		}
+		return []compose.Container{{Service: "app", Name: "web-app-1", State: "running"}}
+	}
+	r := f.phase11Reconciler(f.compose, resolver, rec)
+	r.healthStable = 20 * time.Millisecond
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	got := applyRecord(t, f, applyImage)
+	if got.ApplyBlockedDigest != "sha256:new" || !strings.Contains(got.ApplyError, "restarting") {
+		t.Errorf("record = %+v, want the crash loop caught and the digest blocked", got)
+	}
+	if len(f.compose.upOverrides) != 2 {
+		t.Errorf("UpOverride calls = %d, want forward and rollback", len(f.compose.upOverrides))
 	}
 }

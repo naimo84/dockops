@@ -896,8 +896,11 @@ in einem Pass, in dem die Prüfung für den Stack fällig war:
    Der bisherige Digest wird vorher als `previous_digest` festgehalten.
 4. **Health-Gate**: Polling alle 3s bis `health_timeout`; gesund ist ein
    Service, dessen Container `running` ist und `healthy` meldet (ohne
-   Healthcheck genügt `running`). Sofortiges Scheitern bei `unhealthy`,
-   `exited`, `dead`, `restarting`, fehlendem Container oder Timeout.
+   Healthcheck genügt `running`) — und zwar **durchgehend 10 s lang**
+   (Stabilitätsfenster, höchstens die Hälfte von `health_timeout`): ein
+   kaputtes Image läuft oft kurz an und crasht dann. Sofortiges Scheitern bei
+   `unhealthy`, `exited`, `dead`, `restarting`, fehlendem Container oder
+   Timeout.
 5. **Rollback** bei jedem Fehlschlag: eine temporäre Override-Datei
    (`dockops-rollback-<stack>.yaml`) pinnt die betroffenen Services auf
    `image: <repository>@<previous_digest>` und wird **nach** den
