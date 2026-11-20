@@ -254,7 +254,13 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
   RWMutex-gesichert, /status liest aus HTTP-Goroutines parallel zum Poll-Loop
 - `internal/dotenv/` — Minimaler dotenv-Dialekt (Parse/Format), geteilt von
   SOPS-Output, env_files, Vault-Templates und der erzeugten
-  `--env-file`/Stack-`.env`
+  `--env-file`/Stack-`.env`; `Format` schreibt Wert-Text wörtlich,
+  `Literal`/`EscapeQuoted` erzeugen Text, den compose als exakt den Wert liest
+  (Quoting nur bei Bedarf). `env.Merge` liefert `Values` (Hooks) und `Dotenv`
+  (Env-Dateien): Nutzertext (env_files, sops, Template-Text) bleibt
+  compose-Syntax, eingesetzte Vault-Werte/Systemvariablen werden escaped
+  (Templates kontextabhängig: `"…"`, `'…'`, unquotiert; Round-Trip-Test gegen
+  echtes `docker compose config` in `internal/env/compose_roundtrip_test.go`)
 - `internal/secrets/` — `Resolver`-Interface (abstrahiert SOPS-Dateien und
   Vault-Pfade für den Env-Merge) und `VaultReader` (ReadKV-Teilmenge für
   `env.RenderVaultTemplate`)

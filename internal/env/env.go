@@ -48,12 +48,38 @@ type SystemVars struct {
 	GitCommit string
 }
 
-// MergeStackEnv assembles the environment of stack: all env_files are
-// parsed, all sops files decrypted, all Vault paths read and all vault
-// templates rendered via secrets, then the system variables are set. baseDir
-// is the directory relative env_files, sops and vault template paths resolve
-// against (typically stack.Dir, passed separately so callers and tests
-// control it).
+// Merged is a stack environment in the two forms dockops needs.
+type Merged struct {
+	// Values maps every variable to its value as the process environment of
+	// the hooks sees it (what MergeStackEnv returns).
+	Values map[string]string
+
+	// Dotenv maps every variable to the dotenv text the generated env files
+	// carry (the --env-file in /dev/shm and <stackDir>/.env), written
+	// verbatim by dotenv.Format. Text a user wrote for compose — env_files
+	// and sops dotenv lines, the literal text of vault templates — is kept
+	// as written, so compose interprets it exactly as before. Values dockops
+	// inserts itself — Vault secrets, the system variables — are escaped so
+	// compose reads them verbatim (dotenv.Literal): a secret "pa$word" must
+	// not reach the container as "pa".
+	Dotenv map[string]string
+}
+
+// MergeStackEnv assembles the environment of stack and returns its values;
+// see Merge, which also returns the dotenv text the env files need.
+func MergeStackEnv(ctx context.Context, stack config.Stack, secrets secrets.Resolver, baseDir string, sys SystemVars) (map[string]string, error) {
+	m, err := Merge(ctx, stack, secrets, baseDir, sys)
+	if err != nil {
+		return nil, err
+	}
+	return m.Values, nil
+}
+
+// Merge assembles the environment of stack: all env_files are parsed, all
+// sops files decrypted, all Vault paths read and all vault templates rendered
+// via secrets, then the system variables are set. baseDir is the directory
+// relative env_files, sops and vault template paths resolve against
+// (typically stack.Dir, passed separately so callers and tests control it).
 //
 // Merge priority, low to high: env_files < sops_files < vault_paths and
 // vault_env_templates < system variables — and within each group, later
@@ -67,8 +93,13 @@ type SystemVars struct {
 // order; nothing here re-derives the base/import origin. The system
 // variables are set last and therefore cannot be overridden by any secret
 // source — a stack cannot lie about its own identity.
-func MergeStackEnv(ctx context.Context, stack config.Stack, secrets secrets.Resolver, baseDir string, sys SystemVars) (map[string]string, error) {
-	env := make(map[string]string)
+func Merge(ctx context.Context, stack config.Stack, secrets secrets.Resolver, baseDir string, sys SystemVars) (Merged, error) {
+	m := Merged{Values: make(map[string]string), Dotenv: make(map[string]string)}
+	// set records one variable: value for the hooks, text for the env files.
+	set := func(k, value, text string) {
+		m.Values[k] = value
+		m.Dotenv[k] = text
+	}
 
 	// The stack directory's own .env is dockops output: WriteStackEnv
 	// regenerates it from exactly these inputs before every compose call.
@@ -86,13 +117,15 @@ func MergeStackEnv(ctx context.Context, stack config.Stack, secrets secrets.Reso
 		}
 		raw, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("stack %s: env_files[%d] %s: %w", stack.Name, i, path, err)
+			return Merged{}, fmt.Errorf("stack %s: env_files[%d] %s: %w", stack.Name, i, path, err)
 		}
 		for k, v := range dotenv.Parse(raw) {
-			env[k] = v
+			set(k, v, v)
 		}
 	}
 
+	// sops dotenv files are dotenv text the user wrote (and encrypted), so
+	// they keep their compose meaning like env_files.
 	for i, f := range stack.SopsFiles {
 		resolved := f
 		if f.Path != "" && !filepath.IsAbs(f.Path) {
@@ -100,20 +133,20 @@ func MergeStackEnv(ctx context.Context, stack config.Stack, secrets secrets.Reso
 		}
 		kv, err := secrets.ResolveSops(ctx, resolved)
 		if err != nil {
-			return nil, fmt.Errorf("stack %s: sops_files[%d] %s: %w", stack.Name, i, resolved.Path, err)
+			return Merged{}, fmt.Errorf("stack %s: sops_files[%d] %s: %w", stack.Name, i, resolved.Path, err)
 		}
 		for k, v := range kv {
-			env[k] = v
+			set(k, v, v)
 		}
 	}
 
 	for i, p := range stack.VaultPaths {
 		kv, err := secrets.ResolveVault(ctx, p)
 		if err != nil {
-			return nil, fmt.Errorf("stack %s: vault_paths[%d] %s: %w", stack.Name, i, p, err)
+			return Merged{}, fmt.Errorf("stack %s: vault_paths[%d] %s: %w", stack.Name, i, p, err)
 		}
 		for k, v := range kv {
-			env[k] = v
+			set(k, v, dotenv.Literal(v))
 		}
 	}
 
@@ -131,14 +164,14 @@ func MergeStackEnv(ctx context.Context, stack config.Stack, secrets secrets.Reso
 		}
 		raw, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("stack %s: vault_env_templates[%d] %s: %w", stack.Name, i, path, err)
+			return Merged{}, fmt.Errorf("stack %s: vault_env_templates[%d] %s: %w", stack.Name, i, path, err)
 		}
-		kv, err := RenderVaultTemplate(ctx, string(raw), resolverVaultReader{resolver: secrets})
+		values, text, err := renderTemplate(ctx, string(raw), resolverVaultReader{resolver: secrets})
 		if err != nil {
-			return nil, fmt.Errorf("stack %s: vault_env_templates[%d] %s: %w", stack.Name, i, path, err)
+			return Merged{}, fmt.Errorf("stack %s: vault_env_templates[%d] %s: %w", stack.Name, i, path, err)
 		}
-		for k, v := range kv {
-			env[k] = v
+		for k, v := range values {
+			set(k, v, text[k])
 		}
 	}
 
@@ -149,15 +182,16 @@ func MergeStackEnv(ctx context.Context, stack config.Stack, secrets secrets.Reso
 	if dir == "" {
 		dir = stack.Dir
 	}
-	env["STACK_NAME"] = name
-	env["STACK_DIR"] = dir
-	env["GIT_COMMIT"] = sys.GitCommit
-	return env, nil
+	set("STACK_NAME", name, dotenv.Literal(name))
+	set("STACK_DIR", dir, dotenv.Literal(dir))
+	set("GIT_COMMIT", sys.GitCommit, dotenv.Literal(sys.GitCommit))
+	return m, nil
 }
 
 // WriteShm writes env in dotenv format to a fresh file
 // dockops-<random>-<contenthash>.env with 0600 permissions and returns its
-// path plus a cleanup function.
+// path plus a cleanup function. The values are dotenv text and written
+// verbatim (see Merged.Dotenv and dotenv.Literal).
 //
 // The parent directory is /dev/shm (tmpfs — secrets never reach the disk);
 // when it does not exist, the temp directory (TMPDIR) is used instead and a
@@ -314,7 +348,8 @@ func resolveGroup(group string) (int, error) {
 	return gid, nil
 }
 
-// WriteStackEnv writes env in dotenv format to <stackDir>/.env — atomically
+// WriteStackEnv writes env in dotenv format to <stackDir>/.env — values are
+// dotenv text, written verbatim (see Merged.Dotenv) — atomically
 // (a temporary file in the same directory, renamed over the target) and with
 // the permissions of opts (0600 when opts is the zero value, since the
 // merged environment carries secrets). opts allows a wider mode and a
