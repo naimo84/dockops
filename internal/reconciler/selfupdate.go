@@ -617,6 +617,10 @@ func (r *Reconciler) removeResult(path string) {
 // executor's binary stays its own business; docker run is not compose, and
 // "docker" is the same default compose.New uses.
 func runDockerHelper(ctx context.Context, args []string) error {
+	// docker run -d returns once the container started; a daemon that does
+	// not answer must not hold the pass.
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
 	if err != nil {
 		text := strings.TrimSpace(string(out))

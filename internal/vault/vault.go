@@ -16,9 +16,13 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/local/dockops/internal/config"
 )
+
+// requestTimeout bounds one Vault HTTP request, connection to body.
+const requestTimeout = 30 * time.Second
 
 // Smart defaults mirroring the config loader, so a Client built from a
 // hand-written config.Vault behaves identically to one whose values went
@@ -73,8 +77,10 @@ func New(cfg config.Vault, logger *slog.Logger) (*Client, error) {
 		tokenEnv:    defaultString(cfg.TokenFromEnv, defaultTokenEnv),
 		roleIDEnv:   defaultString(cfg.RoleIDFromEnv, defaultRoleIDEnv),
 		secretIDEnv: defaultString(cfg.SecretIDFromEnv, defaultSecretIDEnv),
-		httpClient:  &http.Client{},
-		logger:      logger,
+		// A Vault that stops answering must not stop the reconcile loop:
+		// every request (login, KV read) is bounded.
+		httpClient: &http.Client{Timeout: requestTimeout},
+		logger:     logger,
 	}, nil
 }
 

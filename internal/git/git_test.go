@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestMain isolates all git invocations from the user's global and system
@@ -426,5 +427,27 @@ func TestHeadCommitOutsideWorkDir(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("HeadCommit() = %q, want %q", got, want)
+	}
+}
+
+// A git command that never returns would stop the reconcile loop; every
+// command has a deadline, and the deadline ends git's children too.
+func TestRunGitHasADeadline(t *testing.T) {
+	binDir := t.TempDir()
+	script := "#!/bin/sh\nsleep 30\n"
+	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	m, _ := newManager(t)
+	m.timeout = 100 * time.Millisecond
+
+	start := time.Now()
+	_, err := m.HeadCommit(t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "timed out after 100ms") {
+		t.Errorf("HeadCommit() error = %v, want a timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("hung git took %s, want the deadline to end it promptly", elapsed)
 	}
 }

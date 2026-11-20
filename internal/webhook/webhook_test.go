@@ -5,10 +5,12 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -207,5 +209,21 @@ func TestWebhookBodyTooLarge(t *testing.T) {
 	})
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("oversized body status = %d, want 413", rec.Code)
+	}
+}
+
+// /healthz reflects the reconcile loop when a liveness check is wired: a
+// stuck loop must be visible to a watchdog while the HTTP server answers.
+func TestHealthzReportsLiveness(t *testing.T) {
+	stuck := error(nil)
+	h := New(Deps{Logger: quietLogger(), Liveness: func() error { return stuck }})
+
+	if rec := do(h, http.MethodGet, "/healthz", nil, nil); rec.Code != http.StatusOK {
+		t.Errorf("healthy /healthz = %d, want 200", rec.Code)
+	}
+	stuck = errors.New("reconcile pass running for 2h0m0s (limit 1h0m0s)")
+	rec := do(h, http.MethodGet, "/healthz", nil, nil)
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "running for 2h") {
+		t.Errorf("stuck /healthz = %d %q, want 503 with the reason", rec.Code, rec.Body.String())
 	}
 }

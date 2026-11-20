@@ -403,13 +403,22 @@ func selfImage(getenv func(string) string, logger *slog.Logger) string {
 	}
 	// helperDockerBinary is the same "docker" the helper's own commands use
 	// (selfupdate.go); one string, one CLI.
-	out, err := exec.Command(helperDockerBinary, "inspect", "--format", "{{.Config.Image}}", host).Output()
+	out, err := inspectSelf(host, "{{.Config.Image}}")
 	if err != nil {
 		logger.Warn("self image: docker does not know the agent's image; self-stack deploys stay in-process",
 			"container", host, "error", err, "hint", "set "+envSelfImage)
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// inspectSelf runs `docker inspect --format <format> <container>` with a
+// deadline: the lookups happen at startup, and a daemon that does not answer
+// must not keep the agent from starting.
+func inspectSelf(container, format string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, helperDockerBinary, "inspect", "--format", format, container).Output()
 }
 
 // selfMounts returns the agent's own mount points, so the self-update helper
@@ -433,7 +442,7 @@ func selfMounts(getenv func(string) string, logger *slog.Logger) []selfupdate.Mo
 		logger.Warn("self mounts: cannot determine the agent's container", "error", err, "hint", "set "+envSelfMounts)
 		return nil
 	}
-	out, err := exec.Command(helperDockerBinary, "inspect", "--format", "{{json .Mounts}}", host).Output()
+	out, err := inspectSelf(host, "{{json .Mounts}}")
 	if err != nil {
 		logger.Warn("self mounts: docker does not know the agent's mounts; the helper will not see bind mounts",
 			"container", host, "error", err, "hint", "set "+envSelfMounts)
@@ -483,7 +492,7 @@ func selfUser(getenv func(string) string, logger *slog.Logger) string {
 		logger.Warn("self user: cannot determine the agent's container", "error", err, "hint", "set "+envSelfUser)
 		return ""
 	}
-	out, err := exec.Command(helperDockerBinary, "inspect", "--format", "{{.Config.User}}", host).Output()
+	out, err := inspectSelf(host, "{{.Config.User}}")
 	if err != nil {
 		logger.Warn("self user: docker does not know the agent's user; the helper runs as the image default",
 			"container", host, "error", err, "hint", "set "+envSelfUser)
@@ -519,7 +528,7 @@ func selfGroups(getenv func(string) string, logger *slog.Logger) []string {
 		logger.Warn("self groups: cannot determine the agent's container", "error", err, "hint", "set "+envSelfGroups)
 		return nil
 	}
-	out, err := exec.Command(helperDockerBinary, "inspect", "--format", "{{json .HostConfig.GroupAdd}}", host).Output()
+	out, err := inspectSelf(host, "{{json .HostConfig.GroupAdd}}")
 	if err != nil {
 		logger.Warn("self groups: docker does not know the agent's groups; the helper may not reach the docker socket",
 			"container", host, "error", err, "hint", "set "+envSelfGroups)
@@ -616,6 +625,49 @@ func writeStatus(ctx context.Context, deps webhook.StatusDeps, w io.Writer) erro
 	return nil
 }
 
+// passTracker records whether a reconcile pass is running and since when,
+// for the liveness answer of GET /healthz. The loop writes it, HTTP
+// goroutines read it.
+type passTracker struct {
+	mu      sync.Mutex
+	running bool
+	since   time.Time
+}
+
+// start marks a pass as running.
+func (p *passTracker) start(now time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.running, p.since = true, now
+}
+
+// finish marks the running pass as done.
+func (p *passTracker) finish() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.running = false
+}
+
+// stuck returns an error when a pass has been running for longer than limit.
+// Between passes the loop waits for its ticker, which is healthy by
+// definition: with every git, docker, Vault and hook call under a deadline,
+// a pass that does not end is the one way the loop can hang.
+func (p *passTracker) stuck(now time.Time, limit time.Duration) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.running && now.Sub(p.since) > limit {
+		return fmt.Errorf("reconcile pass running for %s (limit %s)", now.Sub(p.since).Round(time.Second), limit)
+	}
+	return nil
+}
+
+// passLimit is how long a pass may run before /healthz reports the loop as
+// stuck: three poll intervals, but at least an hour (a pass that pulls large
+// images for several stacks legitimately takes a while).
+func passLimit(interval time.Duration) time.Duration {
+	return max(3*interval, time.Hour)
+}
+
 // serve runs the daemon: the webhook server plus the poll loop, until the
 // context is cancelled. Webhook triggers are debounced and merged — the
 // loop is single-goroutine, a running pass is never interrupted, and any
@@ -633,6 +685,7 @@ func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconcil
 		logger.Info("log API disabled: no token configured", "hint", "set "+envLogsToken)
 	}
 
+	passes := &passTracker{}
 	triggers := make(chan struct{}, 1)
 	notify := func() {
 		select {
@@ -646,6 +699,9 @@ func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconcil
 		Handler: webhook.New(webhook.Deps{
 			Secret:  opts.WebhookSecret,
 			Trigger: notify,
+			Liveness: func() error {
+				return passes.stuck(time.Now(), passLimit(intervals.effective(opts)))
+			},
 			// POST /restart acts on the stacks of the last reconcile pass;
 			// the reconciler owns config, stack dirs, compose files and the
 			// generated .env (see Reconciler.Restart).
@@ -682,6 +738,8 @@ func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconcil
 	// First pass immediately: deploy the current state on startup; it also
 	// loads the config and thereby the poll interval.
 	runPass := func() {
+		passes.start(time.Now())
+		defer passes.finish()
 		if err := rec.Reconcile(ctx); err != nil {
 			logger.Error("reconcile pass failed", "error", err)
 		}

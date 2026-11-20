@@ -76,6 +76,12 @@ type Deps struct {
 	// that (the CLI does).
 	Secret string
 
+	// Liveness reports whether the reconcile loop makes progress; a non-nil
+	// error turns GET /healthz into 503 with the error text, so a watchdog
+	// notices an agent whose loop hangs while its HTTP server still answers.
+	// Nil keeps /healthz a pure process liveness probe.
+	Liveness func() error
+
 	// Trigger fires a reconcile pass. It is called synchronously after
 	// successful webhook authentication and must not block (the CLI passes
 	// a non-blocking channel send that merges concurrent requests into one
@@ -137,8 +143,9 @@ type Deps struct {
 // Handler serves POST /webhook, POST /restart, GET /healthz and GET /status.
 // It is a plain http.Handler, so it composes with any router or middleware.
 type Handler struct {
-	secret  string
-	trigger func()
+	secret   string
+	liveness func() error
+	trigger  func()
 	// restart serves POST /restart (Deps.Restart); nil → 503.
 	restart RestartFunc
 	logger  *slog.Logger
@@ -163,10 +170,11 @@ func New(deps Deps) *Handler {
 		logger = slog.Default()
 	}
 	return &Handler{
-		secret:  deps.Secret,
-		trigger: deps.Trigger,
-		restart: deps.Restart,
-		logger:  logger,
+		secret:   deps.Secret,
+		liveness: deps.Liveness,
+		trigger:  deps.Trigger,
+		restart:  deps.Restart,
+		logger:   logger,
 		status: StatusDeps{
 			State:       deps.State,
 			Compose:     deps.Compose,
@@ -192,6 +200,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Allow", http.MethodGet)
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
+		}
+		if h.liveness != nil {
+			if err := h.liveness(); err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
