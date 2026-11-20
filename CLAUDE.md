@@ -232,7 +232,11 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
   die lokal installierte git-Binary (`os/exec`, keine Git-Library); im
   Update-Pfad sichert `stashWIP` dirty Worktrees (inkl. untracked) vor
   `reset --hard`/`clean -fd` als `dockops-wip:`-Stash (Fehler nur WARN,
-  kein Abbruch, kein Auto-Pop)
+  kein Abbruch, kein Auto-Pop); generierte Artefakte (`.env`,
+  `.env.dockops-*`, `dockops-binds-*.yaml`, `dockops-rollback-*.yaml`) stehen
+  per `ensureExcludes` in `.git/info/exclude` und sind per Pathspec nie Teil
+  des Stashs (die `.env` trägt Secrets und muss Updates überleben); getrackte
+  generierte Dateien → WARN (`generated_test.go`)
 - `internal/git/phase7_test.go` — Phase-7-Regressionstests: WIP-Auto-Stash
   (dirty tracked File im Stash + Reset + INFO-Log, untracked File per
   `stash pop` verifiziert, clean Worktree ohne Stash-Eintrag, Stash-Failure

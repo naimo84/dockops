@@ -202,9 +202,11 @@ services:
 profiles:
   - full
 
-# Klartext-Env-Dateien (relative Pfade: Stack-Verzeichnis)
+# Klartext-Env-Dateien (relative Pfade: Stack-Verzeichnis). Nicht `.env`:
+# die schreibt dockops selbst (gemergte Umgebung), als Quelle wird sie
+# ignoriert.
 env_files:
-  - .env
+  - config.env
 
 # SOPS-verschlüsselte dotenv-Dateien; age_keyfile optional und relativ
 # zum Stack-Verzeichnis (wird als SOPS_AGE_KEY_FILE an den sops-Prozess
@@ -341,11 +343,31 @@ Wiederherstellen der Änderungen:
     git stash list   # Einträge "dockops-wip: <Timestamp>" suchen
     git stash pop    # oder drop, wenn die Änderungen verworfen werden sollen
 
-Hinweis: Die von dockops generierten `<stackDir>/.env`-Dateien sind untracked
-und landen daher ebenfalls im Stash, bevor sie der Reset entfernt. Das ist
-harmlos — die `.env` wird vor jedem Deploy neu geschrieben —, bedeutet aber,
-dass pro dirty Durchlauf ein Stash-Eintrag entsteht. Nicht benötigte Einträge
-lassen sich per `git stash drop` / `git stash clear` aufräumen.
+### Generierte Dateien bleiben außen vor
+
+Was dockops selbst in Stack-Verzeichnisse schreibt — die generierte
+`<stackDir>/.env` (gemergte Umgebung **inklusive aufgelöster Secrets**), ihre
+Temp-Dateien `.env.dockops-*` sowie die Overrides `dockops-binds-*.yaml` und
+`dockops-rollback-*.yaml` — ist Deploy-Artefakt, kein Repo-Inhalt:
+
+- dockops trägt diese Muster in das checkout-lokale `.git/info/exclude` ein
+  (einmalig, nichts wird committet). Untracked Artefakte sind damit für
+  `status`, Stash und `clean -fd` unsichtbar: die `.env` überlebt jedes
+  Update und steht späteren compose-Aufrufen (Image-Apply, `/restart`,
+  Update-Check) weiter zur Verfügung.
+- Generierte Dateien landen **nie** im WIP-Stash, auch nicht neben echten
+  Host-Edits (Pathspec-Ausschluss) — Secrets gehören nicht in den
+  Objektspeicher des Repos.
+- Committet ein Repo selbst eine `.env` in einem Stack-Verzeichnis, wird sie
+  von jedem Deploy überschrieben und beim nächsten Update auf den
+  committeten Stand zurückgesetzt. dockops warnt dann mit Pfad: die Datei
+  gehört aus dem Repo entfernt (als `env_files`-Quelle wird sie ohnehin
+  ignoriert — Klartext-Werte gehören in eine anders benannte Datei, z.B.
+  `config.env`).
+
+Ältere dockops-Versionen haben die generierte `.env` bei jedem Update
+gestasht. Solche Einträge (`dockops-wip: …`) enthalten Secrets und sollten
+geprüft und per `git stash drop` bzw. `git stash clear` entfernt werden.
 
 ## Secret-Auflösung & Priorität
 
