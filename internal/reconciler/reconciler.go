@@ -1119,24 +1119,41 @@ func (r *Reconciler) pruneStack(ctx context.Context, name string, st state.State
 		if st.StackDir == "" || !allRegularFiles(st.ComposeFiles) {
 			return r.compose.DownProject(ctx, name)
 		}
-		envFile, cleanup, err := env.WriteShm(map[string]string{})
-		if err != nil {
-			return fmt.Errorf("write empty env file: %w", err)
-		}
-		defer cleanup()
-		ghost := config.Stack{Name: name, ComposeFiles: st.ComposeFiles}
-		return r.compose.Down(ctx, ghost, st.StackDir, envFile)
+		return r.downWithFiles(ctx, name, st, config.Stack{Name: name, ComposeFiles: st.ComposeFiles})
 	}
 	if st.ComposeFile != "" && st.StackDir != "" && regularFileExists(st.ComposeFile) {
-		envFile, cleanup, err := env.WriteShm(map[string]string{})
+		return r.downWithFiles(ctx, name, st, config.Stack{Name: name, ComposeFile: st.ComposeFile})
+	}
+	return r.compose.DownProject(ctx, name)
+}
+
+// downWithFiles tears a removed stack down with its compose files. compose
+// interpolates for down as well, so the environment matters: the stack's
+// generated .env when it is still there (the variables resolve as they did
+// for up), an empty file otherwise. If the full down still fails — a
+// ${VAR:?} nothing fills, a file that no longer parses — the project name
+// takes over, exactly as for a vanished directory; retrying the same failing
+// command on every pass would never get the stack down.
+func (r *Reconciler) downWithFiles(ctx context.Context, name string, st state.State, ghost config.Stack) error {
+	envFile := filepath.Join(st.StackDir, ".env")
+	if !regularFileExists(envFile) {
+		empty, cleanup, err := env.WriteShm(map[string]string{})
 		if err != nil {
 			return fmt.Errorf("write empty env file: %w", err)
 		}
 		defer cleanup()
-		ghost := config.Stack{Name: name, ComposeFile: st.ComposeFile}
-		return r.compose.Down(ctx, ghost, st.StackDir, envFile)
+		envFile = empty
 	}
-	return r.compose.DownProject(ctx, name)
+	downErr := r.compose.Down(ctx, ghost, st.StackDir, envFile)
+	if downErr == nil {
+		return nil
+	}
+	r.logger.Warn("prune: down with the compose files failed; tearing down by project name",
+		"stack", name, "error", downErr)
+	if err := r.compose.DownProject(ctx, name); err != nil {
+		return errors.Join(downErr, err)
+	}
+	return nil
 }
 
 // allRegularFiles reports whether every path exists and is a regular file.
