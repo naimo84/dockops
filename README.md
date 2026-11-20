@@ -202,9 +202,11 @@ services:
 profiles:
   - full
 
-# Klartext-Env-Dateien (relative Pfade: Stack-Verzeichnis)
+# Klartext-Env-Dateien (relative Pfade: Stack-Verzeichnis). Nicht `.env`:
+# die schreibt dockops selbst (gemergte Umgebung), als Quelle wird sie
+# ignoriert.
 env_files:
-  - .env
+  - config.env
 
 # SOPS-verschlüsselte dotenv-Dateien; age_keyfile optional und relativ
 # zum Stack-Verzeichnis (wird als SOPS_AGE_KEY_FILE an den sops-Prozess
@@ -266,7 +268,14 @@ Listenreihenfolge.
 Hooks laufen als `sh -c` im Stack-Verzeichnis, sequenziell mit
 Per-Kommando-Timeout (Default 5 Minuten), und erhalten die komplette
 gemergte Umgebung des Stacks (inkl. Secrets) sowie `STACK_NAME`,
-`STACK_DIR` und `GIT_COMMIT`.
+`STACK_DIR` und `GIT_COMMIT`. Aus der Umgebung des **Agenten** erben sie nur
+eine Allowlist (`PATH`, `HOME`, `USER`, `SHELL`, `TZ`, `LANG`/`LC_*`,
+`TMPDIR`, `HOSTNAME` und die `DOCKER_*`-Variablen des CLI) — nie Vault-Token,
+Webhook-/Status-/Logs-Token oder die per `${VAR}` referenzierten Registry-
+und Notification-Secrets, denn Hooks stammen aus den Repos (auch aus
+importierten Remotes). Weitere Variablen gibt
+`DOCKOPS_HOOK_PASSTHROUGH=NAME1,NAME2` explizit frei. Die Ausgabe der Hooks
+landet ungefiltert im Log: Hooks dürfen Secrets nicht ausgeben.
 
 ## Ablauf eines Reconcile-Durchlaufs
 
@@ -283,10 +292,20 @@ gemergte Umgebung des Stacks (inkl. Secrets) sowie `STACK_NAME`,
    **Shared-Remotes** nach `<work_dir>/<remote>` bzw. dem konfigurierten
    `remotes.<remote>.checkout` clone-odern/updaten.
 3. **Komplette Config laden**: lokale Stacks via Include-Globs entdecken,
-   Imports laden und mergen, Validierung (u. a. doppelne Stack-Namen).
+   Imports laden und mergen, Validierung (u. a. doppelne Stack-Namen). Eine
+   einzelne kaputte Stack-Definition (Tippfehler, fehlender Import-Checkout)
+   nimmt nur sich selbst heraus: sie wird gemeldet (`repo_failed`, Stage
+   `config`), alle anderen Stacks deployen weiter — und **Prune ist in
+   diesem Durchlauf ausgesetzt**, weil ein kaputter Stack sonst wie ein
+   entfernter aussähe.
 4. **Pro aktivem Stack deployen**, wenn sich sein deterministischer Hash
-   (Stack-Definition + normalisierte Compose-Datei) gegen den State geändert
-   hat oder der letzte Versuch fehlschlug:
+   (Stack-Definition + normalisierte Compose-Datei + Inhalte der
+   `env_files` und Vault-Templates — nicht die aufgelösten Secrets) gegen den
+   State geändert
+   hat oder der letzte Versuch fehlschlug. Scheitert ein Stack mit
+   unveränderter Konfiguration wiederholt, folgt nach dem sofortigen ersten
+   Retry ein Backoff (1, 2, 4 … bis 30 Minuten); eine Konfigurationsänderung
+   oder ein per Webhook ausgelöster Durchlauf versucht es sofort:
    1. Hash berechnen und gegen State vergleichen — unverändert und
       deployed ⇒ überspringen.
    2. Vault-Client bauen und einmal pro Durchlauf einloggen (nur wenn
@@ -341,11 +360,31 @@ Wiederherstellen der Änderungen:
     git stash list   # Einträge "dockops-wip: <Timestamp>" suchen
     git stash pop    # oder drop, wenn die Änderungen verworfen werden sollen
 
-Hinweis: Die von dockops generierten `<stackDir>/.env`-Dateien sind untracked
-und landen daher ebenfalls im Stash, bevor sie der Reset entfernt. Das ist
-harmlos — die `.env` wird vor jedem Deploy neu geschrieben —, bedeutet aber,
-dass pro dirty Durchlauf ein Stash-Eintrag entsteht. Nicht benötigte Einträge
-lassen sich per `git stash drop` / `git stash clear` aufräumen.
+### Generierte Dateien bleiben außen vor
+
+Was dockops selbst in Stack-Verzeichnisse schreibt — die generierte
+`<stackDir>/.env` (gemergte Umgebung **inklusive aufgelöster Secrets**), ihre
+Temp-Dateien `.env.dockops-*` sowie die Overrides `dockops-binds-*.yaml` und
+`dockops-rollback-*.yaml` — ist Deploy-Artefakt, kein Repo-Inhalt:
+
+- dockops trägt diese Muster in das checkout-lokale `.git/info/exclude` ein
+  (einmalig, nichts wird committet). Untracked Artefakte sind damit für
+  `status`, Stash und `clean -fd` unsichtbar: die `.env` überlebt jedes
+  Update und steht späteren compose-Aufrufen (Image-Apply, `/restart`,
+  Update-Check) weiter zur Verfügung.
+- Generierte Dateien landen **nie** im WIP-Stash, auch nicht neben echten
+  Host-Edits (Pathspec-Ausschluss) — Secrets gehören nicht in den
+  Objektspeicher des Repos.
+- Committet ein Repo selbst eine `.env` in einem Stack-Verzeichnis, wird sie
+  von jedem Deploy überschrieben und beim nächsten Update auf den
+  committeten Stand zurückgesetzt. dockops warnt dann mit Pfad: die Datei
+  gehört aus dem Repo entfernt (als `env_files`-Quelle wird sie ohnehin
+  ignoriert — Klartext-Werte gehören in eine anders benannte Datei, z.B.
+  `config.env`).
+
+Ältere dockops-Versionen haben die generierte `.env` bei jedem Update
+gestasht. Solche Einträge (`dockops-wip: …`) enthalten Secrets und sollten
+geprüft und per `git stash drop` bzw. `git stash clear` entfernt werden.
 
 ## Secret-Auflösung & Priorität
 
@@ -366,11 +405,35 @@ Imports gilt Basis vor Import):
 Das Ergebnis geht als `--env-file` an `docker compose` (Interpolation in
 der Compose-Datei) und als Umgebung an Hooks. Die Datei liegt in
 `/dev/shm` (Tmpfs) mit `0600`, wird nach dem Stack-Durchlauf mit Zufallsbytes
-überschrieben und gelöscht; Secrets erscheinen nie in Logs oder
-Fehlermeldungen. Die zusätzlich generierte `<stackDir>/.env` trägt dieselben
+überschrieben und gelöscht; dockops selbst schreibt keine Secrets in Logs
+oder Fehlermeldungen (die Ausgabe von Hooks ist deren Sache, siehe oben;
+Zugangsdaten in Repo-URLs maskiert dockops in Fehlern, Logs,
+Benachrichtigungen und `/status`). Die zusätzlich generierte `<stackDir>/.env` trägt dieselben
 Variablen und ist ebenfalls `0600` — Mode und Gruppe sind über
 `global.env_file` konfigurierbar (siehe
 [Wer darf host-seitig deployen](#wer-darf-host-seitig-deployen-phase-14)).
+
+### Sonderzeichen in Werten
+
+docker compose liest Env-Dateien mit eigener Syntax: in unquotierten Werten
+startet `$` eine Interpolation, ` #` einen Kommentar, Anführungszeichen
+werden entfernt. dockops trennt deshalb zwei Arten von Werten:
+
+- **Von Menschen für compose geschriebener Text** — `env_files`, entschlüsselte
+  `sops_files` und der feste Text der Vault-Templates — geht unverändert in die
+  generierten Dateien und bedeutet dort, was er in jeder compose-`.env`
+  bedeutet (`"…"`, `$$` für ein literales `$`, `${ANDERE}`, ` # Kommentar`).
+- **Werte, die dockops einsetzt** — Vault-Werte aus `vault_paths`, die
+  aufgelösten `${VAULT:…}`-Platzhalter in Templates, `STACK_DIR` usw. —
+  kommen **wörtlich** an: enthält ein Wert `$`, `#`, Quotes, Backslashes,
+  Zeilenumbrüche oder Randleerzeichen, schreibt dockops ihn gequotet und
+  escaped. Ein Vault-Passwort `pa$word` erreicht den Container also als
+  `pa$word` (früher als `pa`), ein mehrzeiliger Schlüssel bleibt ein Wert.
+  Steht ein Platzhalter unquotiert in einem Template, wird die ganze Zeile
+  in Anführungszeichen gesetzt (ein ` # Kommentar` am Zeilenende fällt dabei
+  weg, wie compose ihn ohnehin entfernt hätte).
+
+Hooks bekommen dieselben Werte als Prozessumgebung, ohne dotenv-Escaping.
 
 ## SOPS decryption
 
@@ -402,8 +465,12 @@ HTTP-Vertrag (`POST /decrypt`):
 
     GET /healthz → 200 {"status":"ok"}
 
-Sicherheit: keine Auth (Netz-Isolation — der Sidecar veröffentlicht keinen
-Port, nur dockops im gemeinsamen Netz erreicht ihn), dafür Client-seitig
+Sicherheit: Bearer-Token per `SOPS_SIDECAR_TOKEN` (Sidecar) und
+`DOCKOPS_SOPS_SIDECAR_TOKEN` (Agent, gleicher Wert) — ohne Token antwortet
+`POST /decrypt` mit 401. Ohne gesetztes Token bleibt der Endpunkt offen (WARN
+beim Start): dann entscheidet allein die Netz-Isolation, und **jeder** Container
+im selben Netz kann jede Datei unter den erlaubten Wurzeln entschlüsseln. Der
+Sidecar veröffentlicht keinen Port. Dazu Client-seitig
 ein 60-s-Request-Timeout und ein 10-MB-Response-Limit sowie Server-seitig
 die Pfad-Allow-List `SOPS_SIDECAR_ALLOWED_ROOTS` (doppelpunkt-separiert;
 `filepath.Clean` + Prefix-Check blockt `..`-Traversal, bevor `sops` je
@@ -416,6 +483,7 @@ Deployment im eigenen `compose.yaml` des Repos (siehe auch
 explizit aktiviert werden, inkl. der URL-Variable:
 
     DOCKOPS_SOPS_SIDECAR_URL=http://sops-sidecar:8081 \
+    SOPS_SIDECAR_TOKEN=$(openssl rand -hex 32) \
       docker compose --profile sops up -d
 
 (Build des Images: `docker compose --profile sops build`.)
@@ -746,9 +814,16 @@ update_policy: notify           # notify (default) | pinned | apply
    heraus.
 2. Services aus `ignore_services` (bzw. außerhalb von `services`) werden nicht
    geprüft — was nicht deployt wird, wird auch nicht beobachtet.
-3. Lokaler Digest je Image: `docker image inspect --format '{{json
-   .RepoDigests}}'`. Ohne RepoDigest ist das Image **lokal gebaut** → Record
-   mit `error: "locally built image"`, kein Update-Alarm.
+3. Aktueller Digest je Image: der Digest des Images, das die **Container**
+   des Service tatsächlich fahren (`docker ps` über das compose-Projektlabel,
+   `docker inspect .Image`, dann `docker image inspect --format '{{json
+   .RepoDigests}}'` auf diese Image-ID) — nicht, worauf der Tag gerade zeigt:
+   ein Pull ohne Recreate verschiebt den Tag, der Stack läuft aber weiter auf
+   dem alten Image. Nur ein Service ohne Container fällt auf den Tag zurück
+   (das, was ein Recreate starten würde). Ohne RepoDigest ist das Image
+   **lokal gebaut** → Record mit `error: "locally built image"`, kein
+   Update-Alarm. Teilen sich mehrere Services ein Image (z.B. `app` und
+   `worker`), gibt es **einen** Record mit allen Services (`services`).
 4. Remote-Digest über die Registry-API v2 (`HEAD …/manifests/<tag>`,
    Bearer-Challenge inkl. Token-Cache pro Host, 10s pro Request).
 5. Vergleich → `update_available` im State. Registry-Fehler (404, 401,
@@ -871,7 +946,7 @@ stimmt den Apply-Schritt ab, nicht das Deployment.
 **Ablauf**, am Ende von `checkImageUpdates` — nur für `apply`-Stacks und nur
 in einem Pass, in dem die Prüfung für den Stack fällig war:
 
-1. **Kandidaten**: Records mit `update_available` (lokaler Digest != remote).
+1. **Kandidaten**: Records mit `update_available` (laufender Digest != remote).
    Übersprungen werden lokal gebaute Images (kein `CurrentDigest` → keine
    Registry-Identität, kein Rollback-Ziel), Stacks, deren Deployment in genau
    diesem Pass fehlgeschlagen ist, und Records, deren `apply_blocked_digest`
@@ -879,20 +954,31 @@ in einem Pass, in dem die Prüfung für den Stack fällig war:
    gescheitert, `apply` degradiert für ihn zu `notify`, bis der Tag auf einen
    anderen Digest wandert.
 2. **Pull**: `docker compose -p <stack> -f … pull <services…>`, nur die
-   betroffenen Services. Ein Pull-Fehler blockiert den Digest und meldet
-   `update_failed` mit Stage `pull` — es wird nichts recreated.
+   betroffenen Services — bei einem geteilten Image alle Services, die es
+   fahren (sie werden gemeinsam aktualisiert und zurückgerollt). Ein
+   Pull-Fehler meldet `update_failed` mit Stage `pull`, es wird nichts
+   recreated — der Digest wird dabei **nicht** blockiert (ein Pull scheitert
+   meist an Registry oder Netz, nicht am Image); der nächste fällige Check
+   versucht es erneut.
 3. **Recreate**: `up -d --no-deps <services…>` (derselbe Pfad wie `Up`,
    inklusive `--remove-orphans`), damit Nachbarn nicht mitgerissen werden.
    Der bisherige Digest wird vorher als `previous_digest` festgehalten.
 4. **Health-Gate**: Polling alle 3s bis `health_timeout`; gesund ist ein
    Service, dessen Container `running` ist und `healthy` meldet (ohne
-   Healthcheck genügt `running`). Sofortiges Scheitern bei `unhealthy`,
-   `exited`, `dead`, `restarting`, fehlendem Container oder Timeout.
+   Healthcheck genügt `running`) — und zwar **durchgehend 10 s lang**
+   (Stabilitätsfenster, höchstens die Hälfte von `health_timeout`): ein
+   kaputtes Image läuft oft kurz an und crasht dann. Sofortiges Scheitern bei
+   `unhealthy`, `exited`, `dead`, `restarting`, fehlendem Container oder
+   Timeout.
 5. **Rollback** bei jedem Fehlschlag: eine temporäre Override-Datei
    (`dockops-rollback-<stack>.yaml`) pinnt die betroffenen Services auf
    `image: <repository>@<previous_digest>` und wird **nach** den
    Stack-Compose-Files übergeben (spätere Datei gewinnt), danach erneut
    `up --no-deps` + Health-Gate. Die Datei wird in jedem Fall wieder gelöscht.
+   Danach zeigt dockops den Tag per `docker tag <repository>@<previous_digest>
+   <image>` zurück auf den alten Digest: der Pull hatte ihn auf das gescheiterte
+   Image verschoben, und der nächste reguläre Deploy würde es sonst ohne
+   Health-Gate ausrollen.
    Ein fehlgeschlagener Rollback ist der Fall für einen Menschen: der Stack
    läuft dann weder auf dem alten noch verlässlich auf dem neuen Digest
    (`update_failed`, Stage `rollback`).
@@ -944,7 +1030,11 @@ Helper-Container** den Recreate.
    `pending_at`; `previous_digest` ist das Rollback-Ziel.
 2. Er startet `docker run -d --rm --name dockops-selfupdate-<projekt>-<unix>`
    mit `/var/run/docker.sock`, dem Stack-Verzeichnis und dem State-Dir — beide
-   am **identischen Host-Pfad** — sowie dem gerade gepullten Image.
+   am **identischen Host-Pfad** — und zwar mit dem Image, das der Agent
+   selbst fährt (Image-ID des eigenen Containers bzw. `DOCKOPS_SELF_IMAGE`),
+   **nicht** mit dem gerade gepullten: ein kaputter neuer Build darf nicht
+   derjenige sein, der sich selbst zurückrollen muss. Nur wenn das eigene
+   Image unbekannt ist, läuft der Helper mit dem Ziel-Image (WARN).
 3. Der Helper wartet `grace_seconds` (10s), fährt
    `compose -p … -f … --env-file … up -d --no-deps <services>`, pollt das
    Health-Gate (`docker inspect`, 180s Timeout, 3s Poll) und schreibt
@@ -955,9 +1045,14 @@ Helper-Container** den Recreate.
 4. Beim nächsten Start finalisiert der Agent: `ok` → `current_digest`,
    `applied_at`, `update_applied`; `rolled_back` → `apply_blocked_digest`,
    `apply_error`, `rolled_back_at`, `update_failed`; `rollback_failed` wie
-   `rolled_back`, zusätzlich mit `rollback FAILED` im Text. Fehlt das
-   Ergebnis, entscheidet der laufende Digest: gleich Ziel ⇒ als Erfolg
-   verbuchen (WARN), gleich Vorher-Digest ⇒ als Fehlschlag blockieren.
+   `rolled_back`, zusätzlich mit `rollback FAILED` im Text; nach einem
+   Rollback zeigt der Agent den Tag wieder auf `previous_digest`. Fehlt das
+   Ergebnis, wartet der Agent zunächst das Fenster des Helpers ab (Grace +
+   2× Health-Timeout + 120s ab `pending_at`) — vorher ist „kein Ergebnis“
+   kein Urteil. Danach entscheidet der Digest, den der **Container**
+   tatsächlich fährt (nie der Tag, der ja schon vor dem Hand-over gepullt
+   wurde): gleich Ziel ⇒ als Erfolg verbuchen (WARN), gleich Vorher-Digest ⇒
+   als Fehlschlag blockieren, sonst weiter pending.
 
 Solange `apply_pending_digest` gesetzt ist, startet kein Pass einen zweiten
 Helper, und `/status` meldet den Service mit `pending: true`
@@ -1168,6 +1263,19 @@ Regeln:
 Damit ist der alte Ratschlag „alle Bind-Quellen als absolute Host-Pfade
 schreiben“ eine Option, keine Voraussetzung mehr.
 
+## Fleet-Übersicht (`cmd/dockops-fleet`)
+
+`dockops-fleet` fragt `/status` aller konfigurierten Agenten ab
+(`FLEET_HOSTS="name=url,…"`, `FLEET_STATUS_TOKENS="name=token,…"` — ein Token
+pro Host) und zeigt das Ergebnis als Seite (`/`) und JSON (`/api/fleet`,
+`LISTEN`, Default `:9090`). Der Aggregator selbst hat **keine
+Authentifizierung**: wer ihn erreicht, sieht die Status-Dokumente aller Hosts
+— die Pro-Host-Tokens schützen dann nichts mehr. Er gehört deshalb
+ausschließlich hinter einen authentifizierenden Reverse Proxy (z. B.
+SSO/Forward-Auth) und darf keinen Port ungeschützt veröffentlichen. Die
+Host-URLs sollten `https://` sein, sonst gehen die Status-Tokens im Klartext
+über das Netz.
+
 ## CLI
 
     dockops [-repo URL] [-branch NAME] [-state PFAD] [-addr HOST:PORT]
@@ -1179,7 +1287,7 @@ schreiben“ eine Option, keine Voraussetzung mehr.
 | `-repo` | `DOCKOPS_REPO_URL` | — (Pflicht, außer bei `-print-status`) | URL des Host-Repos (HTTPS/SSH/lokal) |
 | `-branch` | `DOCKOPS_BRANCH` | `main` | Branch des Host-Repos |
 | `-state` | — | `/var/lib/dockops/state.json` | Pfad der JSON-State-Datei |
-| `-webhook-secret` | `DOCKOPS_WEBHOOK_SECRET` | leer | Shared Secret für `POST /webhook` und `POST /restart`; leer ⇒ beide Endpunkte ohne Auth (Warnung im Log) |
+| `-webhook-secret` | `DOCKOPS_WEBHOOK_SECRET` | leer | Shared Secret für `POST /webhook`; leer ⇒ Endpunkt **abgeschaltet** (503, Änderungen kommen nur über den Poll-Loop) |
 | `-addr` | — | `:8080` | Listen-Adresse des Webhook-Servers |
 | `-sops-sidecar` | `DOCKOPS_SOPS_SIDECAR_URL` | leer | URL des SOPS-Sidecar (z. B. `http://sops-sidecar:8081`); leer ⇒ lokales `sops -d` |
 | `-interval` | — | `global.poll_interval` (Default 5m) | Poll-Intervall-Override, z. B. `90s` |
@@ -1190,12 +1298,16 @@ Dazu die Vault-Variablen (Namen in `global.vault` konfigurierbar):
 `VAULT_ADDR` (Fallback für `global.vault.address`), `VAULT_TOKEN`
 (`auth_method: token`) bzw. `VAULT_ROLE_ID` + `VAULT_SECRET_ID`
 (`auth_method: approle`). Ohne eigenes Flag: `DOCKOPS_STATUS_TOKEN`
-(Bearer-Schutz für `GET /status`, leer = offen), `DOCKOPS_SELF_PROJECT`
+(Bearer-Schutz für `GET /status`, leer = offen), `DOCKOPS_RESTART_TOKEN`
+(Bearer-Token für `POST /restart`, siehe unten), `DOCKOPS_SOPS_SIDECAR_TOKEN`
+(Bearer-Token für den Sidecar, siehe „SOPS decryption“),
+`DOCKOPS_HOOK_PASSTHROUGH` (weitere Variablen, die Hooks erben, siehe
+„Lokale `stack.yaml`“), `DOCKOPS_SELF_PROJECT`
 (eigenes Compose-Projekt für die Unmanaged-Erkennung **und** die
 Self-Update-Erkennung, default `dockops`) und `DOCKOPS_SELF_UPDATE`
 (Default an; nur die exakte Angabe `off` deaktiviert beide Helper-Pfade, siehe
-„Self-Update“ und „Deploy-Handover“), `DOCKOPS_SELF_IMAGE` (Image, aus dem der
-Phase-13-Helper startet; leer ⇒ `docker inspect` auf den eigenen Container).
+„Self-Update“ und „Deploy-Handover“), `DOCKOPS_SELF_IMAGE` (Image, aus dem die
+Helper starten; leer ⇒ Image-ID des eigenen Containers per `docker inspect`).
 `DOCKOPS_HOST_CHECKOUT` füllt ein leeres `global.host_checkout` (YAML
 gewinnt; `-print-status` und `/status` folgen der Variable auch ohne
 Config, siehe „Konfigurierbare Checkout-Pfade“).
@@ -1219,26 +1331,34 @@ anderen Modi.
 
 - `POST /webhook` — authentifiziert via GitHub
   (`X-Hub-Signature-256: sha256=<hex>` HMAC-SHA256 über den Body), Gitea
-  (`X-Gitea-Signature` — derselbe HMAC-SHA256 über den Body, nur unter
-  anderem Header-Namen) **oder** GitLab (`X-Gitlab-Token`); alle Vergleiche
-  in konstanter Zeit:
+  (`X-Gitea-Signature` — derselbe HMAC-SHA256 über den Body, als reiner
+  Hex-Wert ohne `sha256=`) **oder** GitLab (`X-Gitlab-Token`); alle Vergleiche
+  in konstanter Zeit. Ohne `DOCKOPS_WEBHOOK_SECRET` antwortet der Endpunkt
+  mit **503** statt jeden Aufrufer durchzulassen. Die Signaturen haben keinen
+  Zeitstempel: ein mitgeschnittener Request lässt sich wiederholen (beim
+  Webhook harmlos, er stößt nur einen idempotenten Durchlauf an) — den Port
+  daher nur über TLS (Reverse Proxy) erreichbar machen:
 
       curl -X POST http://localhost:8080/webhook \
         -H "X-Gitlab-Token: $DOCKOPS_WEBHOOK_SECRET"
 
 - `POST /restart` — startet Stacks neu (`docker compose restart`), ohne zu
   deployen: kein `pull`, kein `up`, keine Änderung an Hash oder
-  `state.json`. Authentifizierung wie `/webhook`. Der Body ist optional;
-  ohne Body (oder mit leerem `stacks`-Array) werden **alle** Stacks der
-  Host-Konfiguration neu gestartet:
+  `state.json`. Authentifizierung per eigenem Bearer-Token
+  `DOCKOPS_RESTART_TOKEN` — das Webhook-Secret kennt auch der Git-Hoster, es
+  soll keine operativen Aktionen autorisieren. Solange kein Restart-Token
+  gesetzt ist, gilt übergangsweise die Webhook-Authentifizierung (WARN beim
+  Start); ohne beides ist der Endpunkt abgeschaltet (**503**). Der Body ist
+  optional; ohne Body (oder mit leerem `stacks`-Array) werden **alle** Stacks
+  der Host-Konfiguration neu gestartet:
 
       # alle Stacks
       curl -X POST http://localhost:8080/restart \
-        -H "X-Gitlab-Token: $DOCKOPS_WEBHOOK_SECRET"
+        -H "Authorization: Bearer $DOCKOPS_RESTART_TOKEN"
 
       # nur ausgewählte Stacks
       curl -X POST http://localhost:8080/restart \
-        -H "X-Gitlab-Token: $DOCKOPS_WEBHOOK_SECRET" \
+        -H "Authorization: Bearer $DOCKOPS_RESTART_TOKEN" \
         -H "Content-Type: application/json" \
         -d '{"stacks":["web","db"]}'
 
@@ -1251,7 +1371,11 @@ anderen Modi.
   wird nichts neu gestartet), eine falsche Methode mit **405**, fehlende
   Authentifizierung mit **401**.
 
-- `GET /healthz` — Liveness.
+- `GET /healthz` — Liveness: `200 ok`, solange der Reconcile-Loop arbeitet;
+  **503** mit Grund, wenn ein Durchlauf länger als max(3× Poll-Intervall, 1 h)
+  läuft. Jeder externe Aufruf hat eine Frist (git 10 min, docker ändernd
+  30 min / lesend 2 min, Vault 30 s, sops 2 min, Hooks 5 min), ein hängender
+  Durchlauf ist also ein echtes Symptom.
 
 - `GET /status` — Soll-vs-Ist-Snapshot für Monitoring (Drift-Matrix,
   Container, unmanaged Projekte, optional Bearer-Token); Details siehe

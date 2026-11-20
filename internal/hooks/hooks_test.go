@@ -158,3 +158,38 @@ func TestRunParentContextCancel(t *testing.T) {
 		t.Error("Run() with cancelled context succeeded, want error")
 	}
 }
+
+// Hooks come from the repositories — imported remotes included — and must not
+// inherit the agent's own credentials: the Vault token, the webhook, status
+// and logs tokens, registry and notification secrets referenced via ${VAR}.
+// They get the stack environment plus the few variables a shell needs.
+func TestRunDoesNotLeakTheAgentEnvironment(t *testing.T) {
+	t.Setenv("VAULT_TOKEN", "agent-vault-token")
+	t.Setenv("DOCKOPS_WEBHOOK_SECRET", "agent-webhook-secret")
+	t.Setenv("TELEGRAM_TOKEN", "agent-notify-secret")
+	t.Setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
+	t.Setenv("CUSTOM_FOR_HOOKS", "wanted")
+	t.Setenv("DOCKOPS_HOOK_PASSTHROUGH", "CUSTOM_FOR_HOOKS")
+	e := quietEngine()
+	dir := t.TempDir()
+
+	command := `env > env.txt`
+	if err := e.Run(context.Background(), []string{command}, dir, []string{"STACK_NAME=web", "DB_PASSWORD=stack-secret"}, time.Minute); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "env.txt"))
+	if err != nil {
+		t.Fatalf("read env.txt: %v", err)
+	}
+	got := string(raw)
+	for _, leaked := range []string{"agent-vault-token", "agent-webhook-secret", "agent-notify-secret"} {
+		if strings.Contains(got, leaked) {
+			t.Errorf("hook environment contains %q:\n%s", leaked, got)
+		}
+	}
+	for _, want := range []string{"STACK_NAME=web", "DB_PASSWORD=stack-secret", "PATH=", "DOCKER_HOST=unix:///var/run/docker.sock", "CUSTOM_FOR_HOOKS=wanted"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("hook environment lacks %q:\n%s", want, got)
+		}
+	}
+}

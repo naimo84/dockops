@@ -22,6 +22,7 @@ package sops
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -56,6 +57,16 @@ const sidecarMaxRequest = 64 << 10
 type SidecarResolver struct {
 	baseURL string // sidecar root, e.g. http://sops-sidecar:8081, no trailing slash
 	client  *http.Client
+	token   string // Bearer token of the decrypt endpoint; "" sends none
+}
+
+// WithToken returns a copy of the resolver that authenticates every decrypt
+// request with token (Authorization: Bearer), matching a sidecar started with
+// SOPS_SIDECAR_TOKEN. An empty token sends no header.
+func (s *SidecarResolver) WithToken(token string) *SidecarResolver {
+	c := *s
+	c.token = token
+	return &c
 }
 
 // NewSidecar returns a resolver for the sidecar at baseURL. A nil
@@ -102,6 +113,9 @@ func (s *SidecarResolver) DecryptFileKeyfile(ctx context.Context, path, ageKeyfi
 		return nil, fmt.Errorf("sops sidecar: build request for %s: %w", path, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if s.token != "" {
+		req.Header.Set("Authorization", "Bearer "+s.token)
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("sops sidecar: decrypt %s: %w", path, err)
@@ -176,8 +190,18 @@ type (
 // defines them (the read-only volume is the operator's boundary). A nil
 // logger falls back to slog.Default().
 func NewSidecarHandler(allowedRoots []string, logger *slog.Logger) http.Handler {
+	return NewSidecarHandlerWithToken(allowedRoots, "", logger)
+}
+
+// NewSidecarHandlerWithToken is NewSidecarHandler with authentication: when
+// token is non-empty, POST /decrypt requires "Authorization: Bearer <token>"
+// (compared in constant time) and answers 401 otherwise. Without it every
+// container that can reach the sidecar can decrypt every file below the
+// allowed roots. GET /healthz stays open.
+func NewSidecarHandlerWithToken(allowedRoots []string, token string, logger *slog.Logger) http.Handler {
 	h := &sidecarHandler{
 		roots:  cleanRoots(allowedRoots),
+		token:  token,
 		logger: logger,
 	}
 	if h.logger == nil {
@@ -193,6 +217,7 @@ func NewSidecarHandler(allowedRoots []string, logger *slog.Logger) http.Handler 
 // sidecarHandler serves the decrypt endpoint for one set of allowed roots.
 type sidecarHandler struct {
 	roots  []string
+	token  string // required Bearer token of POST /decrypt; "" = open
 	logger *slog.Logger
 }
 
@@ -210,6 +235,12 @@ func (h *sidecarHandler) handleDecrypt(w http.ResponseWriter, r *http.Request) {
 // decrypt performs the work of one request and returns the status code and
 // requested path for logging.
 func (h *sidecarHandler) decrypt(w http.ResponseWriter, r *http.Request) (int, string) {
+	if h.token != "" {
+		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !ok || subtle.ConstantTimeCompare([]byte(got), []byte(h.token)) != 1 {
+			return h.fail(w, http.StatusUnauthorized, "unauthorized"), ""
+		}
+	}
 	var req sidecarRequest
 	r.Body = http.MaxBytesReader(w, r.Body, sidecarMaxRequest)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

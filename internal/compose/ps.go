@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os/exec"
 	"sort"
 	"strings"
 )
@@ -242,7 +241,8 @@ func labelValue(labels json.RawMessage, key string) string {
 // are logged and returned like run does, but with stderr in the message (the
 // useful diagnostics for a failed ps; stdout stays unpolluted for parsing).
 func (e *Executor) output(ctx context.Context, args []string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, e.binary, args...)
+	cmd, cmdCtx, cancel := e.command(ctx, e.readTimeout, args)
+	defer cancel()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -250,6 +250,9 @@ func (e *Executor) output(ctx context.Context, args []string) ([]byte, error) {
 	if err := cmd.Run(); err != nil {
 		e.logger.Error("docker command failed",
 			"command", command, "error", err.Error(), "output", snippet(stderr.Bytes()))
+		if derr := deadlineError(cmdCtx, ctx, e.readTimeout, command, err); derr != nil {
+			return nil, fmt.Errorf("%w%s", derr, outputSuffix(stderr.Bytes()))
+		}
 		return nil, fmt.Errorf("docker %s: %w%s", command, err, outputSuffix(stderr.Bytes()))
 	}
 	e.logger.Info("docker command finished", "command", command, "output", snippet(stdout.Bytes()))

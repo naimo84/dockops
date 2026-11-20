@@ -10,12 +10,13 @@
 // Webhook authentication understands the common flavors — GitHub
 // (X-Hub-Signature-256: "sha256=<hex>" HMAC-SHA256 over the raw request
 // body), Gitea (X-Gitea-Signature: the identical HMAC under a different
-// header name) and GitLab (X-Gitlab-Token: plain shared secret). When a
-// secret is configured, at least one of them must match, otherwise the
-// request is rejected with 401. All comparisons run in constant time and
-// never leak header values into the logs. /restart uses exactly the same
-// authentication. /status is optionally guarded by its own Bearer token
-// (Deps.Token).
+// header name) and GitLab (X-Gitlab-Token: plain shared secret). At least one
+// of them must match, otherwise the request is rejected with 401; without a
+// configured secret the endpoint is disabled (503) instead of open. All
+// comparisons run in constant time and never leak header values into the
+// logs. /restart has its own Bearer token (Deps.RestartToken) and falls back
+// to the webhook authentication only while that token is unset. /status is
+// optionally guarded by its own Bearer token (Deps.Token).
 package webhook
 
 import (
@@ -43,12 +44,12 @@ const maxBody = 1 << 20 // 1 MiB
 const (
 	// githubSignatureHeader carries the GitHub HMAC as "sha256=<hex>".
 	githubSignatureHeader = "X-Hub-Signature-256"
-	// giteaSignatureHeader carries the Gitea HMAC as "sha256=<hex>".
-	// Gitea schickt denselben HMAC wie GitHub, nur unter anderem
-	// Header-Namen — derselbe Verifier (matchHMAC) deckt beide ab.
+	// giteaSignatureHeader carries the Gitea HMAC as bare hex, without the
+	// "sha256=" prefix (Gitea's services/webhook/deliver.go). Gitea also
+	// sends X-Hub-Signature-256 in GitHub form; both headers are checked.
 	giteaSignatureHeader = "X-Gitea-Signature"
-	// signaturePrefix separates the algorithm from the hex digest; GitHub
-	// and Gitea use the identical scheme.
+	// signaturePrefix separates the algorithm from the hex digest in
+	// X-Hub-Signature-256; X-Gitea-Signature accepts it optionally.
 	signaturePrefix = "sha256="
 	// gitlabTokenHeader carries the GitLab shared secret in plain text.
 	gitlabTokenHeader = "X-Gitlab-Token"
@@ -71,10 +72,24 @@ var _ ComposeLister = (*compose.Executor)(nil)
 // first three fields existed as positional parameters of New before /status
 // joined the surface; the rest feeds the status endpoint.
 type Deps struct {
-	// Secret authenticates POST /webhook (GitHub HMAC / GitLab token);
-	// empty disables webhook authentication — callers should warn about
-	// that (the CLI does).
+	// Secret authenticates POST /webhook (GitHub/Gitea HMAC, GitLab token).
+	// Empty disables the endpoint (503): an unauthenticated trigger is never
+	// served. The poll loop keeps working without it.
 	Secret string
+
+	// RestartToken guards POST /restart (Authorization: Bearer, compared in
+	// constant time). A restart is an operational action; the webhook
+	// secret is shared with the git hoster and should not authorize it.
+	// While RestartToken is empty, /restart falls back to the webhook
+	// authentication (the behaviour before the token existed; the CLI warns),
+	// and with neither configured the endpoint is disabled (503).
+	RestartToken string
+
+	// Liveness reports whether the reconcile loop makes progress; a non-nil
+	// error turns GET /healthz into 503 with the error text, so a watchdog
+	// notices an agent whose loop hangs while its HTTP server still answers.
+	// Nil keeps /healthz a pure process liveness probe.
+	Liveness func() error
 
 	// Trigger fires a reconcile pass. It is called synchronously after
 	// successful webhook authentication and must not block (the CLI passes
@@ -137,8 +152,10 @@ type Deps struct {
 // Handler serves POST /webhook, POST /restart, GET /healthz and GET /status.
 // It is a plain http.Handler, so it composes with any router or middleware.
 type Handler struct {
-	secret  string
-	trigger func()
+	secret       string
+	restartToken string
+	liveness     func() error
+	trigger      func()
 	// restart serves POST /restart (Deps.Restart); nil → 503.
 	restart RestartFunc
 	logger  *slog.Logger
@@ -163,10 +180,12 @@ func New(deps Deps) *Handler {
 		logger = slog.Default()
 	}
 	return &Handler{
-		secret:  deps.Secret,
-		trigger: deps.Trigger,
-		restart: deps.Restart,
-		logger:  logger,
+		secret:       deps.Secret,
+		restartToken: deps.RestartToken,
+		liveness:     deps.Liveness,
+		trigger:      deps.Trigger,
+		restart:      deps.Restart,
+		logger:       logger,
 		status: StatusDeps{
 			State:       deps.State,
 			Compose:     deps.Compose,
@@ -192,6 +211,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Allow", http.MethodGet)
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
+		}
+		if h.liveness != nil {
+			if err := h.liveness(); err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -232,6 +257,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // trigger. The HMAC covers the exact raw bytes received, so the body is
 // read once up front instead of streamed.
 func (h *Handler) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	if h.secret == "" {
+		http.Error(w, webhookDisabledBody, http.StatusServiceUnavailable)
+		return
+	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 	if err != nil {
 		var maxErr *http.MaxBytesError
@@ -255,18 +284,19 @@ func (h *Handler) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
-// authorized reports whether at least one authentication method matches.
-// With no configured secret every request is accepted (documented behavior;
-// callers warn about it). A malformed header simply does not match.
+// webhookDisabledBody is answered by POST /webhook without a secret.
+const webhookDisabledBody = "webhook endpoint disabled: DOCKOPS_WEBHOOK_SECRET unset"
+
+// authorized reports whether at least one webhook authentication method
+// matches. Without a configured secret nothing matches — the callers disable
+// their endpoint in that case anyway; this is the second line. A malformed
+// header simply does not match.
 func (h *Handler) authorized(r *http.Request, body []byte) bool {
 	if h.secret == "" {
-		return true
+		return false
 	}
-	// GitHub und Gitea nutzen dasselbe HMAC-Verfahren unter unterschiedlichen
-	// Header-Namen; ein Verifier deckt beide ab. GitLab bleibt der
-	// Klartext-Token-Vergleich.
-	return h.matchHMAC(r, body, githubSignatureHeader) ||
-		h.matchHMAC(r, body, giteaSignatureHeader) ||
+	return h.matchHMAC(body, r.Header.Get(githubSignatureHeader), true) ||
+		h.matchHMAC(body, r.Header.Get(giteaSignatureHeader), false) ||
 		h.matchGitLab(r)
 }
 
@@ -281,17 +311,21 @@ func (h *Handler) logAuthenticationFailure(r *http.Request) {
 		"gitlab_header", r.Header.Get(gitlabTokenHeader) != "")
 }
 
-// matchHMAC verifies an HMAC signature header (GitHub's
-// X-Hub-Signature-256 and Gitea's X-Gitea-Signature are the same scheme):
-// the header value after the "sha256=" prefix must be the hex-encoded
-// HMAC-SHA256 of the body under the secret. hmac.Equal compares in constant
-// time; wrong-length digests fail without leaking which bytes differ.
-func (h *Handler) matchHMAC(r *http.Request, body []byte, headerName string) bool {
-	header := r.Header.Get(headerName)
-	if !strings.HasPrefix(header, signaturePrefix) {
+// matchHMAC verifies an HMAC signature header value: the hex-encoded
+// HMAC-SHA256 of the body under the secret. requirePrefix demands the
+// "sha256=" prefix (GitHub's X-Hub-Signature-256); without it the prefix is
+// optional (Gitea's X-Gitea-Signature is bare hex). Any other algorithm
+// prefix fails the hex decode. hmac.Equal compares in constant time;
+// wrong-length digests fail without leaking which bytes differ.
+func (h *Handler) matchHMAC(body []byte, header string, requirePrefix bool) bool {
+	if header == "" {
 		return false
 	}
-	got, err := hex.DecodeString(strings.TrimPrefix(header, signaturePrefix))
+	digest, hasPrefix := strings.CutPrefix(header, signaturePrefix)
+	if requirePrefix && !hasPrefix {
+		return false
+	}
+	got, err := hex.DecodeString(digest)
 	if err != nil {
 		return false
 	}

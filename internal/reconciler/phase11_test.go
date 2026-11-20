@@ -47,6 +47,7 @@ func (f *fixture) phase11Reconciler(composeExec ComposeExecutor, resolver regist
 		Registry: resolver,
 	})
 	r.healthPoll = time.Millisecond
+	r.healthStable = 0
 	return r
 }
 

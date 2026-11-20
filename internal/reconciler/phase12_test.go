@@ -81,6 +81,7 @@ func (f *fixture) phase12Reconciler(composeExec ComposeExecutor, resolver regist
 		SelfUpdate:  true,
 	})
 	r.healthPoll = time.Millisecond
+	r.healthStable = 0
 	// Fixed identity: the helper inherits this container's mounts.
 	r.selfContainer = testSelfContainer
 	r.runHelper = helper
@@ -454,8 +455,8 @@ func TestPhase12FinalizeRollbackFailed(t *testing.T) {
 func TestPhase12FinalizeNoResultDigestMatchesTarget(t *testing.T) {
 	f := newFixture(t, updateRoot)
 	selfState(t, f, pendingRecord())
-	// The helper died, but the tag already points at the target.
-	f.compose.digests = map[string]string{applyImage: "sha256:new"}
+	// The helper died after the recreate: the container runs the target.
+	selfRunning(f, "sha256:new")
 	rec := &recordingNotifier{}
 	r := f.phase12Reconciler(f.compose, &fakeResolver{}, rec, nil, "dockops")
 
@@ -477,8 +478,11 @@ func TestPhase12FinalizeNoResultDigestMatchesTarget(t *testing.T) {
 func TestPhase12FinalizeNoResultDigestIsPrevious(t *testing.T) {
 	f := newFixture(t, updateRoot)
 	selfState(t, f, pendingRecord())
-	// Nothing moved: the helper never recreated the stack.
-	f.compose.digests = map[string]string{applyImage: "sha256:old"}
+	// Nothing moved: the helper never recreated the stack — even though the
+	// tag already points at the target (the agent pulled before the
+	// hand-over).
+	f.compose.digests = map[string]string{applyImage: "sha256:new"}
+	selfRunning(f, "sha256:old")
 	rec := &recordingNotifier{}
 	r := f.phase12Reconciler(f.compose, &fakeResolver{}, rec, nil, "dockops")
 
@@ -507,7 +511,7 @@ func TestPhase12FinalizeUnknownDigestStaysPending(t *testing.T) {
 	f := newFixture(t, updateRoot)
 	selfState(t, f, pendingRecord())
 	// Neither digest: the helper may still be recreating.
-	f.compose.digests = map[string]string{applyImage: "sha256:third"}
+	selfRunning(f, "sha256:third")
 	r := f.phase12Reconciler(f.compose, &fakeResolver{}, &recordingNotifier{}, nil, "dockops")
 
 	r.finalizeSelfUpdate(context.Background())

@@ -34,7 +34,9 @@ type restartBody struct {
 	} `json:"failed"`
 }
 
-// newRestartHandler builds a handler whose restart endpoint uses stub.
+// newRestartHandler builds a handler whose restart endpoint uses stub and
+// authenticates with the webhook secret (the fallback while no restart token
+// is configured).
 func newRestartHandler(secret string, stub *restartStub) *Handler {
 	return New(Deps{
 		Secret:  secret,
@@ -44,9 +46,27 @@ func newRestartHandler(secret string, stub *restartStub) *Handler {
 	})
 }
 
+// testRestartToken authenticates the restart tests that are about the
+// endpoint's behaviour, not its authentication.
+const testRestartToken = "restart-token"
+
+// restartAuth is the header those tests send.
+var restartAuth = map[string]string{"Authorization": "Bearer " + testRestartToken}
+
+// newTokenRestartHandler builds a handler whose restart endpoint uses stub
+// and requires testRestartToken.
+func newTokenRestartHandler(stub *restartStub) *Handler {
+	return New(Deps{
+		RestartToken: testRestartToken,
+		Trigger:      func() {},
+		Restart:      stub.restart,
+		Logger:       quietLogger(),
+	})
+}
+
 func TestRestartMethodNotAllowed(t *testing.T) {
 	stub := &restartStub{}
-	h := newRestartHandler("", stub)
+	h := newTokenRestartHandler(stub)
 
 	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
 		rec := do(h, method, "/restart", nil, nil)
@@ -123,9 +143,9 @@ func TestRestartAuthentication(t *testing.T) {
 
 func TestRestartSuccess(t *testing.T) {
 	stub := &restartStub{restarted: []string{"web", "db"}}
-	h := newRestartHandler("", stub)
+	h := newTokenRestartHandler(stub)
 
-	rec := do(h, http.MethodPost, "/restart", []byte(`{"stacks":["web","db"]}`), nil)
+	rec := do(h, http.MethodPost, "/restart", []byte(`{"stacks":["web","db"]}`), restartAuth)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST /restart status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
 	}
@@ -163,8 +183,8 @@ func TestRestartSelectionDefaultsToAll(t *testing.T) {
 	for name, body := range bodies {
 		t.Run(name, func(t *testing.T) {
 			stub := &restartStub{restarted: []string{"web"}}
-			h := newRestartHandler("", stub)
-			rec := do(h, http.MethodPost, "/restart", body, nil)
+			h := newTokenRestartHandler(stub)
+			rec := do(h, http.MethodPost, "/restart", body, restartAuth)
 			if rec.Code != http.StatusOK {
 				t.Fatalf("POST /restart status = %d, want 200", rec.Code)
 			}
@@ -180,9 +200,9 @@ func TestRestartSelectionDefaultsToAll(t *testing.T) {
 
 func TestRestartUnknownStack(t *testing.T) {
 	stub := &restartStub{unknown: []string{"ghost"}}
-	h := newRestartHandler("", stub)
+	h := newTokenRestartHandler(stub)
 
-	rec := do(h, http.MethodPost, "/restart", []byte(`{"stacks":["web","ghost"]}`), nil)
+	rec := do(h, http.MethodPost, "/restart", []byte(`{"stacks":["web","ghost"]}`), restartAuth)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("POST /restart status = %d, want 400", rec.Code)
 	}
@@ -196,9 +216,9 @@ func TestRestartPartialFailure(t *testing.T) {
 		restarted: []string{"web"},
 		failed:    map[string]string{"db": "compose restart: exit status 1"},
 	}
-	h := newRestartHandler("", stub)
+	h := newTokenRestartHandler(stub)
 
-	rec := do(h, http.MethodPost, "/restart", nil, nil)
+	rec := do(h, http.MethodPost, "/restart", nil, restartAuth)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST /restart status = %d, want 200 (a failing stack is not a failed request)", rec.Code)
 	}
@@ -219,9 +239,9 @@ func TestRestartPartialFailure(t *testing.T) {
 // sorted by name.
 func TestRestartAllFailed(t *testing.T) {
 	stub := &restartStub{failed: map[string]string{"web": "boom", "db": "bang"}}
-	h := newRestartHandler("", stub)
+	h := newTokenRestartHandler(stub)
 
-	rec := do(h, http.MethodPost, "/restart", nil, nil)
+	rec := do(h, http.MethodPost, "/restart", nil, restartAuth)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST /restart status = %d, want 200", rec.Code)
 	}
@@ -258,8 +278,8 @@ func TestRestartInvalidBody(t *testing.T) {
 	for name, body := range bodies {
 		t.Run(name, func(t *testing.T) {
 			stub := &restartStub{}
-			h := newRestartHandler("", stub)
-			rec := do(h, http.MethodPost, "/restart", body, nil)
+			h := newTokenRestartHandler(stub)
+			rec := do(h, http.MethodPost, "/restart", body, restartAuth)
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("POST /restart status = %d, want 400", rec.Code)
 			}
@@ -272,9 +292,9 @@ func TestRestartInvalidBody(t *testing.T) {
 
 func TestRestartCallbackError(t *testing.T) {
 	stub := &restartStub{err: errors.New("no configuration loaded yet")}
-	h := newRestartHandler("", stub)
+	h := newTokenRestartHandler(stub)
 
-	rec := do(h, http.MethodPost, "/restart", nil, nil)
+	rec := do(h, http.MethodPost, "/restart", nil, restartAuth)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("POST /restart status = %d, want 500", rec.Code)
 	}
@@ -282,5 +302,46 @@ func TestRestartCallbackError(t *testing.T) {
 	// not into the response.
 	if body := rec.Body.String(); strings.Contains(body, "no configuration") {
 		t.Errorf("500 body leaks the internal error: %q", body)
+	}
+}
+
+// With a restart token, only the token opens /restart: the webhook secret is
+// shared with the git hoster and must not authorize an operational action.
+func TestRestartTokenReplacesWebhookAuth(t *testing.T) {
+	const secret = "webhook-secret"
+	stub := &restartStub{restarted: []string{"web"}}
+	h := New(Deps{
+		Secret:       secret,
+		RestartToken: testRestartToken,
+		Trigger:      func() {},
+		Restart:      stub.restart,
+		Logger:       quietLogger(),
+	})
+	body := []byte(`{"stacks":["web"]}`)
+	signed := map[string]string{githubSignatureHeader: githubSig(secret, body)}
+	if rec := do(h, http.MethodPost, "/restart", body, signed); rec.Code != http.StatusUnauthorized {
+		t.Errorf("webhook-signed restart status = %d, want 401 once a restart token is set", rec.Code)
+	}
+	if rec := do(h, http.MethodPost, "/restart", body, map[string]string{"Authorization": "Bearer wrong"}); rec.Code != http.StatusUnauthorized {
+		t.Errorf("wrong token status = %d, want 401", rec.Code)
+	}
+	if len(stub.calls) != 0 {
+		t.Fatalf("restart calls = %v, want none for rejected requests", stub.calls)
+	}
+	if rec := do(h, http.MethodPost, "/restart", body, restartAuth); rec.Code != http.StatusOK {
+		t.Errorf("token restart status = %d, want 200", rec.Code)
+	}
+}
+
+// Without any credential the endpoint is disabled, even when a restart
+// function is wired: an empty selection would restart every stack.
+func TestRestartDisabledWithoutCredentials(t *testing.T) {
+	stub := &restartStub{}
+	h := New(Deps{Trigger: func() {}, Restart: stub.restart, Logger: quietLogger()})
+	if rec := do(h, http.MethodPost, "/restart", nil, nil); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("POST /restart without credentials status = %d, want 503", rec.Code)
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("restart calls = %v, want none", stub.calls)
 	}
 }

@@ -34,6 +34,12 @@ services:
       # Optional Bearer token for GET /status (empty = open endpoint, like
       # /healthz). Substituted from the shell/.env like the secret above.
       DOCKOPS_STATUS_TOKEN: "${DOCKOPS_STATUS_TOKEN:-}"
+      # Bearer token for POST /restart. Empty: /restart falls back to the
+      # webhook secret (warning at startup).
+      DOCKOPS_RESTART_TOKEN: "${DOCKOPS_RESTART_TOKEN:-}"
+      # Bearer token for the sops sidecar; must equal SOPS_SIDECAR_TOKEN of
+      # the sidecar service below.
+      DOCKOPS_SOPS_SIDECAR_TOKEN: "${SOPS_SIDECAR_TOKEN:-}"
       # Compose project dockops itself runs under; never reported as
       # unmanaged by GET /status. Only needs overriding when the agent is
       # deployed under a different project name.
@@ -83,6 +89,9 @@ services:
       # the service's security boundary. The stack checkouts arrive via the
       # shared volume below.
       SOPS_SIDECAR_ALLOWED_ROOTS: /var/lib/dockops/repos
+      # Shared token with dockops (DOCKOPS_SOPS_SIDECAR_TOKEN). Without it,
+      # every container on this network can decrypt.
+      SOPS_SIDECAR_TOKEN: "${SOPS_SIDECAR_TOKEN:-}"
       # Vault-Transit for .sops.yaml rules using hc_vault_transit_uri.
       VAULT_ADDR: "https://vault.example.com"
       VAULT_TOKEN: "${VAULT_TOKEN:?set VAULT_TOKEN}"

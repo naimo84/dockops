@@ -106,6 +106,10 @@ type Config struct {
 	// Registries holds the optional registry credentials of the image
 	// update check (phase 10), expanded and validated by the loader.
 	Registries []Registry
+	// StackErrors lists the stack definitions LoadLenient could not load
+	// (each error names the file). Their stacks are missing from Stacks.
+	// Load never returns a Config with StackErrors.
+	StackErrors []error
 }
 
 // Load parses the root configuration at rootFile (stacks.yaml in the host
@@ -114,6 +118,42 @@ type Config struct {
 // under global.work_dir, validates the combined result and returns it.
 // Every failure is returned as an error with file, path and field context.
 func Load(rootFile string) (*Config, error) {
+	cfg, err := load(rootFile)
+	if cfg != nil && len(cfg.StackErrors) > 0 {
+		// The first broken stack, exactly as the strict loader always
+		// reported it.
+		return nil, cfg.StackErrors[0]
+	}
+	if err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// LoadLenient loads like Load, but a stack definition that cannot be loaded
+// — local or imported — does not fail the whole configuration: the stack is
+// left out and its error recorded in Config.StackErrors, so one typo in one
+// stack.yaml (possibly in a remote somebody else maintains) cannot stop the
+// deploys of every other stack on the host. Errors of the root
+// configuration, of the stack discovery itself and duplicate stack names
+// still fail the load.
+//
+// Callers must treat a Config with StackErrors as incomplete: a stack whose
+// definition is broken looks exactly like a removed one (the reconciler
+// suspends pruning for such a pass).
+func LoadLenient(rootFile string) (*Config, error) {
+	cfg, err := load(rootFile)
+	if err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// load is the shared loader: it returns the configuration with the stack
+// errors collected, and a hard error for everything that is not a single
+// stack's problem. With a hard error the Config may still carry the stack
+// errors found before it (Load reports those first).
+func load(rootFile string) (*Config, error) {
 	root, err := loadRoot(rootFile)
 	if err != nil {
 		return nil, err
@@ -134,23 +174,31 @@ func Load(rootFile string) (*Config, error) {
 		cfg.Global.WorkDir = filepath.Join(hostRoot, cfg.Global.WorkDir)
 	}
 
-	local, err := discoverStacks(hostRoot, cfg.Global.Include, cfg.Global.ComposeFilePatterns)
+	files, err := globFiles(hostRoot, cfg.Global.Include)
 	if err != nil {
 		return nil, fmt.Errorf("discover local stacks below %s: %w", hostRoot, err)
 	}
-	cfg.Stacks = append(cfg.Stacks, local...)
+	for _, file := range files {
+		stack, err := loadStackFile(file, cfg.Global.ComposeFilePatterns)
+		if err != nil {
+			cfg.StackErrors = append(cfg.StackErrors, fmt.Errorf("discover local stacks below %s: %w", hostRoot, err))
+			continue
+		}
+		cfg.Stacks = append(cfg.Stacks, stack)
+	}
 
 	for _, imp := range cfg.Imports {
 		rem := cfg.Remotes[imp.Remote] // existence validated by loadRoot
 		stack, err := loadImportStack(cfg.Global, rem, imp)
 		if err != nil {
-			return nil, fmt.Errorf("import remote=%q path=%q: %w", imp.Remote, imp.Path, err)
+			cfg.StackErrors = append(cfg.StackErrors, fmt.Errorf("import remote=%q path=%q: %w", imp.Remote, imp.Path, err))
+			continue
 		}
 		cfg.Stacks = append(cfg.Stacks, stack)
 	}
 
 	if err := checkDuplicateNames(cfg.Stacks); err != nil {
-		return nil, err
+		return cfg, err
 	}
 	return cfg, nil
 }
@@ -422,24 +470,6 @@ func decodeYAMLFile(path string, out any) error {
 		return fmt.Errorf("%s: %w", path, err)
 	}
 	return nil
-}
-
-// discoverStacks finds all stack definition files below root that match any
-// of the include globs and loads each one.
-func discoverStacks(root string, include, composeFilePatterns []string) ([]Stack, error) {
-	files, err := globFiles(root, include)
-	if err != nil {
-		return nil, err
-	}
-	stacks := make([]Stack, 0, len(files))
-	for _, file := range files {
-		stack, err := loadStackFile(file, composeFilePatterns)
-		if err != nil {
-			return nil, err
-		}
-		stacks = append(stacks, stack)
-	}
-	return stacks, nil
 }
 
 // globFiles returns the regular files below root whose path relative to root

@@ -51,6 +51,15 @@ type State struct {
 	Hash string `json:"hash"`
 	// Status is one of the Status constants.
 	Status string `json:"status"`
+	// Failures counts the consecutive failed attempts with this Hash (0 when
+	// the last attempt deployed). It drives the retry back-off of a stack
+	// that keeps failing with the same configuration. Additive and
+	// omitempty; fileVersion stays 1.
+	Failures int `json:"failures,omitempty"`
+	// LastError is the failure text of the last attempt while Status is
+	// failed (bounded by the reconciler), so GET /status can say why a stack
+	// is not deployed. Empty after a successful deploy. Additive, omitempty.
+	LastError string `json:"last_error,omitempty"`
 	// UpdatedAt is the UTC time of the last state change.
 	UpdatedAt time.Time `json:"updated_at"`
 	// StackDir is the directory the stack definition lived in at deploy
@@ -134,6 +143,13 @@ type ImageRecord struct {
 	// the reference is what the registry is asked about); the service name
 	// is kept so GET /status can name it without a compose call.
 	Service string `json:"service,omitempty"`
+	// Services lists every compose service that runs the image, sorted;
+	// Service is its first entry. Several services sharing one image (an app
+	// and its worker) are updated, gated and rolled back together — updating
+	// only one of them would leave the stack running two versions. Omitted
+	// when the image serves a single service, and absent in older files,
+	// which therefore read as "Service only".
+	Services []string `json:"services,omitempty"`
 	// CurrentDigest is the locally recorded repository digest
 	// (docker image inspect RepoDigests); empty for a locally built image.
 	CurrentDigest string `json:"current_digest,omitempty"`

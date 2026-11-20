@@ -19,7 +19,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/local/dockops/internal/redact"
 )
 
 // gitBinary is the name of the git executable used for every command. It is
@@ -31,16 +34,47 @@ const gitBinary = "git"
 // stashes. The remainder of the message is an RFC3339 timestamp.
 const wipStashPrefix = "dockops-wip: "
 
+// generatedPatterns name the files dockops itself writes into the stack
+// directories of a checkout: the merged stack environment (.env, plus the
+// temporary file of its atomic write) and the compose overrides of the bind
+// rewrite and the image rollback. They are deployment artefacts, not
+// repository content, so the update path must neither stash them — the .env
+// carries resolved secrets, and a stash would persist them in the
+// repository's object store — nor clean them: compose reads the .env again
+// for image updates, restarts and the update check, long after the deploy
+// that wrote it.
+//
+// Matched against the base name at any depth, which is also what a slash-less
+// pattern in .git/info/exclude means.
+var generatedPatterns = []string{
+	".env",
+	".env.dockops-*",
+	"dockops-binds-*.yaml",
+	"dockops-binds-*.yaml.tmp",
+	"dockops-rollback-*.yaml",
+}
+
+// excludeHeader introduces dockops' block in .git/info/exclude.
+const excludeHeader = "# dockops: generated deployment artefacts, never repository content"
+
 // maxErrorOutput bounds how much command output is embedded into an error
 // message so failures stay readable while still carrying the essential git
 // diagnostics.
 const maxErrorOutput = 512
+
+// defaultTimeout bounds one git command. The reconcile loop is
+// single-threaded: a fetch that never returns (a stalled network, a server
+// that stops answering) would stop every later pass. Ten minutes leaves room
+// for the first clone of a large repository.
+const defaultTimeout = 10 * time.Minute
 
 // Manager clones and deterministically updates remote repositories below a
 // shared work directory (global.work_dir of the root configuration).
 type Manager struct {
 	workDir string
 	logger  *slog.Logger
+	// timeout is the per-command deadline (defaultTimeout; tests shorten it).
+	timeout time.Duration
 }
 
 // New creates a Manager managing checkouts below workDir. It verifies that
@@ -64,7 +98,7 @@ func New(workDir string, logger *slog.Logger) (*Manager, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Manager{workDir: abs, logger: logger}, nil
+	return &Manager{workDir: abs, logger: logger, timeout: defaultTimeout}, nil
 }
 
 // EnsureRepo guarantees that <workDir>/<name> is a checkout of url at the
@@ -120,17 +154,22 @@ func (m *Manager) EnsureRepoAt(path, url, branch string) (string, error) {
 
 	switch state {
 	case dirAbsent, dirEmpty:
-		m.logger.Info("cloning repository", "url", url, "branch", branch, "path", path)
+		m.logger.Info("cloning repository", "url", redact.URLs(url), "branch", branch, "path", path)
 		// exec passes arguments directly (no shell), so tokens embedded in
 		// url cannot be misinterpreted as shell syntax.
 		if _, err := m.runGit("", "clone", "--branch", branch, "--single-branch", "--", url, path); err != nil {
 			return "", err
 		}
+		m.ensureExcludes(path)
 	case dirRepo:
 		if err := m.checkOrigin(path, url); err != nil {
 			return "", err
 		}
 		m.logger.Info("updating repository", "branch", branch, "path", path)
+		// Before the stash: an adopted checkout (or one cloned by an older
+		// dockops) gets the exclude block here, so the status check below
+		// already ignores the generated files.
+		m.ensureExcludes(path)
 		m.stashWIP(path)
 		if _, err := m.runGit(path, "fetch", "origin", branch); err != nil {
 			return "", err
@@ -182,26 +221,149 @@ func (m *Manager) HeadCommit(repoPath string) (string, error) {
 // deliberately never applied or popped again — restore is a manual
 // operator action (`git stash list` / `git stash pop`) so merge conflicts
 // can never block a deploy.
+//
+// Generated files (see generatedPatterns) are never stashed. Untracked ones
+// are invisible to status and clean through the exclude block; a generated
+// file the repository tracks (a committed .env that every deploy overwrites)
+// still shows up as modified — it is kept out of the stash by a pathspec, the
+// reset restores the committed version, and a warning names the file, since
+// only removing it from the repository ends the flip-flop.
 func (m *Manager) stashWIP(path string) {
-	out, err := m.runGit(path, "status", "--porcelain")
+	out, err := m.runGit(path, "status", "--porcelain", "-z")
 	if err != nil {
 		// A repository this broken fails again, with context, in fetch or
 		// reset below; skipping the stash preserves today's error behavior.
 		m.logger.Warn("checking for local changes failed, skipping WIP stash", "path", path, "error", err)
 		return
 	}
-	if strings.TrimSpace(string(out)) == "" {
+	var edits, generated []string
+	for _, p := range porcelainPaths(out) {
+		if isGenerated(p) {
+			generated = append(generated, p)
+		} else {
+			edits = append(edits, p)
+		}
+	}
+	if len(generated) > 0 {
+		m.logger.Warn("generated dockops files are tracked by the repository; they are reset to the committed version and never stashed",
+			"path", path, "files", generated,
+			"hint", "remove them from the repository: dockops rewrites them on every deploy, and env_files entries pointing at the stack .env are ignored")
+	}
+	if len(edits) == 0 {
 		m.logger.Debug("worktree clean, no WIP stash needed", "path", path)
 		return
 	}
 	message := wipStashPrefix + time.Now().Format(time.RFC3339)
-	if _, err := m.runGit(path, "stash", "push", "--include-untracked", "-m", message); err != nil {
+	args := []string{"stash", "push", "--include-untracked", "-m", message, "--", "."}
+	for _, p := range generatedPatterns {
+		args = append(args, ":(exclude,glob)**/"+p)
+	}
+	if _, err := m.runGit(path, args...); err != nil {
 		m.logger.Warn("WIP stash failed, resetting anyway (local changes may be lost)", "path", path, "error", err)
 		return
 	}
 	m.logger.Info("stashed local changes before reset",
 		"path", path, "stash_message", message,
 		"restore_hint", "git stash list / git stash pop in the checkout")
+}
+
+// ensureExcludes appends the generated file patterns to the checkout's
+// .git/info/exclude unless they are already there, so status, stash and clean
+// leave untracked deployment artefacts alone. The file is local to the
+// checkout — nothing is committed — and the block is written at most once.
+// Failures only warn: the update still works, it just stashes and cleans the
+// artefacts the way it did before the block existed.
+func (m *Manager) ensureExcludes(path string) {
+	out, err := m.runGit(path, "rev-parse", "--git-path", "info/exclude")
+	if err != nil {
+		m.logger.Warn("cannot locate .git/info/exclude; generated files stay visible to git", "path", path, "error", err)
+		return
+	}
+	file := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(file) {
+		file = filepath.Join(path, file)
+	}
+	existing, err := os.ReadFile(file)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		m.logger.Warn("cannot read the exclude file; generated files stay visible to git", "file", file, "error", err)
+		return
+	}
+	present := make(map[string]bool)
+	for _, line := range strings.Split(string(existing), "\n") {
+		present[strings.TrimSpace(line)] = true
+	}
+	var block strings.Builder
+	for _, p := range generatedPatterns {
+		if !present[p] {
+			block.WriteString(p + "\n")
+		}
+	}
+	if block.Len() == 0 {
+		return
+	}
+	var add strings.Builder
+	if len(existing) > 0 && !strings.HasSuffix(string(existing), "\n") {
+		add.WriteByte('\n')
+	}
+	if !present[excludeHeader] {
+		add.WriteString(excludeHeader + "\n")
+	}
+	add.WriteString(block.String())
+	if err := os.MkdirAll(filepath.Dir(file), 0o755); err != nil {
+		m.logger.Warn("cannot create the exclude file's directory; generated files stay visible to git", "file", file, "error", err)
+		return
+	}
+	f, err := os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		m.logger.Warn("cannot open the exclude file; generated files stay visible to git", "file", file, "error", err)
+		return
+	}
+	_, werr := f.WriteString(add.String())
+	cerr := f.Close()
+	if err := errors.Join(werr, cerr); err != nil {
+		m.logger.Warn("cannot write the exclude file; generated files stay visible to git", "file", file, "error", err)
+		return
+	}
+	m.logger.Info("excluded generated dockops files from git", "path", path, "file", file)
+}
+
+// porcelainPaths returns the paths of `git status --porcelain -z` output.
+// Each entry is "XY <path>" terminated by NUL; renames and copies carry their
+// source path as an extra NUL-terminated field, which is skipped (the
+// destination is what lives in the worktree).
+func porcelainPaths(out []byte) []string {
+	fields := strings.Split(string(out), "\x00")
+	var paths []string
+	for i := 0; i < len(fields); i++ {
+		entry := fields[i]
+		if len(entry) < 4 {
+			continue
+		}
+		paths = append(paths, entry[3:])
+		if entry[0] == 'R' || entry[0] == 'C' {
+			i++
+		}
+	}
+	return paths
+}
+
+// isGenerated reports whether a worktree path (slash-separated, as git
+// prints it) names a file dockops generates; see generatedPatterns. A
+// trailing slash marks an untracked directory, which is never generated.
+func isGenerated(p string) bool {
+	if strings.HasSuffix(p, "/") {
+		return false
+	}
+	base := p
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		base = p[i+1:]
+	}
+	for _, pattern := range generatedPatterns {
+		if ok, _ := filepath.Match(pattern, base); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // validateName rejects repository names that would escape the work directory
@@ -295,7 +457,8 @@ func (m *Manager) checkOrigin(path, url string) error {
 		return err
 	}
 	if got := strings.TrimSpace(string(out)); got != url {
-		return fmt.Errorf("git %s: checkout was cloned from %q, not %q (remove the checkout or fix the configuration)", path, got, url)
+		return fmt.Errorf("git %s: checkout was cloned from %q, not %q (remove the checkout or fix the configuration)",
+			path, redact.URLs(got), redact.URLs(url))
 	}
 	return nil
 }
@@ -303,18 +466,43 @@ func (m *Manager) checkOrigin(path, url string) error {
 // runGit executes the git binary with args, optionally with dir as working
 // directory, and returns its combined output. Errors embed the full command
 // and a bounded excerpt of the output, per the project convention that
-// errors carry context.
+// errors carry context — with the credentials of every URL masked: a clone
+// URL may carry a token, and these errors travel on into logs and repo_failed
+// notifications.
 //
 // The public API has no context parameters (matching the briefing's
-// signatures); commands still run through exec.CommandContext with
-// context.Background so a context can be plumbed through Manager later
-// without touching call sites.
+// signatures); every command still runs with a deadline (Manager.timeout),
+// in its own process group so the deadline also ends the ssh or
+// remote-helper children git spawns, and with terminal prompts disabled: a
+// credential prompt nobody can answer must fail, not wait.
 func (m *Manager) runGit(dir string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(context.Background(), gitBinary, args...)
+	timeout := m.timeout
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, gitBinary, args...)
 	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			return err
+		}
+		return nil
+	}
+	cmd.WaitDelay = 10 * time.Second
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("git %s: %w%s", strings.Join(args, " "), err, outputSuffix(out))
+		command := redact.URLs(strings.Join(args, " "))
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("git %s: timed out after %s: %w%s", command, timeout, err, redact.URLs(outputSuffix(out)))
+		}
+		return nil, fmt.Errorf("git %s: %w%s", command, err, redact.URLs(outputSuffix(out)))
 	}
 	return out, nil
 }

@@ -232,11 +232,19 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
   die lokal installierte git-Binary (`os/exec`, keine Git-Library); im
   Update-Pfad sichert `stashWIP` dirty Worktrees (inkl. untracked) vor
   `reset --hard`/`clean -fd` als `dockops-wip:`-Stash (Fehler nur WARN,
-  kein Abbruch, kein Auto-Pop)
+  kein Abbruch, kein Auto-Pop); generierte Artefakte (`.env`,
+  `.env.dockops-*`, `dockops-binds-*.yaml`, `dockops-rollback-*.yaml`) stehen
+  per `ensureExcludes` in `.git/info/exclude` und sind per Pathspec nie Teil
+  des Stashs (die `.env` trägt Secrets und muss Updates überleben); getrackte
+  generierte Dateien → WARN (`generated_test.go`)
 - `internal/git/phase7_test.go` — Phase-7-Regressionstests: WIP-Auto-Stash
   (dirty tracked File im Stash + Reset + INFO-Log, untracked File per
   `stash pop` verifiziert, clean Worktree ohne Stash-Eintrag, Stash-Failure
   via git-PATH-Wrapper ohne EnsureRepo-Fehler)
+- `internal/hash/` — `ComputeWithInputs` nimmt zusätzlich die Inhalte von
+  `env_files` und Vault-Templates (SHA-256-Digests); `env_file_contents` ist
+  additiv mit `omitempty`, daher **ohne** Schema-Bump (Stacks ohne env_files
+  behalten ihren Hash, Golden-Vektor unverändert)
 - `internal/hash/` — Deterministisches Stack-Hashing (Package `stackhash`,
   Schema-Version 3): kanonische Serialisierung von Stack (inkl. Compose-
   File-Liste, effective Services, ignore_services und
@@ -250,7 +258,13 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
   RWMutex-gesichert, /status liest aus HTTP-Goroutines parallel zum Poll-Loop
 - `internal/dotenv/` — Minimaler dotenv-Dialekt (Parse/Format), geteilt von
   SOPS-Output, env_files, Vault-Templates und der erzeugten
-  `--env-file`/Stack-`.env`
+  `--env-file`/Stack-`.env`; `Format` schreibt Wert-Text wörtlich,
+  `Literal`/`EscapeQuoted` erzeugen Text, den compose als exakt den Wert liest
+  (Quoting nur bei Bedarf). `env.Merge` liefert `Values` (Hooks) und `Dotenv`
+  (Env-Dateien): Nutzertext (env_files, sops, Template-Text) bleibt
+  compose-Syntax, eingesetzte Vault-Werte/Systemvariablen werden escaped
+  (Templates kontextabhängig: `"…"`, `'…'`, unquotiert; Round-Trip-Test gegen
+  echtes `docker compose config` in `internal/env/compose_roundtrip_test.go`)
 - `internal/secrets/` — `Resolver`-Interface (abstrahiert SOPS-Dateien und
   Vault-Pfade für den Env-Merge) und `VaultReader` (ReadKV-Teilmenge für
   `env.RenderVaultTemplate`)
@@ -273,7 +287,12 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
   Mode und Gruppe vor dem Rename, Default 0600, Gruppenfehler nur WARN;
   bewusst nicht im Stack-Hash)
 - `internal/hooks/` — Hook-Engine: sequenzielle `sh -c`-Ausführung mit
-  Per-Kommando-Timeout (Prozessgruppen-Kill) und slog-Output
+  Per-Kommando-Timeout (Prozessgruppen-Kill) und slog-Output; Hooks erben aus
+  der Agent-Umgebung nur eine Allowlist (`baseEnv`: PATH/HOME/…, `LC_*`,
+  `DOCKER_*` des CLI) plus `DOCKOPS_HOOK_PASSTHROUGH` — nie Agent-Credentials
+- `internal/redact/` — `URLs` maskiert Zugangsdaten in URLs (`user:***@`,
+  Token-als-User bei http(s)); angewendet auf git-Fehler/-Logs (fließen in
+  `repo_failed`) und `host_repo.url` in `/status`
 - `internal/compose/` — Compose-Executor: `docker compose up/down` mit
   deterministischem Projektnamen (`-p <stack-name>`), einem `-f` pro
   Compose-Datei in Listenreihenfolge, Service-Filter als positionale
@@ -366,6 +385,15 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
   wieder entfernt), blockierter Digest wird nicht erneut versucht, lokal
   gebautes Image und nicht deployter Stack werden übersprungen, genau ein
   `update_failed` je Versuch, `healthPoll` = 1ms (keine echten sleeps)
+- `internal/reconciler/runningdigest_test.go` — Ist-Digest statt Tag: der
+  Update-Check vergleicht, was die **Container** fahren
+  (`ServiceImageIDs` + `ImageRepoDigest`, Tag nur ohne Container), Services
+  mit gemeinsamem Image teilen einen Record (`ImageRecord.Services`, Apply und
+  Rollback für alle), Rollback setzt den Tag per `TagImage` zurück auf
+  `previous_digest` (in-process und nach `rolled_back` des Helpers), der
+  Self-Update-Fallback urteilt erst nach dem Helper-Fenster und nach dem
+  Container-Digest, der Helper startet vom Agent-Image (`selfImage` =
+  Image-ID des eigenen Containers)
 - `internal/compose/phase11_test.go` — `Pull`/`UpOverride`-argv (Override-Datei
   hinter den Stack-Files, `--no-deps`, positionale Services) und `Service` aus
   `compose ps --format json`
@@ -426,6 +454,15 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
   Fehler → ein POST, Prune-Fehler → `prune_failed`, Repo-Fehler →
   `repo_failed`, kein Notifier-Bau ohne Block, `notifications active` einmal
   pro Pass
+- `internal/reconciler/isolation_test.go`/`backoff_test.go` — Robustheit:
+  `config.LoadLenient` isoliert kaputte Stack-Definitionen
+  (`Config.StackErrors`, Prune in dem Pass ausgesetzt; `config.Load` bleibt
+  strikt); fehlgeschlagene Stacks mit gleichem Hash werden mit Backoff
+  wiederholt (`State.Failures`, `retryDelay`: sofort, dann 1 min verdoppelnd
+  bis 30 min; `RetryNow(ctx)` für Webhook-Pässe); Pull-Fehler blockieren den
+  Digest nicht. Alle externen Aufrufe haben Fristen (compose `command` mit
+  Prozessgruppen-Kill, git `runGit`, Vault 30 s, sops 2 min); `/healthz`
+  meldet 503 bei hängendem Durchlauf (`webhook.Deps.Liveness`)
 - `internal/reconciler/phase6c_test.go` — Phase-6c-Regressionstests: die
   drei Prune-Fälle (a/b/c), Skip-über-Prune-Pass (identischer Hash deployt
   nicht neu) und der unterbrochene Pass (State-Dir wird mid-Pass read-only,
@@ -463,6 +500,14 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
 - `PHASE6C_TASK.md` — Aufgabenstellung (nicht ändern)
 
 ## Konventionen
+
+- Sicherheit: HTTP-Endpunkte sind ohne Credential **abgeschaltet** (503),
+  nie offen — `/webhook` ohne `DOCKOPS_WEBHOOK_SECRET`, `/logs*` ohne
+  `DOCKOPS_LOGS_TOKEN`, `/restart` ohne `DOCKOPS_RESTART_TOKEN` (Übergang:
+  Webhook-Auth, solange nur das Secret gesetzt ist). Ausnahme mit Absicht:
+  `/status` ohne `DOCKOPS_STATUS_TOKEN` (Monitoring). Der SOPS-Sidecar prüft
+  `SOPS_SIDECAR_TOKEN` (Agent: `DOCKOPS_SOPS_SIDECAR_TOKEN`). URLs aus der
+  Konfiguration laufen vor Logs/Fehlern/Antworten durch `redact.URLs`.
 
 - Logging ausschließlich über stdlib `log/slog` (kein anderes Log-Paket).
 - Tests mit stdlib `testing`, kein testify. Fixtures über `t.TempDir()`

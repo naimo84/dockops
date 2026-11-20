@@ -47,6 +47,14 @@ import (
 // compose edit moved the hash. The digests cover the template *text*, i.e.
 // the deployment recipe, not the resolved values: rotating a secret in Vault
 // still does not redeploy anything.
+//
+// The env_files contents (EnvFileContents) came later WITHOUT a bump, on
+// purpose: the field is omitted when empty, so every stack without env_files
+// — and every caller that passes no contents, the golden vector included —
+// keeps a byte-identical canonical form and therefore its hash. Only stacks
+// with env_files get a new hash, once, which redeploys exactly them (the safe
+// direction). A bump would have redeployed every stack on every host, hooks
+// included, for no change of theirs.
 const schemaVersion = 4
 
 // canonicalStack is the fixed, JSON-serializable projection of a
@@ -71,6 +79,12 @@ type canonicalStack struct {
 	VaultEnvTemplateContents []string       `json:"vault_env_template_contents"`
 	Hooks                    canonicalHooks `json:"hooks"`
 	Compose                  []any          `json:"compose"`
+	// EnvFileContents carries one SHA-256 hex digest per env_files entry, in
+	// EnvFiles order: plaintext configuration (an image tag, a feature flag)
+	// is deployment recipe like the compose file, and a change must
+	// redeploy. Omitted when empty — see schemaVersion for why that keeps
+	// every other hash stable.
+	EnvFileContents []string `json:"env_file_contents,omitempty"`
 }
 
 // canonicalSopsFile is the hash-relevant projection of config.SopsFile.
@@ -136,15 +150,35 @@ func Compute(stack config.Stack, composeContents ...[]byte) (string, error) {
 // A nil or empty templateContents hashes no digests, so a stack without
 // templates hashes identically either way.
 func ComputeWithTemplates(stack config.Stack, templateContents [][]byte, composeContents ...[]byte) (string, error) {
+	return ComputeWithInputs(stack, Inputs{VaultEnvTemplates: templateContents}, composeContents...)
+}
+
+// Inputs are the contents of the files a stack references by path that enter
+// the hash as SHA-256 digests next to the compose documents. Each list holds
+// one content per entry of the matching stack field, in that order, or is
+// empty when the caller has no access to the files.
+type Inputs struct {
+	// VaultEnvTemplates are the contents of stack.VaultEnvTemplates.
+	VaultEnvTemplates [][]byte
+	// EnvFiles are the contents of stack.EnvFiles.
+	EnvFiles [][]byte
+}
+
+// ComputeWithInputs is Compute plus the contents of the stack's vault env
+// templates and env_files (see Inputs). The deploy path passes both, so an
+// edit of either redeploys the stack. Only file text enters the hash, never
+// a value resolved from a secret store.
+func ComputeWithInputs(stack config.Stack, in Inputs, composeContents ...[]byte) (string, error) {
+	templateContents := in.VaultEnvTemplates
 	if len(templateContents) != 0 && len(templateContents) != len(stack.VaultEnvTemplates) {
 		return "", fmt.Errorf("stack %s: %d template contents for %d vault_env_templates",
 			stack.Name, len(templateContents), len(stack.VaultEnvTemplates))
 	}
-	digests := make([]string, len(templateContents))
-	for i, content := range templateContents {
-		sum := sha256.Sum256(content)
-		digests[i] = hex.EncodeToString(sum[:])
+	if len(in.EnvFiles) != 0 && len(in.EnvFiles) != len(stack.EnvFiles) {
+		return "", fmt.Errorf("stack %s: %d env file contents for %d env_files",
+			stack.Name, len(in.EnvFiles), len(stack.EnvFiles))
 	}
+	digests := contentDigests(templateContents)
 	files := stack.EffectiveComposeFiles()
 	if len(files) != len(composeContents) {
 		return "", fmt.Errorf("stack %s: %d compose contents for %d compose files", stack.Name, len(composeContents), len(files))
@@ -171,6 +205,7 @@ func ComputeWithTemplates(stack config.Stack, templateContents [][]byte, compose
 		VaultPaths:               nilIfEmpty(stack.VaultPaths),
 		VaultEnvTemplates:        nilIfEmpty(stack.VaultEnvTemplates),
 		VaultEnvTemplateContents: nilIfEmpty(digests),
+		EnvFileContents:          nilIfEmpty(contentDigests(in.EnvFiles)),
 		Hooks: canonicalHooks{
 			PreDeploy:  nilIfEmpty(stack.Hooks.PreDeploy),
 			PostDeploy: nilIfEmpty(stack.Hooks.PostDeploy),
@@ -186,6 +221,16 @@ func ComputeWithTemplates(stack config.Stack, templateContents [][]byte, compose
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// contentDigests returns the SHA-256 hex digest of every content, in order.
+func contentDigests(contents [][]byte) []string {
+	digests := make([]string, len(contents))
+	for i, content := range contents {
+		sum := sha256.Sum256(content)
+		digests[i] = hex.EncodeToString(sum[:])
+	}
+	return digests
 }
 
 // nilIfEmptyAny is nilIfEmpty for the canonical compose document list (all

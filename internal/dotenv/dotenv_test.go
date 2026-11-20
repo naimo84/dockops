@@ -50,3 +50,38 @@ func TestRoundTrip(t *testing.T) {
 		t.Errorf("Parse(Format(env)) = %v, want %v", got, env)
 	}
 }
+
+func TestLiteral(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		// Values compose reads verbatim stay as they are, so ordinary
+		// generated files keep their KEY=value form.
+		{"plain", "pg-secret", "pg-secret"},
+		{"inner space", "two words", "two words"},
+		{"url", "https://x.example/p?a=b&c=d", "https://x.example/p?a=b&c=d"},
+		{"inner tab", "a\tb", "a\tb"},
+		{"empty", "", ""},
+		{"utf-8", "päss→wört", "päss→wört"},
+		// Everything compose would read differently gets quoted.
+		{"dollar", "pa$word", `"pa$$word"`},
+		{"braced reference", "${HOME}", `"$${HOME}"`},
+		{"inline comment", "abc #1", `"abc #1"`},
+		{"hash", "a#b", `"a#b"`},
+		{"double quotes", `say "hi"`, `"say \"hi\""`},
+		{"leading single quote", "'x'", `"'x'"`},
+		{"backtick", "a`b", "\"a`b\""},
+		{"backslash", `back\slash`, `"back\\slash"`},
+		{"newline", "line1\nline2", `"line1\nline2"`},
+		{"carriage return", "a\rb", `"a\rb"`},
+		{"leading space", " x", `" x"`},
+		{"trailing tab", "x\t", "\"x\t\""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Literal(tc.in); got != tc.want {
+				t.Errorf("Literal(%q) = %s, want %s", tc.in, got, tc.want)
+			}
+		})
+	}
+}

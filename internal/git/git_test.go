@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestMain isolates all git invocations from the user's global and system
@@ -426,5 +427,49 @@ func TestHeadCommitOutsideWorkDir(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("HeadCommit() = %q, want %q", got, want)
+	}
+}
+
+// A clone URL may carry a token. git's failure — command line and git's own
+// output alike — travels into logs and repo_failed notifications, so the
+// token must be masked in both, and in the clone log line.
+func TestEnsureRepoMasksURLCredentials(t *testing.T) {
+	t.Setenv("GIT_TERMINAL_PROMPT", "0")
+	m, logs, _ := newLoggedManager(t)
+
+	_, err := m.EnsureRepo("host", "https://deploy:tok3n-s3cret@127.0.0.1:1/host.git", "main")
+	if err == nil {
+		t.Fatal("EnsureRepo() against an unreachable remote error = nil, want the clone failure")
+	}
+	if strings.Contains(err.Error(), "tok3n-s3cret") {
+		t.Errorf("error leaks the token: %v", err)
+	}
+	if !strings.Contains(err.Error(), "https://deploy:***@127.0.0.1:1/host.git") {
+		t.Errorf("error lacks the masked URL: %v", err)
+	}
+	if strings.Contains(logs.String(), "tok3n-s3cret") {
+		t.Errorf("log leaks the token:\n%s", logs.String())
+	}
+}
+
+// A git command that never returns would stop the reconcile loop; every
+// command has a deadline, and the deadline ends git's children too.
+func TestRunGitHasADeadline(t *testing.T) {
+	binDir := t.TempDir()
+	script := "#!/bin/sh\nsleep 30\n"
+	if err := os.WriteFile(filepath.Join(binDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	m, _ := newManager(t)
+	m.timeout = 100 * time.Millisecond
+
+	start := time.Now()
+	_, err := m.HeadCommit(t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "timed out after 100ms") {
+		t.Errorf("HeadCommit() error = %v, want a timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("hung git took %s, want the deadline to end it promptly", elapsed)
 	}
 }

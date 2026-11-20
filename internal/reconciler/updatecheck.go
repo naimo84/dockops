@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -169,44 +170,79 @@ func (r *Reconciler) checkImageUpdates(ctx context.Context, cfg *config.Config, 
 }
 
 // checkStackImages compares the checkable images of one stack and returns the
-// records. st supplies the
-// previous records: the false→true transition (or a new remote digest next to
-// an old one) is what turns into a notification, so an unchanged remote
-// digest stays silent across passes.
+// records, one per image reference. st supplies the previous records: the
+// false→true transition (or a new remote digest next to an old one) is what
+// turns into a notification, so an unchanged remote digest stays silent
+// across passes.
+//
+// The current digest is what the containers run (see runningDigests), not
+// where the tag points: a pull moves the tag without recreating anything, and
+// a rollback recreates from a digest while the tag stays on the image that
+// failed. Services that share one image reference share one record (Services
+// lists them all), so an apply updates them together.
 func (r *Reconciler) checkStackImages(ctx context.Context, stack config.Stack, images map[string]string, st state.State, resolver registry.Resolver, now time.Time, pn *passNotify) map[string]state.ImageRecord {
-	recs := make(map[string]state.ImageRecord, len(images))
-	notified := make(map[string]struct{}, len(images))
-
+	byRef := make(map[string][]string, len(images))
 	for _, service := range checkableServices(stack, images) {
-		ref := images[service]
-		rec := state.ImageRecord{Service: service, CheckedAt: now}
+		byRef[images[service]] = append(byRef[images[service]], service)
+	}
+	recs := make(map[string]state.ImageRecord, len(byRef))
+	if len(byRef) == 0 {
+		return recs
+	}
+	running, err := r.compose.ServiceImageIDs(ctx, stack.Name)
+	if err != nil {
+		// Without the container view the tag is the best remaining answer:
+		// it is what a recreate would run.
+		r.logger.Warn("image update check: cannot list the stack's containers; comparing the image tags instead",
+			"stack", stack.Name, "error", err)
+		running = nil
+	}
 
-		local, err := r.compose.ImageDigest(ctx, ref)
+	for _, ref := range sortedKeys(byRef) {
+		services := byRef[ref] // sorted: checkableServices sorts
+		label := strings.Join(services, ",")
+		rec := state.ImageRecord{Service: services[0], CheckedAt: now}
+		if len(services) > 1 {
+			rec.Services = services
+		}
+
+		digests, err := r.runningDigests(ctx, ref, services, running)
 		if err != nil {
 			// No local digest means no comparison: record why and stay
 			// silent, exactly like an unreadable registry answer.
 			rec.Error = fmt.Sprintf("image inspect: %v", err)
-			r.logger.Warn("image update check: cannot inspect local image", "stack", stack.Name, "service", service, "image", ref, "error", err)
+			r.logger.Warn("image update check: cannot inspect local image", "stack", stack.Name, "service", label, "image", ref, "error", err)
 			recs[ref] = rec
 			continue
 		}
-		if local == "" {
+		if slices.Contains(digests, "") {
 			rec.Error = locallyBuiltImage
-			r.logger.Debug("image update check: locally built image, nothing to compare", "stack", stack.Name, "service", service, "image", ref)
+			r.logger.Debug("image update check: locally built image, nothing to compare", "stack", stack.Name, "service", label, "image", ref)
 			recs[ref] = rec
 			continue
 		}
-		rec.CurrentDigest = local
+		rec.CurrentDigest = digests[0]
 
 		remote, err := resolver.RemoteDigest(ctx, ref)
 		if err != nil {
 			rec.Error = err.Error()
-			r.logger.Warn("image update check: registry lookup failed", "stack", stack.Name, "service", service, "image", ref, "error", err)
+			r.logger.Warn("image update check: registry lookup failed", "stack", stack.Name, "service", label, "image", ref, "error", err)
 			recs[ref] = rec
 			continue
 		}
 		rec.RemoteDigest = remote
-		rec.UpdateAvailable = remote != "" && remote != local
+		if remote != "" {
+			// Any container that does not run the remote digest is behind;
+			// the first such digest is the current one (and the rollback
+			// target of an apply).
+			for _, d := range digests {
+				if d != remote {
+					rec.CurrentDigest = d
+					rec.UpdateAvailable = true
+					break
+				}
+			}
+		}
 
 		prev := st.Images[ref]
 		// The phase-11 apply bookkeeping survives a re-check: this record is
@@ -234,10 +270,7 @@ func (r *Reconciler) checkStackImages(ctx context.Context, stack config.Stack, i
 			// New digest (including the very first check that already finds
 			// a newer image): one event. The recorded digest makes the next
 			// pass silent even before the notifier's dedupe window applies.
-			if _, ok := notified[ref]; !ok {
-				notified[ref] = struct{}{}
-				pn.updateAvailable(ctx, stack.Name, st.Hash, updateText(service, ref, local, remote))
-			}
+			pn.updateAvailable(ctx, stack.Name, st.Hash, updateText(label, ref, rec.CurrentDigest, remote))
 		case !rec.UpdateAvailable && prev.UpdateAvailable:
 			// Back in sync (the image was pulled, the stack redeployed, or
 			// the tag moved back): drop the notifier's dedupe key so the
@@ -247,6 +280,41 @@ func (r *Reconciler) checkStackImages(ctx context.Context, stack config.Stack, i
 		recs[ref] = rec
 	}
 	return recs
+}
+
+// runningDigests returns the distinct repository digests (sorted) of the
+// images the given services run for ref; "" stands for an image without a
+// digest for ref's repository (built locally). A service without containers
+// contributes the tag's digest instead — what its next recreate would run.
+func (r *Reconciler) runningDigests(ctx context.Context, ref string, services []string, running map[string][]string) ([]string, error) {
+	seen := make(map[string]bool)
+	var digests []string
+	add := func(d string) {
+		if !seen[d] {
+			seen[d] = true
+			digests = append(digests, d)
+		}
+	}
+	for _, service := range services {
+		ids := running[service]
+		if len(ids) == 0 {
+			d, err := r.compose.ImageDigest(ctx, ref)
+			if err != nil {
+				return nil, err
+			}
+			add(d)
+			continue
+		}
+		for _, id := range ids {
+			d, err := r.compose.ImageRepoDigest(ctx, id, ref)
+			if err != nil {
+				return nil, err
+			}
+			add(d)
+		}
+	}
+	sort.Strings(digests)
+	return digests, nil
 }
 
 // checkableServices returns the services of the resolved image map that the

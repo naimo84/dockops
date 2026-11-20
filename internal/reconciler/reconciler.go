@@ -108,8 +108,22 @@ type ComposeExecutor interface {
 
 	// ImageDigest returns the local repository digest of an image
 	// reference, "" when it has none (built locally) — compose.Executor's
-	// ImageDigest.
+	// ImageDigest. It answers for the tag, i.e. what a recreate would run.
 	ImageDigest(ctx context.Context, ref string) (string, error)
+
+	// ImageRepoDigest returns the repository digest an image ID (or
+	// reference) carries for ref's repository (compose.Executor's
+	// ImageRepoDigest).
+	ImageRepoDigest(ctx context.Context, image, ref string) (string, error)
+
+	// ServiceImageIDs returns the image IDs the containers of a project run,
+	// per service (compose.Executor.ServiceImageIDs) — what is deployed, not
+	// where the tag points.
+	ServiceImageIDs(ctx context.Context, project string) (map[string][]string, error)
+
+	// TagImage points a tag at an image (compose.Executor.TagImage); the
+	// rollback moves the tag back to the digest that runs again.
+	TagImage(ctx context.Context, source, target string) error
 
 	// Pull fetches the images of the named services, all of the project for
 	// an empty list (compose.Executor.Pull; phase-11 apply step).
@@ -235,6 +249,11 @@ type Deps struct {
 	// has no effect while Sops is injected.
 	SopsSidecarURL string
 
+	// SopsSidecarToken authenticates the decrypt requests to the sidecar
+	// (env DOCKOPS_SOPS_SIDECAR_TOKEN, matching SOPS_SIDECAR_TOKEN of the
+	// sidecar). Empty sends no credential.
+	SopsSidecarToken string
+
 	// NewVault, nil → vault.New. Called at most once per pass, and only
 	// when a stack actually has vault paths or vault templates.
 	NewVault VaultFactory
@@ -283,12 +302,12 @@ type Deps struct {
 	// process", exactly as before phase 12.
 	SelfUpdate bool
 
-	// SelfImage is the image the phase-13 deploy helper starts from (env
-	// DOCKOPS_SELF_IMAGE). A deploy plan has no target image, so the helper
-	// must run something the agent knows works; empty means "ask docker for
-	// the agent's own image" (docker inspect .Config.Image). It is not a
-	// default to be guessed: an unresolvable image is a hard error before
-	// the helper starts.
+	// SelfImage is the image the self-update and deploy helpers start from
+	// (env DOCKOPS_SELF_IMAGE, else the image ID of the agent's own
+	// container, see cmd/dockops). The helpers must run something the agent
+	// knows works — never a freshly pulled target. It is not a default to be
+	// guessed: a deploy helper without it is not started, and an image
+	// update then falls back to the target image with a warning.
 	SelfImage string
 
 	// SelfMounts are the agent's own mounts (docker inspect .Mounts), handed
@@ -369,6 +388,11 @@ type Reconciler struct {
 	// would invite per-stack configuration without a need.
 	healthPoll time.Duration
 
+	// healthStable is how long the health gate wants the services green
+	// before it passes (defaultHealthStable; tests shrink it). Unexported
+	// like healthPoll.
+	healthStable time.Duration
+
 	// Phase-12 self update: the self project, whether the detached helper
 	// path is enabled, and the docker run injection point. runHelper is
 	// unexported and defaults to the plain docker CLI in New; the tests
@@ -447,7 +471,7 @@ func New(deps Deps) *Reconciler {
 			// Sidecar mode: decrypt via the HTTP service instead of the
 			// local sops binary (fleet reality: the sops credentials live in
 			// the sidecar container, not in the dockops image).
-			sopsFn = sops.NewSidecar(deps.SopsSidecarURL, nil).DecryptFileKeyfile
+			sopsFn = sops.NewSidecar(deps.SopsSidecarURL, nil).WithToken(deps.SopsSidecarToken).DecryptFileKeyfile
 		} else {
 			sopsFn = sops.DecryptFileKeyfile
 		}
@@ -516,6 +540,7 @@ func New(deps Deps) *Reconciler {
 		injectedReg:   deps.Registry != nil,
 		newRegistry:   newRegistry,
 		healthPoll:    defaultHealthPoll,
+		healthStable:  defaultHealthStable,
 		selfProject:   deps.SelfProject,
 		selfUpdate:    deps.SelfUpdate,
 		selfContainer: selfContainer,
@@ -652,13 +677,24 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		remotePaths[name] = p
 	}
 
-	// 3. Full configuration: local stack discovery plus import merge.
-	cfg, err := config.Load(rootFile)
+	// 3. Full configuration: local stack discovery plus import merge. A
+	// broken stack definition only takes itself out (LoadLenient): it is
+	// reported, the other stacks deploy, and the prune is suspended below.
+	cfg, err := config.LoadLenient(rootFile)
 	if err != nil {
 		err = fmt.Errorf("reconciler: %w", err)
 		pn.repoFailed(ctx, HostRepoName, stageConfig, err)
 		errs = append(errs, err)
 		return errors.Join(errs...)
+	}
+	if len(cfg.StackErrors) > 0 {
+		for _, stackErr := range cfg.StackErrors {
+			r.logger.Error("stack definition cannot be loaded; the stack is skipped", "error", stackErr)
+		}
+		err := fmt.Errorf("reconciler: %d stack definition(s) cannot be loaded: %w",
+			len(cfg.StackErrors), errors.Join(cfg.StackErrors...))
+		pn.repoFailed(ctx, HostRepoName, stageConfig, err)
+		errs = append(errs, err)
 	}
 	// POST /restart acts on exactly this set: the freshly loaded stacks are
 	// cached so the endpoint needs neither git nor a second configuration
@@ -708,8 +744,16 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		}
 	}
 
-	// 5. Prune stacks that disappeared from the configuration.
-	if cfg.Global.PruneRemovedStacks {
+	// 5. Prune stacks that disappeared from the configuration — but never in
+	// a pass whose configuration is incomplete: a stack whose definition
+	// could not be loaded is missing from cfg.Stacks exactly like a removed
+	// one, and tearing it down over a typo is the worst possible outcome.
+	switch {
+	case !cfg.Global.PruneRemovedStacks:
+	case len(cfg.StackErrors) > 0:
+		r.logger.Warn("prune suspended: the configuration is incomplete",
+			"broken_stack_definitions", len(cfg.StackErrors))
+	default:
 		errs = append(errs, r.prune(ctx, cfg, pn)...)
 	}
 
@@ -775,7 +819,29 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		}
 		templateContents = append(templateContents, content)
 	}
-	newHash, err := stackhash.ComputeWithTemplates(stack, templateContents, contents...)
+	// env_files are plaintext deployment recipe (an image tag, a flag): an
+	// edit must redeploy. The generated .env contributes nothing, as above —
+	// the merge skips it as a source for the same reason.
+	envFileContents := make([][]byte, 0, len(stack.EnvFiles))
+	for _, rel := range stack.EnvFiles {
+		path := rel
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(stack.Dir, path)
+		}
+		if filepath.Clean(path) == generatedEnv {
+			envFileContents = append(envFileContents, nil)
+			continue
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("stack %s: read env file %s: %w", stack.Name, path, err)
+		}
+		envFileContents = append(envFileContents, content)
+	}
+	newHash, err := stackhash.ComputeWithInputs(stack, stackhash.Inputs{
+		VaultEnvTemplates: templateContents,
+		EnvFiles:          envFileContents,
+	}, contents...)
 	if err != nil {
 		return fmt.Errorf("stack %s: compute hash: %w", stack.Name, err)
 	}
@@ -800,6 +866,17 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		r.logger.Debug("stack unchanged, skipping", "stack", stack.Name, "hash", newHash)
 		return nil
 	}
+	// A stack that keeps failing with the same configuration is retried
+	// with a growing pause instead of on every poll (hooks, compose up and
+	// notifications included). A changed configuration has a new hash and
+	// is tried at once.
+	if st, ok := r.state.Get(stack.Name); ok && st.Status == state.StatusFailed && st.Hash == newHash && !retryNow(ctx) {
+		if remaining := retryDelay(st.Failures) - time.Since(st.UpdatedAt); remaining > 0 {
+			r.logger.Info("stack failed with this configuration before; backing off",
+				"stack", stack.Name, "failures", st.Failures, "retry_in", remaining.Round(time.Second))
+			return nil
+		}
+	}
 	r.logger.Info("deploying stack", "stack", stack.Name, "hash", newHash)
 
 	// Secrets: the Vault client is built and logged in lazily, at most once
@@ -811,37 +888,39 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		if err != nil {
 			err = fmt.Errorf("stack %s: vault: %w", stack.Name, err)
 			pn.deployFailed(ctx, stack.Name, stageSecrets, newHash, err)
-			r.markFailed(stack, newHash)
+			r.markFailed(stack, newHash, err)
 			return err
 		}
 	}
 
 	sysEnv := env.SystemVars{GitCommit: commitFor(stack.Dir, commits)}
 	resolver := &stackResolver{stack: stack, decrypt: r.sops, vault: vaultClient}
-	merged, err := env.MergeStackEnv(ctx, stack, resolver, stack.Dir, sysEnv)
+	merged, err := env.Merge(ctx, stack, resolver, stack.Dir, sysEnv)
 	if err != nil {
 		err = fmt.Errorf("stack %s: resolve environment: %w", stack.Name, err)
 		pn.deployFailed(ctx, stack.Name, stageSecrets, newHash, err)
-		r.markFailed(stack, newHash)
+		r.markFailed(stack, newHash, err)
 		return err
 	}
 
-	envFile, cleanup, err := env.WriteShm(merged)
+	// The env files carry the dotenv text (Vault values escaped so compose
+	// reads them verbatim), the hooks the plain values.
+	envFile, cleanup, err := env.WriteShm(merged.Dotenv)
 	if err != nil {
 		// The generated environment is part of the secret pipeline; a
 		// failure here aborts the deployment just like a resolution error.
 		err = fmt.Errorf("stack %s: write env file: %w", stack.Name, err)
 		pn.deployFailed(ctx, stack.Name, stageSecrets, newHash, err)
-		r.markFailed(stack, newHash)
+		r.markFailed(stack, newHash, err)
 		return err
 	}
 	defer cleanup()
 
-	hookEnv := envList(merged)
+	hookEnv := envList(merged.Values)
 	if err := r.hooks.Run(ctx, stack.Hooks.PreDeploy, stack.Dir, hookEnv, hookTimeout); err != nil {
 		err = fmt.Errorf("stack %s: pre_deploy: %w", stack.Name, err)
 		pn.deployFailed(ctx, stack.Name, stagePreDeploy, newHash, err)
-		r.markFailed(stack, newHash)
+		r.markFailed(stack, newHash, err)
 		return err
 	}
 
@@ -854,11 +933,11 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	// remove or revert it, and the next deployment regenerates it. It is
 	// deliberately not part of the stack hash: a changed secret value must
 	// not trigger a redeployment (Komodo reality; see env.WriteStackEnv).
-	stackEnvPath, rollbackStackEnv, err := env.WriteStackEnv(stack.Dir, merged, envFileOpts)
+	stackEnvPath, rollbackStackEnv, err := env.WriteStackEnv(stack.Dir, merged.Dotenv, envFileOpts)
 	if err != nil {
 		err = fmt.Errorf("stack %s: write stack env file: %w", stack.Name, err)
 		pn.deployFailed(ctx, stack.Name, stageSecrets, newHash, err)
-		r.markFailed(stack, newHash)
+		r.markFailed(stack, newHash, err)
 		return err
 	}
 	r.logger.Debug("wrote stack env file", "stack", stack.Name, "path", stackEnvPath)
@@ -877,7 +956,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 			rollbackStackEnv()
 			err = fmt.Errorf("stack %s: up: %w", stack.Name, err)
 			pn.deployFailed(ctx, stack.Name, stageComposeUp, newHash, err)
-			r.markFailed(stack, newHash)
+			r.markFailed(stack, newHash, err)
 			return err
 		}
 		// No rollbackStackEnv from here on: the helper reads the generated
@@ -909,7 +988,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		rollbackStackEnv()
 		err = fmt.Errorf("stack %s: up: %w", stack.Name, err)
 		pn.deployFailed(ctx, stack.Name, stageComposeUp, newHash, err)
-		r.markFailed(stack, newHash)
+		r.markFailed(stack, newHash, err)
 		return err
 	}
 
@@ -956,10 +1035,16 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 // non-deployed status as changed), and persists the record immediately (see
 // the per-stack save in deployStack). The bookkeeping itself must never mask
 // the original failure, so Set and Save errors are only logged.
-func (r *Reconciler) markFailed(stack config.Stack, newHash string) {
+func (r *Reconciler) markFailed(stack config.Stack, newHash string, cause error) {
+	failures := 1
+	if prev, ok := r.state.Get(stack.Name); ok && prev.Status == state.StatusFailed && prev.Hash == newHash {
+		failures = prev.Failures + 1
+	}
 	if err := r.state.Set(stack.Name, state.State{
 		Hash:         newHash,
 		Status:       state.StatusFailed,
+		Failures:     failures,
+		LastError:    lastError(cause),
 		StackDir:     stack.Dir,
 		ComposeFile:  stack.ComposeFile,
 		ComposeFiles: stack.ComposeFiles,
@@ -971,6 +1056,59 @@ func (r *Reconciler) markFailed(stack config.Stack, newHash string) {
 	if err := r.state.Save(); err != nil {
 		r.logger.Error("cannot persist failed state", "stack", stack.Name, "error", err)
 	}
+}
+
+// maxLastError bounds the failure text kept in the state (and shown in
+// GET /status): enough for the compose or hook message, not a log dump.
+const maxLastError = 1024
+
+// lastError renders a deployment failure for State.LastError, bounded to
+// maxLastError bytes.
+func lastError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := err.Error()
+	if len(text) > maxLastError {
+		text = text[:maxLastError] + "..."
+	}
+	return text
+}
+
+// maxRetryDelay caps the back-off of a failing stack. Some fixes do not
+// change the stack hash — a secret added in Vault, an image pushed again —
+// and must still land without an operator: half an hour at most.
+const maxRetryDelay = 30 * time.Minute
+
+// retryDelay is the pause before the next attempt of a stack whose last
+// failures attempts with the same configuration failed: the first retry runs
+// on the next pass (a transient failure heals quickly), then the pause
+// doubles from one minute up to maxRetryDelay.
+func retryDelay(failures int) time.Duration {
+	if failures <= 1 {
+		return 0
+	}
+	if failures-2 >= 6 {
+		return maxRetryDelay
+	}
+	return min(time.Minute<<(failures-2), maxRetryDelay)
+}
+
+// retryNowKey marks a pass whose failed stacks skip their back-off.
+type retryNowKey struct{}
+
+// RetryNow returns a context for a pass that retries failed stacks
+// immediately, back-off or not. The CLI uses it for passes a webhook
+// triggered: an explicit request means "try now" — after fixing a secret in
+// Vault, say, which no hash change announces.
+func RetryNow(ctx context.Context) context.Context {
+	return context.WithValue(ctx, retryNowKey{}, true)
+}
+
+// retryNow reports whether ctx carries RetryNow.
+func retryNow(ctx context.Context) bool {
+	v, _ := ctx.Value(retryNowKey{}).(bool)
+	return v
 }
 
 // prune tears down every state entry whose stack no longer exists in the
@@ -1030,24 +1168,41 @@ func (r *Reconciler) pruneStack(ctx context.Context, name string, st state.State
 		if st.StackDir == "" || !allRegularFiles(st.ComposeFiles) {
 			return r.compose.DownProject(ctx, name)
 		}
-		envFile, cleanup, err := env.WriteShm(map[string]string{})
-		if err != nil {
-			return fmt.Errorf("write empty env file: %w", err)
-		}
-		defer cleanup()
-		ghost := config.Stack{Name: name, ComposeFiles: st.ComposeFiles}
-		return r.compose.Down(ctx, ghost, st.StackDir, envFile)
+		return r.downWithFiles(ctx, name, st, config.Stack{Name: name, ComposeFiles: st.ComposeFiles})
 	}
 	if st.ComposeFile != "" && st.StackDir != "" && regularFileExists(st.ComposeFile) {
-		envFile, cleanup, err := env.WriteShm(map[string]string{})
+		return r.downWithFiles(ctx, name, st, config.Stack{Name: name, ComposeFile: st.ComposeFile})
+	}
+	return r.compose.DownProject(ctx, name)
+}
+
+// downWithFiles tears a removed stack down with its compose files. compose
+// interpolates for down as well, so the environment matters: the stack's
+// generated .env when it is still there (the variables resolve as they did
+// for up), an empty file otherwise. If the full down still fails — a
+// ${VAR:?} nothing fills, a file that no longer parses — the project name
+// takes over, exactly as for a vanished directory; retrying the same failing
+// command on every pass would never get the stack down.
+func (r *Reconciler) downWithFiles(ctx context.Context, name string, st state.State, ghost config.Stack) error {
+	envFile := filepath.Join(st.StackDir, ".env")
+	if !regularFileExists(envFile) {
+		empty, cleanup, err := env.WriteShm(map[string]string{})
 		if err != nil {
 			return fmt.Errorf("write empty env file: %w", err)
 		}
 		defer cleanup()
-		ghost := config.Stack{Name: name, ComposeFile: st.ComposeFile}
-		return r.compose.Down(ctx, ghost, st.StackDir, envFile)
+		envFile = empty
 	}
-	return r.compose.DownProject(ctx, name)
+	downErr := r.compose.Down(ctx, ghost, st.StackDir, envFile)
+	if downErr == nil {
+		return nil
+	}
+	r.logger.Warn("prune: down with the compose files failed; tearing down by project name",
+		"stack", name, "error", downErr)
+	if err := r.compose.DownProject(ctx, name); err != nil {
+		return errors.Join(downErr, err)
+	}
+	return nil
 }
 
 // allRegularFiles reports whether every path exists and is a regular file.
