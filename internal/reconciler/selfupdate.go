@@ -130,7 +130,18 @@ func (r *Reconciler) startSelfUpdate(ctx context.Context, stack config.Stack, re
 		return r.abandonSelfUpdate(stack.Name, recs, handed, fmt.Errorf("write plan: %w", err))
 	}
 
-	helperArgs, err := selfupdate.HelperArgs(plan, targets[0].Image, stateDir, fmt.Sprintf("%d", now.Unix()), r.selfContainer, r.selfMounts, r.selfUser, r.selfGroups)
+	// The helper runs the agent's own image — the build known to work on
+	// this host — not the target: the pull above already moved the target's
+	// tag, and a broken new build must not be the one that has to roll
+	// itself back. Without a known own image the target is the only choice
+	// left (the behaviour before this rule existed).
+	helperImage := strings.TrimSpace(r.selfImage)
+	if helperImage == "" {
+		helperImage = targets[0].Image
+		r.logger.Warn("self update: the agent's own image is unknown; the helper runs the new image",
+			"stack", stack.Name, "image", helperImage, "hint", "set "+envSelfImage)
+	}
+	helperArgs, err := selfupdate.HelperArgs(plan, helperImage, stateDir, fmt.Sprintf("%d", now.Unix()), r.selfContainer, r.selfMounts, r.selfUser, r.selfGroups)
 	if err != nil {
 		// Nothing was started: the pending markers still have to go.
 		r.logger.Error("self update: cannot build the helper command", "stack", stack.Name, "error", err)
@@ -142,7 +153,7 @@ func (r *Reconciler) startSelfUpdate(ctx context.Context, stack config.Stack, re
 	}
 
 	r.logger.Info("self update: helper started",
-		"stack", stack.Name, "services", services, "image", targets[0].Image,
+		"stack", stack.Name, "services", services, "image", targets[0].Image, "helper_image", helperImage,
 		"container", selfupdate.HelperName(plan, fmt.Sprintf("%d", now.Unix())))
 	return nil
 }
@@ -289,9 +300,36 @@ func (r *Reconciler) finalizeSelfUpdate(ctx context.Context) {
 	now := time.Now().UTC()
 	if haveResult {
 		r.applySelfUpdateResult(ctx, project, st, recs, pending, res, pn, now)
-	} else {
-		r.fallbackSelfUpdate(ctx, project, st, recs, pending, pn, now)
+		return
 	}
+	// No result is no verdict while the helper may still be working: a pass
+	// triggered in its grace period or health gate (a webhook, say) would
+	// otherwise judge a recreate that has not happened yet.
+	window := r.pendingWaitWindow(stateDir, false)
+	if pendingAt := oldestPendingAt(recs, pending); !pendingAt.IsZero() && now.Sub(pendingAt) <= window {
+		r.logger.Debug("self update: helper has not reported yet, staying pending",
+			"stack", project, "age", now.Sub(pendingAt), "window", window)
+		return
+	}
+	r.fallbackSelfUpdate(ctx, project, st, recs, pending, pn, now)
+}
+
+// oldestPendingAt returns the earliest PendingAt of the pending records (one
+// hand-over marks them all at once); zero when none carries a time — such a
+// record cannot be aged and counts as expired, like a deploy pending without
+// a timestamp.
+func oldestPendingAt(recs map[string]state.ImageRecord, refs []string) time.Time {
+	var oldest time.Time
+	for _, ref := range refs {
+		at := recs[ref].PendingAt
+		if at.IsZero() {
+			return time.Time{}
+		}
+		if oldest.IsZero() || at.Before(oldest) {
+			oldest = at
+		}
+	}
+	return oldest
 }
 
 // helperLogHint names the next diagnostic step for a helper that left no
@@ -434,11 +472,25 @@ func (r *Reconciler) bookDeploy(ctx context.Context, project string, st state.St
 // file — the window must never be zero, or a slow helper would be declared
 // dead on the first pass after the recreate.
 func (r *Reconciler) deployWaitWindow(stateDir string) time.Duration {
+	return r.pendingWaitWindow(stateDir, true)
+}
+
+// pendingWaitWindow is how long a pending hand-over may live without a result
+// before the finalization judges it on its own: the plan's grace period plus
+// its health timeout plus deployFinalizeSlack. An image plan may run the gate
+// twice — forward and, after a failure, the rollback — so it counts the
+// health timeout twice. The plan of the matching kind is the source; the
+// defaults stand in for a missing or unrelated plan file, so the window is
+// never zero.
+func (r *Reconciler) pendingWaitWindow(stateDir string, deploy bool) time.Duration {
 	grace := time.Duration(selfUpdateGraceSeconds) * time.Second
 	health := config.DefaultHealthTimeout
-	if plan, err := selfupdate.ReadPlan(selfupdate.PlanPath(stateDir)); err == nil && plan.Kind == selfupdate.KindDeploy {
+	if plan, err := selfupdate.ReadPlan(selfupdate.PlanPath(stateDir)); err == nil && (plan.Kind == selfupdate.KindDeploy) == deploy {
 		grace = time.Duration(plan.GraceSeconds) * time.Second
 		health = time.Duration(plan.HealthTimeoutSeconds) * time.Second
+	}
+	if !deploy {
+		health *= 2
 	}
 	return grace + health + deployFinalizeSlack
 }
@@ -508,6 +560,19 @@ func (r *Reconciler) applySelfUpdateResult(ctx context.Context, project string, 
 			recs[ref] = rec
 			texts = append(texts, fmt.Sprintf("%s: %s: %s", rec.Service, ref, errText))
 		}
+		// The agent pulled before the hand-over, so the tag points at the
+		// digest that failed; move it back like the in-process rollback does.
+		cands := make([]applyCandidate, 0, len(refs))
+		for _, ref := range refs {
+			cands = append(cands, applyCandidate{ref: ref, rec: recs[ref]})
+		}
+		if err := r.restoreTags(ctx, project, recs, cands); err != nil {
+			for _, ref := range refs {
+				rec := recs[ref]
+				rec.ApplyError += "; " + err.Error()
+				recs[ref] = rec
+			}
+		}
 		if res.Status == selfupdate.StatusRolledBack {
 			r.logger.Warn("self update: helper rolled back after a failed update", "stack", project, "error", res.Error)
 		} else {
@@ -533,9 +598,18 @@ func (r *Reconciler) fallbackSelfUpdate(ctx context.Context, project string, st 
 		failed    []string
 		changed   bool
 	)
+	// What the containers run decides, never the tag: the agent pulled
+	// before the hand-over, so the tag points at the target whether or not
+	// the helper ever recreated anything.
+	containers, err := r.compose.ServiceImageIDs(ctx, project)
+	if err != nil {
+		r.logger.Warn("self update: cannot list the stack's containers; keeping the update pending",
+			"stack", project, "error", err)
+		return
+	}
 	for _, ref := range refs {
 		rec := recs[ref]
-		running, err := r.compose.ImageDigest(ctx, ref)
+		running, err := r.containerDigest(ctx, ref, recordServices(rec), containers)
 		if err != nil {
 			r.logger.Warn("self update: cannot inspect the running digest; keeping the update pending",
 				"stack", project, "image", ref, "error", err)
@@ -602,6 +676,30 @@ func (r *Reconciler) fallbackSelfUpdate(ctx context.Context, project string, st 
 	if err := r.persistImageRecords(project, recs); err != nil {
 		r.logger.Error("self update: cannot persist the fallback state", "stack", project, "error", err)
 	}
+}
+
+// containerDigest returns the one repository digest (for ref's repository)
+// the containers of services run. "" — no verdict — when a service has no
+// container or the containers disagree (a recreate half done).
+func (r *Reconciler) containerDigest(ctx context.Context, ref string, services []string, containers map[string][]string) (string, error) {
+	digest := ""
+	for _, service := range services {
+		ids := containers[service]
+		if len(ids) == 0 {
+			return "", nil
+		}
+		for _, id := range ids {
+			d, err := r.compose.ImageRepoDigest(ctx, id, ref)
+			if err != nil {
+				return "", err
+			}
+			if digest != "" && d != digest {
+				return "", nil
+			}
+			digest = d
+		}
+	}
+	return digest, nil
 }
 
 // removeResult deletes a consumed result file; a failure is logged and left

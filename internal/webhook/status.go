@@ -167,6 +167,9 @@ type StackUpdates struct {
 type ServiceUpdate struct {
 	// Service is the compose service name.
 	Service string `json:"service"`
+	// Services lists every service running the image when several share it
+	// (they are updated and rolled back together); omitted for a single one.
+	Services []string `json:"services,omitempty"`
 	// Image is the image reference (the registry's identity of the image).
 	Image string `json:"image"`
 	// CurrentDigest is the locally recorded digest, empty for a locally
@@ -398,6 +401,7 @@ func buildStackUpdates(st state.State) *StackUpdates {
 		}
 		updates.Services = append(updates.Services, ServiceUpdate{
 			Service:         rec.Service,
+			Services:        append([]string(nil), rec.Services...),
 			Image:           ref,
 			CurrentDigest:   rec.CurrentDigest,
 			RemoteDigest:    rec.RemoteDigest,

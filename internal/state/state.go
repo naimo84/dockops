@@ -134,6 +134,13 @@ type ImageRecord struct {
 	// the reference is what the registry is asked about); the service name
 	// is kept so GET /status can name it without a compose call.
 	Service string `json:"service,omitempty"`
+	// Services lists every compose service that runs the image, sorted;
+	// Service is its first entry. Several services sharing one image (an app
+	// and its worker) are updated, gated and rolled back together — updating
+	// only one of them would leave the stack running two versions. Omitted
+	// when the image serves a single service, and absent in older files,
+	// which therefore read as "Service only".
+	Services []string `json:"services,omitempty"`
 	// CurrentDigest is the locally recorded repository digest
 	// (docker image inspect RepoDigests); empty for a locally built image.
 	CurrentDigest string `json:"current_digest,omitempty"`

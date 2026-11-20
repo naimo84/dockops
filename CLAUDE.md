@@ -366,6 +366,15 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
   wieder entfernt), blockierter Digest wird nicht erneut versucht, lokal
   gebautes Image und nicht deployter Stack werden übersprungen, genau ein
   `update_failed` je Versuch, `healthPoll` = 1ms (keine echten sleeps)
+- `internal/reconciler/runningdigest_test.go` — Ist-Digest statt Tag: der
+  Update-Check vergleicht, was die **Container** fahren
+  (`ServiceImageIDs` + `ImageRepoDigest`, Tag nur ohne Container), Services
+  mit gemeinsamem Image teilen einen Record (`ImageRecord.Services`, Apply und
+  Rollback für alle), Rollback setzt den Tag per `TagImage` zurück auf
+  `previous_digest` (in-process und nach `rolled_back` des Helpers), der
+  Self-Update-Fallback urteilt erst nach dem Helper-Fenster und nach dem
+  Container-Digest, der Helper startet vom Agent-Image (`selfImage` =
+  Image-ID des eigenen Containers)
 - `internal/compose/phase11_test.go` — `Pull`/`UpOverride`-argv (Override-Datei
   hinter den Stack-Files, `--no-deps`, positionale Services) und `Service` aus
   `compose ps --format json`
