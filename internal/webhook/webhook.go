@@ -85,6 +85,12 @@ type Deps struct {
 	// and with neither configured the endpoint is disabled (503).
 	RestartToken string
 
+	// Liveness reports whether the reconcile loop makes progress; a non-nil
+	// error turns GET /healthz into 503 with the error text, so a watchdog
+	// notices an agent whose loop hangs while its HTTP server still answers.
+	// Nil keeps /healthz a pure process liveness probe.
+	Liveness func() error
+
 	// Trigger fires a reconcile pass. It is called synchronously after
 	// successful webhook authentication and must not block (the CLI passes
 	// a non-blocking channel send that merges concurrent requests into one
@@ -148,6 +154,7 @@ type Deps struct {
 type Handler struct {
 	secret       string
 	restartToken string
+	liveness     func() error
 	trigger      func()
 	// restart serves POST /restart (Deps.Restart); nil → 503.
 	restart RestartFunc
@@ -175,6 +182,7 @@ func New(deps Deps) *Handler {
 	return &Handler{
 		secret:       deps.Secret,
 		restartToken: deps.RestartToken,
+		liveness:     deps.Liveness,
 		trigger:      deps.Trigger,
 		restart:      deps.Restart,
 		logger:       logger,
@@ -203,6 +211,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Allow", http.MethodGet)
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
+		}
+		if h.liveness != nil {
+			if err := h.liveness(); err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))

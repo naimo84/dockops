@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/local/dockops/internal/config"
 	"github.com/local/dockops/internal/dotenv"
@@ -93,6 +94,9 @@ func decrypt(ctx context.Context, path string, extraEnv []string) (map[string]st
 	return dotenv.Parse(out), nil
 }
 
+// decryptTimeout bounds one sops invocation.
+const decryptTimeout = 2 * time.Minute
+
 // decryptContent runs the sops CLI on path with extraEnv appended to the
 // child environment and returns its raw stdout — the decrypted dotenv
 // plaintext. The sidecar handler serves exactly these bytes as the response
@@ -101,8 +105,13 @@ func decryptContent(ctx context.Context, path string, extraEnv []string) ([]byte
 	if _, err := exec.LookPath(binary); err != nil {
 		return nil, fmt.Errorf("sops: decrypt %s: sops binary not found in PATH", path)
 	}
+	// A key service (KMS, Vault transit) that stops answering must not stop
+	// the reconcile loop or a sidecar request.
+	ctx, cancel := context.WithTimeout(ctx, decryptTimeout)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, binary,
 		"-d", "--input-type", "dotenv", "--output-type", "dotenv", path)
+	cmd.WaitDelay = 10 * time.Second
 	cmd.Env = append(os.Environ(), extraEnv...)
 	// Output, not CombinedOutput: stdout carries the plaintext, stderr the
 	// diagnostics — mixing them would leak error text into the environment.

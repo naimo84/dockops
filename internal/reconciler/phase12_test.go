@@ -81,6 +81,7 @@ func (f *fixture) phase12Reconciler(composeExec ComposeExecutor, resolver regist
 		SelfUpdate:  true,
 	})
 	r.healthPoll = time.Millisecond
+	r.healthStable = 0
 	// Fixed identity: the helper inherits this container's mounts.
 	r.selfContainer = testSelfContainer
 	r.runHelper = helper

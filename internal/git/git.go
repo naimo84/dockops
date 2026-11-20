@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/local/dockops/internal/redact"
@@ -61,11 +62,19 @@ const excludeHeader = "# dockops: generated deployment artefacts, never reposito
 // diagnostics.
 const maxErrorOutput = 512
 
+// defaultTimeout bounds one git command. The reconcile loop is
+// single-threaded: a fetch that never returns (a stalled network, a server
+// that stops answering) would stop every later pass. Ten minutes leaves room
+// for the first clone of a large repository.
+const defaultTimeout = 10 * time.Minute
+
 // Manager clones and deterministically updates remote repositories below a
 // shared work directory (global.work_dir of the root configuration).
 type Manager struct {
 	workDir string
 	logger  *slog.Logger
+	// timeout is the per-command deadline (defaultTimeout; tests shorten it).
+	timeout time.Duration
 }
 
 // New creates a Manager managing checkouts below workDir. It verifies that
@@ -89,7 +98,7 @@ func New(workDir string, logger *slog.Logger) (*Manager, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Manager{workDir: abs, logger: logger}, nil
+	return &Manager{workDir: abs, logger: logger, timeout: defaultTimeout}, nil
 }
 
 // EnsureRepo guarantees that <workDir>/<name> is a checkout of url at the
@@ -462,15 +471,38 @@ func (m *Manager) checkOrigin(path, url string) error {
 // notifications.
 //
 // The public API has no context parameters (matching the briefing's
-// signatures); commands still run through exec.CommandContext with
-// context.Background so a context can be plumbed through Manager later
-// without touching call sites.
+// signatures); every command still runs with a deadline (Manager.timeout),
+// in its own process group so the deadline also ends the ssh or
+// remote-helper children git spawns, and with terminal prompts disabled: a
+// credential prompt nobody can answer must fail, not wait.
 func (m *Manager) runGit(dir string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(context.Background(), gitBinary, args...)
+	timeout := m.timeout
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, gitBinary, args...)
 	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			return err
+		}
+		return nil
+	}
+	cmd.WaitDelay = 10 * time.Second
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("git %s: %w%s", redact.URLs(strings.Join(args, " ")), err, redact.URLs(outputSuffix(out)))
+		command := redact.URLs(strings.Join(args, " "))
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("git %s: timed out after %s: %w%s", command, timeout, err, redact.URLs(outputSuffix(out)))
+		}
+		return nil, fmt.Errorf("git %s: %w%s", command, err, redact.URLs(outputSuffix(out)))
 	}
 	return out, nil
 }

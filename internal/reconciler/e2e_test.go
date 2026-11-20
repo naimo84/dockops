@@ -228,8 +228,11 @@ func withEnvFilePlaceholder(t *testing.T, args []string) []string {
 			continue
 		}
 		f := out[i+1]
-		if !filepath.IsAbs(f) || !strings.HasPrefix(filepath.Base(f), "dockops-") || !strings.HasSuffix(f, ".env") {
-			t.Errorf("env file argument %q is not an absolute dockops-*.env path", f)
+		// Either a generated tmpfs file (dockops-*.env) or a stack's
+		// generated .env (the prune interpolates with it when it survived).
+		generated := strings.HasPrefix(filepath.Base(f), "dockops-") && strings.HasSuffix(f, ".env")
+		if !filepath.IsAbs(f) || !(generated || filepath.Base(f) == ".env") {
+			t.Errorf("env file argument %q is neither a dockops-*.env path nor a stack .env", f)
 		}
 		out[i+1] = "<ENVFILE>"
 	}

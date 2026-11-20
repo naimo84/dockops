@@ -19,6 +19,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -32,10 +34,28 @@ const defaultBinary = "docker"
 // message or log entry (same limit as internal/git).
 const maxErrorOutput = 512
 
+// Command deadlines. The reconcile loop is single-threaded: one docker call
+// that never returns (a registry that stalls a pull, a wedged daemon) would
+// stop every later pass, so every call gets a deadline on top of the
+// caller's context. Changing calls (up, down, pull, restart, tag) may
+// legitimately take long — large images, slow stop timeouts — reads (config,
+// ps, inspect) must not.
+const (
+	defaultChangeTimeout = 30 * time.Minute
+	defaultReadTimeout   = 2 * time.Minute
+	// commandWaitDelay bounds how long a killed command may hold its output
+	// pipes open (a child process docker spawned) before Wait gives up.
+	commandWaitDelay = 10 * time.Second
+)
+
 // Executor runs docker compose commands for stacks.
 type Executor struct {
 	binary string
 	logger *slog.Logger
+	// changeTimeout and readTimeout are the per-command deadlines (see the
+	// defaults above); tests shorten them.
+	changeTimeout time.Duration
+	readTimeout   time.Duration
 	// selfContainer is the name (or ID) of the agent's own container, used to
 	// read the mount mappings that translate container paths into the
 	// daemon's namespace (see bindOverrideArgs). Empty means "runs on the
@@ -53,7 +73,42 @@ func New(logger *slog.Logger, binary string) *Executor {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Executor{binary: binary, logger: logger}
+	return &Executor{binary: binary, logger: logger, changeTimeout: defaultChangeTimeout, readTimeout: defaultReadTimeout}
+}
+
+// command builds the exec.Cmd of one docker call with its deadline: the
+// caller's context, bounded by timeout. The returned cancel must be called.
+func (e *Executor) command(ctx context.Context, timeout time.Duration, args []string) (*exec.Cmd, context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		timeout = defaultReadTimeout
+	}
+	cmdCtx, cancel := context.WithTimeout(ctx, timeout)
+	cmd := exec.CommandContext(cmdCtx, e.binary, args...)
+	// docker runs compose as a plugin child process: killing only the
+	// docker process would leave the plugin running (and holding the output
+	// pipes). The command gets its own process group, and cancellation
+	// kills the whole group — the same pattern as the hook engine.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			return err
+		}
+		return nil
+	}
+	cmd.WaitDelay = commandWaitDelay
+	return cmd, cmdCtx, cancel
+}
+
+// deadlineError turns a command failure caused by its own deadline (not the
+// caller's cancellation) into an error that says so; other errors pass.
+func deadlineError(cmdCtx, ctx context.Context, timeout time.Duration, command string, err error) error {
+	if errors.Is(cmdCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+		return fmt.Errorf("docker %s: timed out after %s: %w", command, timeout, err)
+	}
+	return nil
 }
 
 // WithSelfContainer returns a copy of the executor that knows the name (or ID)
@@ -471,12 +526,16 @@ func composeServiceNames(stack config.Stack, stackDir string) ([]string, error) 
 // and returns an error embedding the command and a bounded output excerpt
 // when it fails.
 func (e *Executor) run(ctx context.Context, args []string) error {
-	cmd := exec.CommandContext(ctx, e.binary, args...)
+	cmd, cmdCtx, cancel := e.command(ctx, e.changeTimeout, args)
+	defer cancel()
 	out, err := cmd.CombinedOutput()
 	command := strings.Join(args, " ")
 	if err != nil {
 		e.logger.Error("docker compose command failed",
 			"command", command, "error", err.Error(), "output", snippet(out))
+		if derr := deadlineError(cmdCtx, ctx, e.changeTimeout, command, err); derr != nil {
+			return fmt.Errorf("%w%s", derr, outputSuffix(out))
+		}
 		return fmt.Errorf("docker %s: %w%s", command, err, outputSuffix(out))
 	}
 	e.logger.Info("docker compose command finished", "command", command, "output", snippet(out))

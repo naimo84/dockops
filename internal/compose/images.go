@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"sort"
 	"strings"
 
@@ -216,7 +215,8 @@ func normalizeRepository(repo string) string {
 // keeps stdout and stderr apart — callers parse stdout as JSON — and embeds
 // both, bounded, into the error message when the command fails.
 func (e *Executor) query(ctx context.Context, args []string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, e.binary, args...)
+	cmd, cmdCtx, cancel := e.command(ctx, e.readTimeout, args)
+	defer cancel()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -225,6 +225,9 @@ func (e *Executor) query(ctx context.Context, args []string) ([]byte, error) {
 	if err != nil {
 		out := append(stderr.Bytes(), stdout.Bytes()...)
 		e.logger.Error("docker command failed", "command", command, "error", err.Error(), "output", snippet(out))
+		if derr := deadlineError(cmdCtx, ctx, e.readTimeout, command, err); derr != nil {
+			return nil, fmt.Errorf("%w%s", derr, outputSuffix(out))
+		}
 		return nil, fmt.Errorf("docker %s: %w%s", command, err, outputSuffix(out))
 	}
 	e.logger.Debug("docker command finished", "command", command)
