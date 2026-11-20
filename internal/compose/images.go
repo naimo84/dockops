@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 
 	"github.com/local/dockops/internal/config"
@@ -91,18 +92,86 @@ func (e *Executor) Images(ctx context.Context, req Request) (map[string]string, 
 // the image carries no RepoDigest at all — it was built locally and never
 // pulled, so it has no registry identity to compare against.
 func (e *Executor) ImageDigest(ctx context.Context, ref string) (string, error) {
-	if ref == "" {
-		return "", fmt.Errorf("docker image inspect: image reference must not be empty")
+	return e.ImageRepoDigest(ctx, ref, ref)
+}
+
+// ImageRepoDigest returns the repository digest that image — an image ID or
+// a reference — carries for ref's repository:
+//
+//	<binary> image inspect --format '{{json .RepoDigests}}' <image>
+//
+// "" with a nil error means the image has no digest for that repository (it
+// was built locally). With an image ID it answers what a container runs,
+// independent of where the tag points today.
+func (e *Executor) ImageRepoDigest(ctx context.Context, image, ref string) (string, error) {
+	if image == "" || ref == "" {
+		return "", fmt.Errorf("docker image inspect: image and reference must not be empty")
 	}
-	out, err := e.query(ctx, []string{"image", "inspect", "--format", "{{json .RepoDigests}}", ref})
+	out, err := e.query(ctx, []string{"image", "inspect", "--format", "{{json .RepoDigests}}", image})
 	if err != nil {
 		return "", err
 	}
 	var repoDigests []string
 	if err := json.Unmarshal(bytes.TrimSpace(out), &repoDigests); err != nil {
-		return "", fmt.Errorf("docker image inspect %s: parse RepoDigests: %w", ref, err)
+		return "", fmt.Errorf("docker image inspect %s: parse RepoDigests: %w", image, err)
 	}
 	return matchRepoDigest(ref, repoDigests), nil
+}
+
+// ServiceImageIDs returns, per compose service of project, the IDs of the
+// images its containers were created from — sorted, without duplicates:
+//
+//	<binary> ps --all --quiet --no-trunc --filter label=com.docker.compose.project=<project>
+//	<binary> inspect --format '<service label> <.Image>' <container>...
+//
+// This is what actually runs. An image tag is not: a pull moves the tag
+// without recreating anything, and a rollback recreates services from a
+// digest while the tag stays on the image that failed. A project without
+// containers yields an empty map; containers without a service label are
+// skipped.
+func (e *Executor) ServiceImageIDs(ctx context.Context, project string) (map[string][]string, error) {
+	if project == "" {
+		return nil, fmt.Errorf("docker ps: project name must not be empty")
+	}
+	out, err := e.query(ctx, []string{"ps", "--all", "--quiet", "--no-trunc",
+		"--filter", "label=com.docker.compose.project=" + project})
+	if err != nil {
+		return nil, err
+	}
+	ids := strings.Fields(string(out))
+	images := make(map[string][]string)
+	if len(ids) == 0 {
+		return images, nil
+	}
+	args := append([]string{"inspect", "--format",
+		`{{index .Config.Labels "com.docker.compose.service"}} {{.Image}}`}, ids...)
+	out, err = e.query(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(string(out), "\n") {
+		service, image, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok || service == "" || image == "" || seen[service+" "+image] {
+			continue
+		}
+		seen[service+" "+image] = true
+		images[service] = append(images[service], image)
+	}
+	for service := range images {
+		sort.Strings(images[service])
+	}
+	return images, nil
+}
+
+// TagImage points the tag target at the image source (docker tag). The
+// rollback uses it to move a tag back to the digest the stack runs again,
+// so the next deploy does not bring back the image that just failed.
+func (e *Executor) TagImage(ctx context.Context, source, target string) error {
+	if source == "" || target == "" {
+		return fmt.Errorf("docker tag: source and target must not be empty")
+	}
+	return e.run(ctx, []string{"tag", source, target})
 }
 
 // matchRepoDigest returns the digest of the RepoDigests entry whose

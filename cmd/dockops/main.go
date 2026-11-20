@@ -375,16 +375,16 @@ func selfProject() string {
 	return defaultSelfProject
 }
 
-// selfImage returns the image a phase-13 deploy helper runs. A deploy plan
-// has no target image, so the helper must start the build the agent itself
-// runs:
+// selfImage returns the image the self-update and deploy helpers run: the
+// build the agent itself runs, known to work on this host.
 //
 //   - DOCKOPS_SELF_IMAGE wins when set (the override for hosts where docker
-//     reports an unusable reference, e.g. a locally built image without a
-//     tag);
-//   - otherwise docker answers for the agent's own container
-//     (`docker inspect <container> --format '{{.Config.Image}}'`), which is
-//     exactly the image this process was created from.
+//     cannot answer for the agent's container);
+//   - otherwise docker answers for the agent's own container with the image
+//     ID (`docker inspect <container> --format '{{.Image}}'`). The ID, not
+//     the reference (.Config.Image): a pull moves the tag, and the image
+//     update path pulls right before it starts the helper — by reference the
+//     helper would run the new, untested build instead of this one.
 //
 // The lookup happens once at startup, not per pass: it needs the daemon, and
 // a per-pass shell-out would only add latency to a value that cannot change
@@ -403,7 +403,7 @@ func selfImage(getenv func(string) string, logger *slog.Logger) string {
 	}
 	// helperDockerBinary is the same "docker" the helper's own commands use
 	// (selfupdate.go); one string, one CLI.
-	out, err := exec.Command(helperDockerBinary, "inspect", "--format", "{{.Config.Image}}", host).Output()
+	out, err := exec.Command(helperDockerBinary, "inspect", "--format", "{{.Image}}", host).Output()
 	if err != nil {
 		logger.Warn("self image: docker does not know the agent's image; self-stack deploys stay in-process",
 			"container", host, "error", err, "hint", "set "+envSelfImage)

@@ -790,9 +790,16 @@ update_policy: notify           # notify (default) | pinned | apply
    heraus.
 2. Services aus `ignore_services` (bzw. außerhalb von `services`) werden nicht
    geprüft — was nicht deployt wird, wird auch nicht beobachtet.
-3. Lokaler Digest je Image: `docker image inspect --format '{{json
-   .RepoDigests}}'`. Ohne RepoDigest ist das Image **lokal gebaut** → Record
-   mit `error: "locally built image"`, kein Update-Alarm.
+3. Aktueller Digest je Image: der Digest des Images, das die **Container**
+   des Service tatsächlich fahren (`docker ps` über das compose-Projektlabel,
+   `docker inspect .Image`, dann `docker image inspect --format '{{json
+   .RepoDigests}}'` auf diese Image-ID) — nicht, worauf der Tag gerade zeigt:
+   ein Pull ohne Recreate verschiebt den Tag, der Stack läuft aber weiter auf
+   dem alten Image. Nur ein Service ohne Container fällt auf den Tag zurück
+   (das, was ein Recreate starten würde). Ohne RepoDigest ist das Image
+   **lokal gebaut** → Record mit `error: "locally built image"`, kein
+   Update-Alarm. Teilen sich mehrere Services ein Image (z.B. `app` und
+   `worker`), gibt es **einen** Record mit allen Services (`services`).
 4. Remote-Digest über die Registry-API v2 (`HEAD …/manifests/<tag>`,
    Bearer-Challenge inkl. Token-Cache pro Host, 10s pro Request).
 5. Vergleich → `update_available` im State. Registry-Fehler (404, 401,
@@ -915,7 +922,7 @@ stimmt den Apply-Schritt ab, nicht das Deployment.
 **Ablauf**, am Ende von `checkImageUpdates` — nur für `apply`-Stacks und nur
 in einem Pass, in dem die Prüfung für den Stack fällig war:
 
-1. **Kandidaten**: Records mit `update_available` (lokaler Digest != remote).
+1. **Kandidaten**: Records mit `update_available` (laufender Digest != remote).
    Übersprungen werden lokal gebaute Images (kein `CurrentDigest` → keine
    Registry-Identität, kein Rollback-Ziel), Stacks, deren Deployment in genau
    diesem Pass fehlgeschlagen ist, und Records, deren `apply_blocked_digest`
@@ -923,7 +930,8 @@ in einem Pass, in dem die Prüfung für den Stack fällig war:
    gescheitert, `apply` degradiert für ihn zu `notify`, bis der Tag auf einen
    anderen Digest wandert.
 2. **Pull**: `docker compose -p <stack> -f … pull <services…>`, nur die
-   betroffenen Services. Ein Pull-Fehler blockiert den Digest und meldet
+   betroffenen Services — bei einem geteilten Image alle Services, die es
+   fahren (sie werden gemeinsam aktualisiert und zurückgerollt). Ein Pull-Fehler blockiert den Digest und meldet
    `update_failed` mit Stage `pull` — es wird nichts recreated.
 3. **Recreate**: `up -d --no-deps <services…>` (derselbe Pfad wie `Up`,
    inklusive `--remove-orphans`), damit Nachbarn nicht mitgerissen werden.
@@ -937,6 +945,10 @@ in einem Pass, in dem die Prüfung für den Stack fällig war:
    `image: <repository>@<previous_digest>` und wird **nach** den
    Stack-Compose-Files übergeben (spätere Datei gewinnt), danach erneut
    `up --no-deps` + Health-Gate. Die Datei wird in jedem Fall wieder gelöscht.
+   Danach zeigt dockops den Tag per `docker tag <repository>@<previous_digest>
+   <image>` zurück auf den alten Digest: der Pull hatte ihn auf das gescheiterte
+   Image verschoben, und der nächste reguläre Deploy würde es sonst ohne
+   Health-Gate ausrollen.
    Ein fehlgeschlagener Rollback ist der Fall für einen Menschen: der Stack
    läuft dann weder auf dem alten noch verlässlich auf dem neuen Digest
    (`update_failed`, Stage `rollback`).
@@ -988,7 +1000,11 @@ Helper-Container** den Recreate.
    `pending_at`; `previous_digest` ist das Rollback-Ziel.
 2. Er startet `docker run -d --rm --name dockops-selfupdate-<projekt>-<unix>`
    mit `/var/run/docker.sock`, dem Stack-Verzeichnis und dem State-Dir — beide
-   am **identischen Host-Pfad** — sowie dem gerade gepullten Image.
+   am **identischen Host-Pfad** — und zwar mit dem Image, das der Agent
+   selbst fährt (Image-ID des eigenen Containers bzw. `DOCKOPS_SELF_IMAGE`),
+   **nicht** mit dem gerade gepullten: ein kaputter neuer Build darf nicht
+   derjenige sein, der sich selbst zurückrollen muss. Nur wenn das eigene
+   Image unbekannt ist, läuft der Helper mit dem Ziel-Image (WARN).
 3. Der Helper wartet `grace_seconds` (10s), fährt
    `compose -p … -f … --env-file … up -d --no-deps <services>`, pollt das
    Health-Gate (`docker inspect`, 180s Timeout, 3s Poll) und schreibt
@@ -999,9 +1015,14 @@ Helper-Container** den Recreate.
 4. Beim nächsten Start finalisiert der Agent: `ok` → `current_digest`,
    `applied_at`, `update_applied`; `rolled_back` → `apply_blocked_digest`,
    `apply_error`, `rolled_back_at`, `update_failed`; `rollback_failed` wie
-   `rolled_back`, zusätzlich mit `rollback FAILED` im Text. Fehlt das
-   Ergebnis, entscheidet der laufende Digest: gleich Ziel ⇒ als Erfolg
-   verbuchen (WARN), gleich Vorher-Digest ⇒ als Fehlschlag blockieren.
+   `rolled_back`, zusätzlich mit `rollback FAILED` im Text; nach einem
+   Rollback zeigt der Agent den Tag wieder auf `previous_digest`. Fehlt das
+   Ergebnis, wartet der Agent zunächst das Fenster des Helpers ab (Grace +
+   2× Health-Timeout + 120s ab `pending_at`) — vorher ist „kein Ergebnis“
+   kein Urteil. Danach entscheidet der Digest, den der **Container**
+   tatsächlich fährt (nie der Tag, der ja schon vor dem Hand-over gepullt
+   wurde): gleich Ziel ⇒ als Erfolg verbuchen (WARN), gleich Vorher-Digest ⇒
+   als Fehlschlag blockieren, sonst weiter pending.
 
 Solange `apply_pending_digest` gesetzt ist, startet kein Pass einen zweiten
 Helper, und `/status` meldet den Service mit `pending: true`

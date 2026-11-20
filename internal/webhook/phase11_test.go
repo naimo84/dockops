@@ -25,6 +25,7 @@ func TestStatusReportsApplyState(t *testing.T) {
 		Images: map[string]state.ImageRecord{
 			"ghcr.io/x/app:latest": {
 				Service:            "app",
+				Services:           []string{"app", "worker"},
 				CurrentDigest:      "sha256:old",
 				RemoteDigest:       "sha256:new",
 				UpdateAvailable:    true,
@@ -83,6 +84,9 @@ func TestStatusReportsApplyState(t *testing.T) {
 	if got := app["blocked"]; got != true {
 		t.Errorf("blocked = %v, want true (the failed digest is the remote one)", got)
 	}
+	if got, _ := app["services"].([]any); len(got) != 2 || got[0] != "app" || got[1] != "worker" {
+		t.Errorf("services = %v, want both services sharing the image", app["services"])
+	}
 
 	db, _ := services[1].(map[string]any)
 	if got := db["blocked"]; got != false {
@@ -90,6 +94,9 @@ func TestStatusReportsApplyState(t *testing.T) {
 	}
 	if _, ok := db["previous_digest"]; ok {
 		t.Errorf("db entry = %v, want no previous_digest key", db)
+	}
+	if _, ok := db["services"]; ok {
+		t.Errorf("db entry = %v, want no services key for a single service", db)
 	}
 }
 

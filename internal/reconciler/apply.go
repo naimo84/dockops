@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -185,6 +186,17 @@ func (r *Reconciler) rollbackImages(ctx context.Context, stack config.Stack, rec
 	}
 
 	rbErr := r.rollbackUp(ctx, stack, recs, cands, services, req)
+	// The pull moved the tag to the digest that just failed. Left there, the
+	// next regular deploy of the stack would recreate the services from it —
+	// without any gate. The tag goes back to the rollback target whether or
+	// not the rollback worked: pointing at the failed digest is never right.
+	if err := r.restoreTags(ctx, stack.Name, recs, cands); err != nil {
+		for _, c := range cands {
+			rec := recs[c.ref]
+			rec.ApplyError += "; " + err.Error()
+			recs[c.ref] = rec
+		}
+	}
 	if rbErr != nil {
 		// The case that needs a human: the stack now runs neither the old
 		// nor the new digest reliably.
@@ -221,7 +233,8 @@ func (r *Reconciler) rollbackUp(ctx context.Context, stack config.Stack, recs ma
 		// The working copy, not the candidate snapshot: the rollback target
 		// was recorded there before the up.
 		rec := recs[c.ref]
-		if rec.Service == "" {
+		services := recordServices(rec)
+		if len(services) == 0 {
 			return fmt.Errorf("rollback: no service recorded for image %s", c.ref)
 		}
 		if rec.PreviousDigest == "" {
@@ -231,7 +244,9 @@ func (r *Reconciler) rollbackUp(ctx context.Context, stack config.Stack, recs ma
 		if err != nil {
 			return fmt.Errorf("rollback: %w", err)
 		}
-		doc.Services[rec.Service] = rollbackService{Image: repository + "@" + rec.PreviousDigest}
+		for _, service := range services {
+			doc.Services[service] = rollbackService{Image: repository + "@" + rec.PreviousDigest}
+		}
 	}
 	raw, err := yaml.Marshal(doc)
 	if err != nil {
@@ -392,22 +407,65 @@ func (r *Reconciler) applyCandidates(stack string, recs map[string]state.ImageRe
 }
 
 // candidateServices returns the sorted, deduplicated service names of the
-// candidates (one image may serve several services).
+// candidates — every service of every image, since services sharing an image
+// are updated together.
 func candidateServices(cands []applyCandidate) []string {
 	seen := make(map[string]struct{}, len(cands))
 	out := make([]string, 0, len(cands))
 	for _, c := range cands {
-		if c.rec.Service == "" {
-			continue
+		for _, service := range recordServices(c.rec) {
+			if _, ok := seen[service]; ok {
+				continue
+			}
+			seen[service] = struct{}{}
+			out = append(out, service)
 		}
-		if _, ok := seen[c.rec.Service]; ok {
-			continue
-		}
-		seen[c.rec.Service] = struct{}{}
-		out = append(out, c.rec.Service)
 	}
 	sort.Strings(out)
 	return out
+}
+
+// recordServices returns every service an image record covers: Services when
+// several services share the image, else the single Service (records written
+// before Services existed have only that).
+func recordServices(rec state.ImageRecord) []string {
+	if len(rec.Services) > 0 {
+		return rec.Services
+	}
+	if rec.Service == "" {
+		return nil
+	}
+	return []string{rec.Service}
+}
+
+// restoreTags points each candidate's tag back at the digest it is rolled
+// back to (see rollbackImages). A reference pinned by digest has no tag to
+// restore. The error joins every failed retag; callers record it next to the
+// apply error, since a tag left on the failed digest is what the next deploy
+// would run.
+func (r *Reconciler) restoreTags(ctx context.Context, stack string, recs map[string]state.ImageRecord, cands []applyCandidate) error {
+	var errs []error
+	for _, c := range cands {
+		rec := recs[c.ref]
+		if rec.PreviousDigest == "" || strings.Contains(c.ref, "@") {
+			continue
+		}
+		repository, err := imageRepository(c.ref)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("tag not restored: %w", err))
+			continue
+		}
+		source := repository + "@" + rec.PreviousDigest
+		if err := r.compose.TagImage(ctx, source, c.ref); err != nil {
+			r.logger.Error("image update apply: cannot move the tag back; the next deploy would run the failed image",
+				"stack", stack, "image", c.ref, "digest", shortDigest(rec.PreviousDigest), "error", err)
+			errs = append(errs, fmt.Errorf("tag %s not restored to %s: %w", c.ref, shortDigest(rec.PreviousDigest), err))
+			continue
+		}
+		r.logger.Info("image update apply: tag moved back to the rolled-back digest",
+			"stack", stack, "image", c.ref, "digest", shortDigest(rec.PreviousDigest))
+	}
+	return errors.Join(errs...)
 }
 
 // candidateRefs renders the image references of the candidates for a log or

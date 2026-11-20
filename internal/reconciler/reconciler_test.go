@@ -132,6 +132,17 @@ type fakeCompose struct {
 	// starts (1-based call number). Tests use it to change the scripted
 	// gate answer between the forward up and the rollback up.
 	onUpOverride func(call int)
+
+	// What the containers run: serviceImages maps a service to the image
+	// IDs of its containers (nil = no containers, the check then falls back
+	// to the tag digest), repoDigests maps an image ID to its repository
+	// digest. tags records TagImage calls as {source, target}.
+	serviceImages     map[string][]string
+	serviceImagesErr  error
+	serviceImageCalls []string
+	repoDigests       map[string]string
+	tags              [][2]string
+	tagErr            error
 }
 
 func (f *fakeCompose) Up(_ context.Context, stack config.Stack, stackDir, envFile string) error {
@@ -186,6 +197,30 @@ func (f *fakeCompose) ImageDigest(_ context.Context, ref string) (string, error)
 		return "", f.digestErr
 	}
 	return f.digests[ref], nil
+}
+
+func (f *fakeCompose) ImageRepoDigest(ctx context.Context, image, ref string) (string, error) {
+	if d, ok := f.repoDigests[image]; ok {
+		return d, nil
+	}
+	return f.ImageDigest(ctx, ref)
+}
+
+func (f *fakeCompose) ServiceImageIDs(_ context.Context, project string) (map[string][]string, error) {
+	f.serviceImageCalls = append(f.serviceImageCalls, project)
+	if f.serviceImagesErr != nil {
+		return nil, f.serviceImagesErr
+	}
+	out := make(map[string][]string, len(f.serviceImages))
+	for service, ids := range f.serviceImages {
+		out[service] = append([]string(nil), ids...)
+	}
+	return out, nil
+}
+
+func (f *fakeCompose) TagImage(_ context.Context, source, target string) error {
+	f.tags = append(f.tags, [2]string{source, target})
+	return f.tagErr
 }
 
 func (f *fakeCompose) Pull(_ context.Context, req compose.Request, services []string) error {

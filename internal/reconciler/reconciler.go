@@ -108,8 +108,22 @@ type ComposeExecutor interface {
 
 	// ImageDigest returns the local repository digest of an image
 	// reference, "" when it has none (built locally) — compose.Executor's
-	// ImageDigest.
+	// ImageDigest. It answers for the tag, i.e. what a recreate would run.
 	ImageDigest(ctx context.Context, ref string) (string, error)
+
+	// ImageRepoDigest returns the repository digest an image ID (or
+	// reference) carries for ref's repository (compose.Executor's
+	// ImageRepoDigest).
+	ImageRepoDigest(ctx context.Context, image, ref string) (string, error)
+
+	// ServiceImageIDs returns the image IDs the containers of a project run,
+	// per service (compose.Executor.ServiceImageIDs) — what is deployed, not
+	// where the tag points.
+	ServiceImageIDs(ctx context.Context, project string) (map[string][]string, error)
+
+	// TagImage points a tag at an image (compose.Executor.TagImage); the
+	// rollback moves the tag back to the digest that runs again.
+	TagImage(ctx context.Context, source, target string) error
 
 	// Pull fetches the images of the named services, all of the project for
 	// an empty list (compose.Executor.Pull; phase-11 apply step).
@@ -283,12 +297,12 @@ type Deps struct {
 	// process", exactly as before phase 12.
 	SelfUpdate bool
 
-	// SelfImage is the image the phase-13 deploy helper starts from (env
-	// DOCKOPS_SELF_IMAGE). A deploy plan has no target image, so the helper
-	// must run something the agent knows works; empty means "ask docker for
-	// the agent's own image" (docker inspect .Config.Image). It is not a
-	// default to be guessed: an unresolvable image is a hard error before
-	// the helper starts.
+	// SelfImage is the image the self-update and deploy helpers start from
+	// (env DOCKOPS_SELF_IMAGE, else the image ID of the agent's own
+	// container, see cmd/dockops). The helpers must run something the agent
+	// knows works — never a freshly pulled target. It is not a default to be
+	// guessed: a deploy helper without it is not started, and an image
+	// update then falls back to the target image with a warning.
 	SelfImage string
 
 	// SelfMounts are the agent's own mounts (docker inspect .Mounts), handed

@@ -169,8 +169,8 @@ func (r *Reconciler) clearDeployPending(stack string) error {
 // build that is known to work on this host.
 //
 // The value comes from Deps.SelfImage, which cmd/dockops fills at startup:
-// DOCKOPS_SELF_IMAGE when set, otherwise the answer of
-// `docker inspect <self container> --format '{{.Config.Image}}'`. The lookup
+// DOCKOPS_SELF_IMAGE when set, otherwise the image ID of the agent's own
+// container (`docker inspect <self container> --format '{{.Image}}'`). The lookup
 // deliberately does NOT happen here: it needs the docker daemon, and a
 // reconciler that shells out to docker for its own image would behave
 // differently on every host that happens to run a container with the same
