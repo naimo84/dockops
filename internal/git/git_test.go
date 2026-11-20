@@ -428,3 +428,25 @@ func TestHeadCommitOutsideWorkDir(t *testing.T) {
 		t.Errorf("HeadCommit() = %q, want %q", got, want)
 	}
 }
+
+// A clone URL may carry a token. git's failure — command line and git's own
+// output alike — travels into logs and repo_failed notifications, so the
+// token must be masked in both, and in the clone log line.
+func TestEnsureRepoMasksURLCredentials(t *testing.T) {
+	t.Setenv("GIT_TERMINAL_PROMPT", "0")
+	m, logs, _ := newLoggedManager(t)
+
+	_, err := m.EnsureRepo("host", "https://deploy:tok3n-s3cret@127.0.0.1:1/host.git", "main")
+	if err == nil {
+		t.Fatal("EnsureRepo() against an unreachable remote error = nil, want the clone failure")
+	}
+	if strings.Contains(err.Error(), "tok3n-s3cret") {
+		t.Errorf("error leaks the token: %v", err)
+	}
+	if !strings.Contains(err.Error(), "https://deploy:***@127.0.0.1:1/host.git") {
+		t.Errorf("error lacks the masked URL: %v", err)
+	}
+	if strings.Contains(logs.String(), "tok3n-s3cret") {
+		t.Errorf("log leaks the token:\n%s", logs.String())
+	}
+}

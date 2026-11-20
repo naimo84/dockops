@@ -43,9 +43,11 @@ const (
 	envBranch         = "DOCKOPS_BRANCH"
 	envWebhookSecret  = "DOCKOPS_WEBHOOK_SECRET"
 	envSopsSidecarURL = "DOCKOPS_SOPS_SIDECAR_URL"
+	envSopsSidecarTok = "DOCKOPS_SOPS_SIDECAR_TOKEN"
 	envPrintStatus    = "DOCKOPS_PRINT_STATUS"
 	envStatusToken    = "DOCKOPS_STATUS_TOKEN"
 	envLogsToken      = "DOCKOPS_LOGS_TOKEN"
+	envRestartToken   = "DOCKOPS_RESTART_TOKEN"
 	envSelfProject    = "DOCKOPS_SELF_PROJECT"
 	envSelfUpdate     = "DOCKOPS_SELF_UPDATE"
 	envSelfImage      = "DOCKOPS_SELF_IMAGE"
@@ -332,12 +334,15 @@ func run(opts options, logger *slog.Logger) error {
 		Logger:         logger,
 		Compose:        composeExec,
 		SopsSidecarURL: opts.SopsSidecarURL,
-		SelfProject:    selfProject(),
-		SelfUpdate:     selfUpdateEnabled(os.Getenv),
-		SelfImage:      selfImage(os.Getenv, logger),
-		SelfMounts:     selfMounts(os.Getenv, logger),
-		SelfUser:       selfUser(os.Getenv, logger),
-		SelfGroups:     selfGroups(os.Getenv, logger),
+		// Read here, not as a flag: a credential does not belong on the
+		// command line (visible in ps and docker inspect).
+		SopsSidecarToken: os.Getenv(envSopsSidecarTok),
+		SelfProject:      selfProject(),
+		SelfUpdate:       selfUpdateEnabled(os.Getenv),
+		SelfImage:        selfImage(os.Getenv, logger),
+		SelfMounts:       selfMounts(os.Getenv, logger),
+		SelfUser:         selfUser(os.Getenv, logger),
+		SelfGroups:       selfGroups(os.Getenv, logger),
 		// The stack .env permissions of every pass, from the just-loaded
 		// root configuration (phase 14).
 		EnvFileOptions: envFileOpts,
@@ -624,8 +629,17 @@ func writeStatus(ctx context.Context, deps webhook.StatusDeps, w io.Writer) erro
 // further sends).
 func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconciler.Reconciler, intervals *intervalSource, collab collaborators) error {
 	if opts.WebhookSecret == "" {
-		logger.Warn("no webhook secret configured; every caller can trigger reconciles",
+		logger.Warn("webhook endpoint disabled: no secret configured; changes arrive with the poll loop only",
 			"hint", "set -webhook-secret or "+envWebhookSecret)
+	}
+	restartToken := os.Getenv(envRestartToken)
+	switch {
+	case restartToken != "":
+	case opts.WebhookSecret != "":
+		logger.Warn("POST /restart authenticates with the webhook secret, which the git hoster knows as well",
+			"hint", "set "+envRestartToken+" to give restarts their own credential")
+	default:
+		logger.Info("restart endpoint disabled: no credential configured", "hint", "set "+envRestartToken)
 	}
 
 	logsToken := os.Getenv(envLogsToken)
@@ -649,17 +663,18 @@ func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconcil
 			// POST /restart acts on the stacks of the last reconcile pass;
 			// the reconciler owns config, stack dirs, compose files and the
 			// generated .env (see Reconciler.Restart).
-			Restart:     rec.Restart,
-			Logger:      logger,
-			State:       collab.store,
-			Compose:     collab.compose,
-			RepoURL:     opts.RepoURL,
-			Branch:      opts.Branch,
-			HeadCommit:  hostCommitFn(collab.git),
-			SelfProject: selfProject(),
-			Token:       os.Getenv(envStatusToken),
-			Logs:        collab.compose,
-			LogsToken:   logsToken,
+			Restart:      rec.Restart,
+			RestartToken: restartToken,
+			Logger:       logger,
+			State:        collab.store,
+			Compose:      collab.compose,
+			RepoURL:      opts.RepoURL,
+			Branch:       opts.Branch,
+			HeadCommit:   hostCommitFn(collab.git),
+			SelfProject:  selfProject(),
+			Token:        os.Getenv(envStatusToken),
+			Logs:         collab.compose,
+			LogsToken:    logsToken,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}

@@ -27,6 +27,7 @@ import (
 
 	"github.com/local/dockops/internal/compose"
 	"github.com/local/dockops/internal/config"
+	"github.com/local/dockops/internal/redact"
 	"github.com/local/dockops/internal/state"
 )
 
@@ -238,7 +239,9 @@ func BuildStatus(ctx context.Context, deps StatusDeps) (StatusResponse, error) {
 	resp := StatusResponse{
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		HostRepo: HostRepo{
-			URL:    deps.RepoURL,
+			// The repository URL may carry an access token; the document
+			// is often readable without one (DOCKOPS_STATUS_TOKEN unset).
+			URL:    redact.URLs(deps.RepoURL),
 			Branch: deps.Branch,
 			Commit: resolveHeadCommit(logger, deps.HeadCommit),
 		},

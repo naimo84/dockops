@@ -283,7 +283,12 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
   Mode und Gruppe vor dem Rename, Default 0600, Gruppenfehler nur WARN;
   bewusst nicht im Stack-Hash)
 - `internal/hooks/` — Hook-Engine: sequenzielle `sh -c`-Ausführung mit
-  Per-Kommando-Timeout (Prozessgruppen-Kill) und slog-Output
+  Per-Kommando-Timeout (Prozessgruppen-Kill) und slog-Output; Hooks erben aus
+  der Agent-Umgebung nur eine Allowlist (`baseEnv`: PATH/HOME/…, `LC_*`,
+  `DOCKER_*` des CLI) plus `DOCKOPS_HOOK_PASSTHROUGH` — nie Agent-Credentials
+- `internal/redact/` — `URLs` maskiert Zugangsdaten in URLs (`user:***@`,
+  Token-als-User bei http(s)); angewendet auf git-Fehler/-Logs (fließen in
+  `repo_failed`) und `host_repo.url` in `/status`
 - `internal/compose/` — Compose-Executor: `docker compose up/down` mit
   deterministischem Projektnamen (`-p <stack-name>`), einem `-f` pro
   Compose-Datei in Listenreihenfolge, Service-Filter als positionale
@@ -482,6 +487,14 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
 - `PHASE6C_TASK.md` — Aufgabenstellung (nicht ändern)
 
 ## Konventionen
+
+- Sicherheit: HTTP-Endpunkte sind ohne Credential **abgeschaltet** (503),
+  nie offen — `/webhook` ohne `DOCKOPS_WEBHOOK_SECRET`, `/logs*` ohne
+  `DOCKOPS_LOGS_TOKEN`, `/restart` ohne `DOCKOPS_RESTART_TOKEN` (Übergang:
+  Webhook-Auth, solange nur das Secret gesetzt ist). Ausnahme mit Absicht:
+  `/status` ohne `DOCKOPS_STATUS_TOKEN` (Monitoring). Der SOPS-Sidecar prüft
+  `SOPS_SIDECAR_TOKEN` (Agent: `DOCKOPS_SOPS_SIDECAR_TOKEN`). URLs aus der
+  Konfiguration laufen vor Logs/Fehlern/Antworten durch `redact.URLs`.
 
 - Logging ausschließlich über stdlib `log/slog` (kein anderes Log-Paket).
 - Tests mit stdlib `testing`, kein testify. Fixtures über `t.TempDir()`

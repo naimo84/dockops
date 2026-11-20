@@ -34,6 +34,7 @@ import (
 const (
 	envAddr         = "SOPS_SIDECAR_ADDR"
 	envAllowedRoots = "SOPS_SIDECAR_ALLOWED_ROOTS"
+	envToken        = "SOPS_SIDECAR_TOKEN"
 	defaultAddr     = ":8081"
 	shutdownTimeout = 10 * time.Second
 )
@@ -59,9 +60,14 @@ func run(logger *slog.Logger, getenv func(string) string) error {
 		return err
 	}
 
+	token := getenv(envToken)
+	if token == "" {
+		logger.Warn("decrypt endpoint is open to every container that can reach it",
+			"hint", "set "+envToken+" here and DOCKOPS_SOPS_SIDECAR_TOKEN on the agent")
+	}
 	server := &http.Server{
 		Addr:              *addr,
-		Handler:           sops.NewSidecarHandler(roots, logger),
+		Handler:           sops.NewSidecarHandlerWithToken(roots, token, logger),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	ln, err := net.Listen("tcp", *addr)

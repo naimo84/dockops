@@ -170,16 +170,18 @@ func TestWebhookAtLeastOneMethodMustMatch(t *testing.T) {
 	}
 }
 
-func TestWebhookWithoutSecretAcceptsEverything(t *testing.T) {
+// Without a secret the endpoint is disabled instead of open: anyone who can
+// reach the port must not be able to trigger passes.
+func TestWebhookWithoutSecretIsDisabled(t *testing.T) {
 	triggers := 0
 	h := New(Deps{Trigger: countingTrigger(&triggers), Logger: quietLogger()})
 
 	rec := do(h, http.MethodPost, "/webhook", []byte(`{}`), nil)
-	if rec.Code != http.StatusOK {
-		t.Errorf("no secret configured status = %d, want 200 (authentication disabled)", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("no secret configured status = %d, want 503 (endpoint disabled)", rec.Code)
 	}
-	if triggers != 1 {
-		t.Errorf("trigger calls = %d, want 1", triggers)
+	if triggers != 0 {
+		t.Errorf("trigger calls = %d, want 0", triggers)
 	}
 }
 

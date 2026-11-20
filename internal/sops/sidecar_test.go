@@ -368,3 +368,37 @@ func TestValidateSidecarPath(t *testing.T) {
 		})
 	}
 }
+
+// With SOPS_SIDECAR_TOKEN the decrypt endpoint is closed to every caller
+// without it — any container on the network could otherwise decrypt every
+// file below the allowed roots. The agent's resolver sends it via WithToken.
+func TestSidecarTokenEndToEnd(t *testing.T) {
+	_, callsFile := fakeSops(t)
+	root := t.TempDir()
+	enc := filepath.Join(root, "web", "secrets.env")
+	writeFile(t, enc, "SECRET=hunter2\n")
+	srv := httptest.NewServer(NewSidecarHandlerWithToken([]string{root}, "sidecar-token", quietLogger()))
+	defer srv.Close()
+
+	if _, err := NewSidecar(srv.URL, nil).DecryptFile(context.Background(), enc); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Errorf("decrypt without token error = %v, want a 401", err)
+	}
+	if _, err := NewSidecar(srv.URL, nil).WithToken("wrong").DecryptFile(context.Background(), enc); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Errorf("decrypt with a wrong token error = %v, want a 401", err)
+	}
+	if calls := readCalls(t, callsFile); len(calls) != 0 {
+		t.Errorf("sops ran %d times for rejected requests, want 0", len(calls))
+	}
+	got, err := NewSidecar(srv.URL, nil).WithToken("sidecar-token").DecryptFile(context.Background(), enc)
+	if err != nil || got["SECRET"] != "hunter2" {
+		t.Errorf("decrypt with the token = %v, %v; want SECRET=hunter2", got, err)
+	}
+	// Liveness stays open for the container healthcheck.
+	res, err := http.Get(srv.URL + "/healthz")
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Errorf("GET /healthz = %v, %v; want 200 without a token", res, err)
+	}
+	if res != nil {
+		res.Body.Close()
+	}
+}

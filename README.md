@@ -268,7 +268,14 @@ Listenreihenfolge.
 Hooks laufen als `sh -c` im Stack-Verzeichnis, sequenziell mit
 Per-Kommando-Timeout (Default 5 Minuten), und erhalten die komplette
 gemergte Umgebung des Stacks (inkl. Secrets) sowie `STACK_NAME`,
-`STACK_DIR` und `GIT_COMMIT`.
+`STACK_DIR` und `GIT_COMMIT`. Aus der Umgebung des **Agenten** erben sie nur
+eine Allowlist (`PATH`, `HOME`, `USER`, `SHELL`, `TZ`, `LANG`/`LC_*`,
+`TMPDIR`, `HOSTNAME` und die `DOCKER_*`-Variablen des CLI) — nie Vault-Token,
+Webhook-/Status-/Logs-Token oder die per `${VAR}` referenzierten Registry-
+und Notification-Secrets, denn Hooks stammen aus den Repos (auch aus
+importierten Remotes). Weitere Variablen gibt
+`DOCKOPS_HOOK_PASSTHROUGH=NAME1,NAME2` explizit frei. Die Ausgabe der Hooks
+landet ungefiltert im Log: Hooks dürfen Secrets nicht ausgeben.
 
 ## Ablauf eines Reconcile-Durchlaufs
 
@@ -388,8 +395,10 @@ Imports gilt Basis vor Import):
 Das Ergebnis geht als `--env-file` an `docker compose` (Interpolation in
 der Compose-Datei) und als Umgebung an Hooks. Die Datei liegt in
 `/dev/shm` (Tmpfs) mit `0600`, wird nach dem Stack-Durchlauf mit Zufallsbytes
-überschrieben und gelöscht; Secrets erscheinen nie in Logs oder
-Fehlermeldungen. Die zusätzlich generierte `<stackDir>/.env` trägt dieselben
+überschrieben und gelöscht; dockops selbst schreibt keine Secrets in Logs
+oder Fehlermeldungen (die Ausgabe von Hooks ist deren Sache, siehe oben;
+Zugangsdaten in Repo-URLs maskiert dockops in Fehlern, Logs,
+Benachrichtigungen und `/status`). Die zusätzlich generierte `<stackDir>/.env` trägt dieselben
 Variablen und ist ebenfalls `0600` — Mode und Gruppe sind über
 `global.env_file` konfigurierbar (siehe
 [Wer darf host-seitig deployen](#wer-darf-host-seitig-deployen-phase-14)).
@@ -446,8 +455,12 @@ HTTP-Vertrag (`POST /decrypt`):
 
     GET /healthz → 200 {"status":"ok"}
 
-Sicherheit: keine Auth (Netz-Isolation — der Sidecar veröffentlicht keinen
-Port, nur dockops im gemeinsamen Netz erreicht ihn), dafür Client-seitig
+Sicherheit: Bearer-Token per `SOPS_SIDECAR_TOKEN` (Sidecar) und
+`DOCKOPS_SOPS_SIDECAR_TOKEN` (Agent, gleicher Wert) — ohne Token antwortet
+`POST /decrypt` mit 401. Ohne gesetztes Token bleibt der Endpunkt offen (WARN
+beim Start): dann entscheidet allein die Netz-Isolation, und **jeder** Container
+im selben Netz kann jede Datei unter den erlaubten Wurzeln entschlüsseln. Der
+Sidecar veröffentlicht keinen Port. Dazu Client-seitig
 ein 60-s-Request-Timeout und ein 10-MB-Response-Limit sowie Server-seitig
 die Pfad-Allow-List `SOPS_SIDECAR_ALLOWED_ROOTS` (doppelpunkt-separiert;
 `filepath.Clean` + Prefix-Check blockt `..`-Traversal, bevor `sops` je
@@ -460,6 +473,7 @@ Deployment im eigenen `compose.yaml` des Repos (siehe auch
 explizit aktiviert werden, inkl. der URL-Variable:
 
     DOCKOPS_SOPS_SIDECAR_URL=http://sops-sidecar:8081 \
+    SOPS_SIDECAR_TOKEN=$(openssl rand -hex 32) \
       docker compose --profile sops up -d
 
 (Build des Images: `docker compose --profile sops build`.)
@@ -1233,6 +1247,19 @@ Regeln:
 Damit ist der alte Ratschlag „alle Bind-Quellen als absolute Host-Pfade
 schreiben“ eine Option, keine Voraussetzung mehr.
 
+## Fleet-Übersicht (`cmd/dockops-fleet`)
+
+`dockops-fleet` fragt `/status` aller konfigurierten Agenten ab
+(`FLEET_HOSTS="name=url,…"`, `FLEET_STATUS_TOKENS="name=token,…"` — ein Token
+pro Host) und zeigt das Ergebnis als Seite (`/`) und JSON (`/api/fleet`,
+`LISTEN`, Default `:9090`). Der Aggregator selbst hat **keine
+Authentifizierung**: wer ihn erreicht, sieht die Status-Dokumente aller Hosts
+— die Pro-Host-Tokens schützen dann nichts mehr. Er gehört deshalb
+ausschließlich hinter einen authentifizierenden Reverse Proxy (z. B.
+SSO/Forward-Auth) und darf keinen Port ungeschützt veröffentlichen. Die
+Host-URLs sollten `https://` sein, sonst gehen die Status-Tokens im Klartext
+über das Netz.
+
 ## CLI
 
     dockops [-repo URL] [-branch NAME] [-state PFAD] [-addr HOST:PORT]
@@ -1244,7 +1271,7 @@ schreiben“ eine Option, keine Voraussetzung mehr.
 | `-repo` | `DOCKOPS_REPO_URL` | — (Pflicht, außer bei `-print-status`) | URL des Host-Repos (HTTPS/SSH/lokal) |
 | `-branch` | `DOCKOPS_BRANCH` | `main` | Branch des Host-Repos |
 | `-state` | — | `/var/lib/dockops/state.json` | Pfad der JSON-State-Datei |
-| `-webhook-secret` | `DOCKOPS_WEBHOOK_SECRET` | leer | Shared Secret für `POST /webhook` und `POST /restart`; leer ⇒ beide Endpunkte ohne Auth (Warnung im Log) |
+| `-webhook-secret` | `DOCKOPS_WEBHOOK_SECRET` | leer | Shared Secret für `POST /webhook`; leer ⇒ Endpunkt **abgeschaltet** (503, Änderungen kommen nur über den Poll-Loop) |
 | `-addr` | — | `:8080` | Listen-Adresse des Webhook-Servers |
 | `-sops-sidecar` | `DOCKOPS_SOPS_SIDECAR_URL` | leer | URL des SOPS-Sidecar (z. B. `http://sops-sidecar:8081`); leer ⇒ lokales `sops -d` |
 | `-interval` | — | `global.poll_interval` (Default 5m) | Poll-Intervall-Override, z. B. `90s` |
@@ -1255,12 +1282,16 @@ Dazu die Vault-Variablen (Namen in `global.vault` konfigurierbar):
 `VAULT_ADDR` (Fallback für `global.vault.address`), `VAULT_TOKEN`
 (`auth_method: token`) bzw. `VAULT_ROLE_ID` + `VAULT_SECRET_ID`
 (`auth_method: approle`). Ohne eigenes Flag: `DOCKOPS_STATUS_TOKEN`
-(Bearer-Schutz für `GET /status`, leer = offen), `DOCKOPS_SELF_PROJECT`
+(Bearer-Schutz für `GET /status`, leer = offen), `DOCKOPS_RESTART_TOKEN`
+(Bearer-Token für `POST /restart`, siehe unten), `DOCKOPS_SOPS_SIDECAR_TOKEN`
+(Bearer-Token für den Sidecar, siehe „SOPS decryption“),
+`DOCKOPS_HOOK_PASSTHROUGH` (weitere Variablen, die Hooks erben, siehe
+„Lokale `stack.yaml`“), `DOCKOPS_SELF_PROJECT`
 (eigenes Compose-Projekt für die Unmanaged-Erkennung **und** die
 Self-Update-Erkennung, default `dockops`) und `DOCKOPS_SELF_UPDATE`
 (Default an; nur die exakte Angabe `off` deaktiviert beide Helper-Pfade, siehe
-„Self-Update“ und „Deploy-Handover“), `DOCKOPS_SELF_IMAGE` (Image, aus dem der
-Phase-13-Helper startet; leer ⇒ `docker inspect` auf den eigenen Container).
+„Self-Update“ und „Deploy-Handover“), `DOCKOPS_SELF_IMAGE` (Image, aus dem die
+Helper starten; leer ⇒ Image-ID des eigenen Containers per `docker inspect`).
 `DOCKOPS_HOST_CHECKOUT` füllt ein leeres `global.host_checkout` (YAML
 gewinnt; `-print-status` und `/status` folgen der Variable auch ohne
 Config, siehe „Konfigurierbare Checkout-Pfade“).
@@ -1286,24 +1317,32 @@ anderen Modi.
   (`X-Hub-Signature-256: sha256=<hex>` HMAC-SHA256 über den Body), Gitea
   (`X-Gitea-Signature` — derselbe HMAC-SHA256 über den Body, nur unter
   anderem Header-Namen) **oder** GitLab (`X-Gitlab-Token`); alle Vergleiche
-  in konstanter Zeit:
+  in konstanter Zeit. Ohne `DOCKOPS_WEBHOOK_SECRET` antwortet der Endpunkt
+  mit **503** statt jeden Aufrufer durchzulassen. Die Signaturen haben keinen
+  Zeitstempel: ein mitgeschnittener Request lässt sich wiederholen (beim
+  Webhook harmlos, er stößt nur einen idempotenten Durchlauf an) — den Port
+  daher nur über TLS (Reverse Proxy) erreichbar machen:
 
       curl -X POST http://localhost:8080/webhook \
         -H "X-Gitlab-Token: $DOCKOPS_WEBHOOK_SECRET"
 
 - `POST /restart` — startet Stacks neu (`docker compose restart`), ohne zu
   deployen: kein `pull`, kein `up`, keine Änderung an Hash oder
-  `state.json`. Authentifizierung wie `/webhook`. Der Body ist optional;
-  ohne Body (oder mit leerem `stacks`-Array) werden **alle** Stacks der
-  Host-Konfiguration neu gestartet:
+  `state.json`. Authentifizierung per eigenem Bearer-Token
+  `DOCKOPS_RESTART_TOKEN` — das Webhook-Secret kennt auch der Git-Hoster, es
+  soll keine operativen Aktionen autorisieren. Solange kein Restart-Token
+  gesetzt ist, gilt übergangsweise die Webhook-Authentifizierung (WARN beim
+  Start); ohne beides ist der Endpunkt abgeschaltet (**503**). Der Body ist
+  optional; ohne Body (oder mit leerem `stacks`-Array) werden **alle** Stacks
+  der Host-Konfiguration neu gestartet:
 
       # alle Stacks
       curl -X POST http://localhost:8080/restart \
-        -H "X-Gitlab-Token: $DOCKOPS_WEBHOOK_SECRET"
+        -H "Authorization: Bearer $DOCKOPS_RESTART_TOKEN"
 
       # nur ausgewählte Stacks
       curl -X POST http://localhost:8080/restart \
-        -H "X-Gitlab-Token: $DOCKOPS_WEBHOOK_SECRET" \
+        -H "Authorization: Bearer $DOCKOPS_RESTART_TOKEN" \
         -H "Content-Type: application/json" \
         -d '{"stacks":["web","db"]}'
 

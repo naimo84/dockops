@@ -20,6 +20,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/local/dockops/internal/redact"
 )
 
 // gitBinary is the name of the git executable used for every command. It is
@@ -143,7 +145,7 @@ func (m *Manager) EnsureRepoAt(path, url, branch string) (string, error) {
 
 	switch state {
 	case dirAbsent, dirEmpty:
-		m.logger.Info("cloning repository", "url", url, "branch", branch, "path", path)
+		m.logger.Info("cloning repository", "url", redact.URLs(url), "branch", branch, "path", path)
 		// exec passes arguments directly (no shell), so tokens embedded in
 		// url cannot be misinterpreted as shell syntax.
 		if _, err := m.runGit("", "clone", "--branch", branch, "--single-branch", "--", url, path); err != nil {
@@ -446,7 +448,8 @@ func (m *Manager) checkOrigin(path, url string) error {
 		return err
 	}
 	if got := strings.TrimSpace(string(out)); got != url {
-		return fmt.Errorf("git %s: checkout was cloned from %q, not %q (remove the checkout or fix the configuration)", path, got, url)
+		return fmt.Errorf("git %s: checkout was cloned from %q, not %q (remove the checkout or fix the configuration)",
+			path, redact.URLs(got), redact.URLs(url))
 	}
 	return nil
 }
@@ -454,7 +457,9 @@ func (m *Manager) checkOrigin(path, url string) error {
 // runGit executes the git binary with args, optionally with dir as working
 // directory, and returns its combined output. Errors embed the full command
 // and a bounded excerpt of the output, per the project convention that
-// errors carry context.
+// errors carry context — with the credentials of every URL masked: a clone
+// URL may carry a token, and these errors travel on into logs and repo_failed
+// notifications.
 //
 // The public API has no context parameters (matching the briefing's
 // signatures); commands still run through exec.CommandContext with
@@ -465,7 +470,7 @@ func (m *Manager) runGit(dir string, args ...string) ([]byte, error) {
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("git %s: %w%s", strings.Join(args, " "), err, outputSuffix(out))
+		return nil, fmt.Errorf("git %s: %w%s", redact.URLs(strings.Join(args, " ")), err, redact.URLs(outputSuffix(out)))
 	}
 	return out, nil
 }
