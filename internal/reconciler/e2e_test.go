@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -495,6 +496,22 @@ hooks:
 	}
 	if downs := invocationsWith(readInvocations(t, dockerCallsFile), "down"); len(downs) != 0 {
 		t.Errorf("pass 2: %d compose down invocations, want 0: %v", len(downs), downs)
+	}
+	// The checkout update of pass 2 must leave the generated artefacts alone:
+	// the import's stack .env (untracked) survives for later compose calls,
+	// and no stash entry carries the resolved secrets — neither of the
+	// untracked .env nor of web's committed one, which the deploy overwrote.
+	if got, err := os.ReadFile(filepath.Join(monDir, ".env")); err != nil || !strings.Contains(string(got), "STACK_NAME=shared-monitoring") {
+		t.Errorf("pass 2: generated import .env = %q, %v; want it to survive the checkout update", got, err)
+	}
+	for _, checkout := range []string{filepath.Join(workDir, "host"), filepath.Join(workDir, "shared")} {
+		out, err := exec.Command("git", "-C", checkout, "stash", "list").CombinedOutput()
+		if err != nil {
+			t.Fatalf("git stash list in %s: %v: %s", checkout, err, out)
+		}
+		if strings.TrimSpace(string(out)) != "" {
+			t.Errorf("pass 2: %s has stash entries (generated secrets stashed):\n%s", checkout, out)
+		}
 	}
 
 	// ---- pass 3: changed stack definition → redeploy ------------------
