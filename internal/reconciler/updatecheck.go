@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -445,7 +446,14 @@ func (r *Reconciler) recordNonPortableBinds(stack config.Stack) {
 		// portable". Leave the state alone rather than flag everything.
 		return
 	}
-	findings, err := compose.NonPortableBinds(stack.EffectiveComposeFiles(), stack.Dir, roots)
+	// The generated <stackDir>/.env holds the values the last deploy
+	// interpolated with; without it only the process environment is known.
+	env, err := compose.EnvLookup(filepath.Join(stack.Dir, ".env"))
+	if err != nil {
+		r.logger.Warn("non-portable bind check: cannot read the stack env", "stack", stack.Name, "error", err)
+		return
+	}
+	findings, err := compose.NonPortableBindsEnv(stack.EffectiveComposeFiles(), stack.Dir, roots, env)
 	if err != nil {
 		r.logger.Warn("non-portable bind check: cannot read compose files", "stack", stack.Name, "error", err)
 		return

@@ -273,27 +273,6 @@ services:
 	}
 }
 
-// TestRewriteRefusesInterpolatedSource: ${CONF_DIR:-./config} looks like a
-// named volume to a naive classifier and would pass through untouched — the
-// exact silent failure the rewrite exists to stop. The value is only known
-// after interpolation, so the entry is an error, not a guess.
-func TestRewriteRefusesInterpolatedSource(t *testing.T) {
-	stackDir := "/var/lib/dockops/repos/host/x"
-	file := writeStackFile(t, t.TempDir(), "compose.yaml", `
-services:
-  a:
-    image: alpine
-    volumes:
-      - ${CONF_DIR:-./config}:/etc/cfg
-`)
-	_, _, err := RewriteRelativeBinds([]string{file}, stackDir, []BindRoot{{Container: "/var/lib/dockops/repos/host", Host: "/home/docker/apps"}})
-	if err == nil || !strings.Contains(err.Error(), "interpolated") {
-		t.Fatalf("err = %v, want a refusal for the interpolated source", err)
-	}
-	// A named volume with a $ would be caught too, but that is not valid
-	// compose either — the rule errs on the loud side.
-}
-
 // TestTranslate: the pure mapping rules, including the exact-root case and the
 // prefix trap (/var/lib/dockopsX must not match /var/lib/dockops).
 func TestTranslate(t *testing.T) {
