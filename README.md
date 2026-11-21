@@ -1248,6 +1248,13 @@ Regeln:
   Host-Namespace; der bisherige Workaround funktioniert weiter.
 - **Named Volumes werden nicht angefasst** (kein Host-Pfad, per Konstruktion
   portabel).
+- **Variablen werden wie bei compose eingesetzt**, bevor die Quelle bewertet
+  wird: `${VAR}`, `${VAR:-default}`, `${VAR-default}`, `${VAR:?msg}`,
+  `${VAR:+alt}` (auch verschachtelt), Werte aus der Prozessumgebung und der
+  `--env-file` des Deploys. Ergibt sich ein absoluter Pfad, bleibt die Quelle
+  unverändert, ein relativer wird übersetzt. Beispiel (traefik):
+  `${TRAEFIK_CROWDSEC_FILE:-/home/docker/infrastructure/traefik/dynamic-crowdsec/off.yaml}:/etc/traefik/dynamic/crowdsec.yaml:ro`.
+  Eine fehlende Pflichtvariable (`:?`) oder eine leere Quelle ist ein Fehler.
 - **Nicht auflösbar = harter Fehler.** Liegt die aufgelöste Quelle außerhalb
   aller Mounts des Agenten, bricht der Deploy *vor* dem ersten
   Compose-Kommando ab, mit Quelle, `target` und dem aufgelösten Pfad in der

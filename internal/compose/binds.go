@@ -103,7 +103,15 @@ func translate(p string, roots []BindRoot) (string, bool) {
 // keeps the earlier source (compose's own rule, mirrored here so the override
 // states the effective value).
 func RewriteRelativeBinds(files []string, stackDir string, roots []BindRoot) ([]byte, int, error) {
-	effective, err := effectiveBindEntries(files, stackDir)
+	return RewriteRelativeBindsEnv(files, stackDir, roots, nil)
+}
+
+// RewriteRelativeBindsEnv is RewriteRelativeBinds with the variables the
+// deploy interpolates with (see EnvLookup): compose expands ${VAR:-default}
+// before it parses a volume, so the check does the same and judges the
+// resulting path — absolute stays untouched, relative is rewritten.
+func RewriteRelativeBindsEnv(files []string, stackDir string, roots []BindRoot, env Lookup) ([]byte, int, error) {
+	effective, err := effectiveBindEntries(files, stackDir, env)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -204,7 +212,7 @@ func (e bindEntry) mergeOver(prev bindEntry) bindEntry {
 // target. Named volumes (no path separator before the target) hold no host
 // path and are skipped — they are portable by construction and the whole
 // point of them.
-func readBindEntries(path string) (map[string]bindEntry, error) {
+func readBindEntries(path string, env Lookup) (map[string]bindEntry, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
@@ -223,7 +231,7 @@ func readBindEntries(path string) (map[string]bindEntry, error) {
 	entries := map[string]bindEntry{}
 	for name, svc := range doc.Services {
 		for i, v := range svc.Volumes {
-			entry, ok, err := parseVolume(name, v, path, i)
+			entry, ok, err := parseVolume(name, v, path, i, env)
 			if err != nil {
 				return nil, err
 			}
@@ -240,14 +248,14 @@ func readBindEntries(path string) (map[string]bindEntry, error) {
 // order into the entry set compose itself would resolve. Shared by the
 // rewrite and the read-only non-portability check, so both see exactly the
 // same picture.
-func effectiveBindEntries(files []string, stackDir string) (map[string]bindEntry, error) {
+func effectiveBindEntries(files []string, stackDir string, env Lookup) (map[string]bindEntry, error) {
 	effective := map[string]bindEntry{}
 	for _, file := range files {
 		path := file
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(stackDir, path)
 		}
-		entries, err := readBindEntries(path)
+		entries, err := readBindEntries(path, env)
 		if err != nil {
 			return nil, err
 		}
@@ -263,11 +271,24 @@ func effectiveBindEntries(files []string, stackDir string) (map[string]bindEntry
 
 // parseVolume normalizes one volumes element (short string syntax or long
 // mapping syntax). ok is false for named volumes and anonymous volumes, which
-// carry no host-relative source.
-func parseVolume(service string, v any, file string, index int) (bindEntry, bool, error) {
+// carry no host-relative source. Variables are expanded first, exactly as
+// compose does before it splits a short entry at ":" — splitting first would
+// cut ${VAR:-/default} apart.
+func parseVolume(service string, v any, file string, index int, env Lookup) (bindEntry, bool, error) {
+	expand := func(raw string) (string, error) {
+		out, err := interpolate(raw, env)
+		if err != nil {
+			return "", fmt.Errorf("%s: service %s: volumes[%d]: %w", file, service, index, err)
+		}
+		return out, nil
+	}
 	switch value := v.(type) {
 	case string:
-		parts := strings.Split(value, ":")
+		expanded, err := expand(value)
+		if err != nil {
+			return bindEntry{}, false, err
+		}
+		parts := strings.Split(expanded, ":")
 		// One part is an anonymous volume ("/data"); two or more is a bind
 		// or a named volume. Windows drive letters are not a concern: dockops
 		// targets Linux hosts.
@@ -275,15 +296,10 @@ func parseVolume(service string, v any, file string, index int) (bindEntry, bool
 			return bindEntry{}, false, nil
 		}
 		source, target := parts[0], parts[1]
+		if source == "" && strings.Contains(value, "$") {
+			return bindEntry{}, false, fmt.Errorf("%s: service %s: volumes[%d]: bind source of %q interpolates to an empty path", file, service, index, value)
+		}
 		if !looksLikePath(source) {
-			// A source carrying ${...} or $VAR can still resolve to a
-			// relative path (./config via ${CONF_DIR:-./config}). It is
-			// neither a named volume nor rewritable here — the value is
-			// only known after interpolation — so it must not pass
-			// silently as "named volume".
-			if strings.Contains(source, "$") {
-				return bindEntry{}, false, fmt.Errorf("%s: service %s: volumes[%d]: bind source %q is interpolated; dockops cannot resolve a variable source — declare it as a literal relative or absolute path", file, service, index, source)
-			}
 			return bindEntry{}, false, nil
 		}
 		return bindEntry{
@@ -294,8 +310,16 @@ func parseVolume(service string, v any, file string, index int) (bindEntry, bool
 		}, true, nil
 	case map[string]any:
 		typ, _ := value["type"].(string)
-		source, _ := value["source"].(string)
-		target, _ := value["target"].(string)
+		rawSource, _ := value["source"].(string)
+		rawTarget, _ := value["target"].(string)
+		source, err := expand(rawSource)
+		if err != nil {
+			return bindEntry{}, false, err
+		}
+		target, err := expand(rawTarget)
+		if err != nil {
+			return bindEntry{}, false, err
+		}
 		if typ != "bind" || source == "" {
 			return bindEntry{}, false, nil
 		}
@@ -429,10 +453,16 @@ func reverseTranslate(p string, roots []BindRoot) (string, bool) {
 // stripped so the message names the source as it is written in the compose
 // file rather than an absolute rebuild of it.
 func NonPortableBinds(files []string, stackDir string, roots []BindRoot) ([]string, error) {
+	return NonPortableBindsEnv(files, stackDir, roots, nil)
+}
+
+// NonPortableBindsEnv is NonPortableBinds with the variables the deploy
+// interpolates with (see EnvLookup and RewriteRelativeBindsEnv).
+func NonPortableBindsEnv(files []string, stackDir string, roots []BindRoot, env Lookup) ([]string, error) {
 	if len(roots) == 0 {
 		return nil, nil
 	}
-	effective, err := effectiveBindEntries(files, stackDir)
+	effective, err := effectiveBindEntries(files, stackDir, env)
 	if err != nil {
 		return nil, err
 	}

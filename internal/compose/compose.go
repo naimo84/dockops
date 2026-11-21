@@ -139,7 +139,7 @@ func (e *Executor) Up(ctx context.Context, stack config.Stack, stackDir, envFile
 	if err != nil {
 		return err
 	}
-	fileArgs, bindCleanup, err := e.bindOverrideArgs(ctx, stack, stackDir)
+	fileArgs, bindCleanup, err := e.bindOverrideArgs(ctx, stack, stackDir, envFile)
 	if err != nil {
 		return err
 	}
@@ -179,7 +179,7 @@ func bindOverrideTempName(path string) string { return path + ".tmp" }
 // Cleanup removes the generated file again — it must not look like part of
 // the stack on the next pass (the checkout is cleaned, a stale file would
 // confuse the hash and the operator alike).
-func (e *Executor) bindOverrideArgs(ctx context.Context, stack config.Stack, stackDir string) ([]string, func(), error) {
+func (e *Executor) bindOverrideArgs(ctx context.Context, stack config.Stack, stackDir, envFile string) ([]string, func(), error) {
 	fileArgs := composeFileArgs(stack, stackDir)
 	cleanup := func() {}
 	files := stack.EffectiveComposeFiles()
@@ -204,7 +204,11 @@ func (e *Executor) bindOverrideArgs(ctx context.Context, stack config.Stack, sta
 				"stack", stack.Name, "error", err.Error())
 		}
 	}
-	raw, count, err := RewriteRelativeBinds(resolved, stackDir, roots)
+	env, err := EnvLookup(envFile)
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("stack %s: %w", stack.Name, err)
+	}
+	raw, count, err := RewriteRelativeBindsEnv(resolved, stackDir, roots, env)
 	if err != nil {
 		return nil, cleanup, fmt.Errorf("stack %s: %w", stack.Name, err)
 	}

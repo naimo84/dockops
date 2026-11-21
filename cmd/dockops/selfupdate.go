@@ -244,7 +244,11 @@ func (h *helper) bindOverrideFiles(p selfupdate.Plan) ([]string, func(), error) 
 	for _, m := range h.mounts {
 		roots = append(roots, compose.BindRoot{Container: m.Path, Host: m.Host})
 	}
-	raw, count, err := compose.RewriteRelativeBinds(files, p.StackDir, roots)
+	env, err := compose.EnvLookup(p.EnvFile)
+	if err != nil {
+		return nil, cleanup, err
+	}
+	raw, count, err := compose.RewriteRelativeBindsEnv(files, p.StackDir, roots, env)
 	if err != nil {
 		return nil, cleanup, err
 	}
