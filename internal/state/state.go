@@ -74,6 +74,13 @@ type State struct {
 	// deployed from multiple files (compose_files); ComposeFile stays empty
 	// in that case. Optional, see ComposeFile.
 	ComposeFiles []string `json:"compose_files,omitempty"`
+	// IgnoreServices mirrors the stack's ignore_services at deploy time so
+	// the /status drift matrix can skip the services whose containers are
+	// *meant* to have exited (init-container pattern). Without it the
+	// matrix's documented fallback counts the exited init container as
+	// drift "partial" on every stack that uses the pattern. Purely additive
+	// and optional (old state files load unchanged, fileVersion stays 1).
+	IgnoreServices []string `json:"ignore_services,omitempty"`
 	// Images holds the last update check per image reference (phase 10).
 	// Purely additive and optional: state files written before the field
 	// existed load unchanged, and fileVersion stays 1 — nothing about a

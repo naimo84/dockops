@@ -386,8 +386,24 @@ func buildStackStatus(containers []compose.Container, listingErr error, name str
 		return entry
 	}
 	entry.Containers = sortContainers(containers)
-	entry.Drift = driftFor(containers)
+	entry.Drift = driftFor(containers, ignoredServices(st))
 	return entry
+}
+
+// ignoredServices returns the stack's recorded ignore_services (see
+// state.State): the services whose containers are *meant* to have exited
+// (init-container pattern) and therefore never count as drift. Only
+// trailing-name matches are filtered: the state records the stack's names,
+// while container names carry project/service suffixes.
+func ignoredServices(st state.State) map[string]bool {
+	if len(st.IgnoreServices) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(st.IgnoreServices))
+	for _, s := range st.IgnoreServices {
+		out[s] = true
+	}
+	return out
 }
 
 // buildStackUpdates renders the recorded image update check of one stack.
@@ -467,15 +483,23 @@ func formatTime(t time.Time) string {
 //	        restarting (a crash loop) or running unhealthy
 //	unknown listing failed (set by the caller, never returned here)
 //
-// The state store records no expected-service list yet, so the comparison
-// the briefing describes ("mind. 1 Service des Stacks fehlt") runs in its
-// documented fallback form. A crash-looping or unhealthy container is the
-// failure a watchdog exists for, so it never reads as ok; the values stay
-// the four the consumers (fleet page) know. Other states (created, paused)
-// count as neither — they are transient by nature.
-func driftFor(containers []compose.Container) string {
+// Containers of ignored services (the stack's recorded ignore_services —
+// the init-container pattern, whose containers exit with code 0 by design)
+// are skipped entirely: counting them as exited would report drift
+// "partial" for a healthy stack, forever.
+//
+// The state store records no expected-service list beyond that, so the
+// comparison the briefing describes ("mind. 1 Service des Stacks fehlt")
+// runs in its documented fallback form. A crash-looping or unhealthy
+// container is the failure a watchdog exists for, so it never reads as ok;
+// the values stay the four the consumers (fleet page) know. Other states
+// (created, paused) count as neither — they are transient by nature.
+func driftFor(containers []compose.Container, ignored map[string]bool) string {
 	running, exited, troubled := 0, 0, 0
 	for _, c := range containers {
+		if ignored[c.Service] || ignored[c.Name] {
+			continue
+		}
 		switch c.State {
 		case "running":
 			running++

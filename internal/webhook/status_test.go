@@ -474,7 +474,7 @@ func TestDriftMatrixFlagsTroubledContainers(t *testing.T) {
 		{"none", nil, driftStopped},
 	}
 	for _, tc := range cases {
-		if got := driftFor(tc.containers); got != tc.want {
+		if got := driftFor(tc.containers, nil); got != tc.want {
 			t.Errorf("%s: driftFor() = %q, want %q", tc.name, got, tc.want)
 		}
 	}
@@ -506,5 +506,39 @@ func TestStatusReportsFailedDeploy(t *testing.T) {
 	}
 	if web["drift"] != driftOK {
 		t.Errorf("drift = %v, want ok (the old containers still run)", web["drift"])
+	}
+}
+
+// The init-container pattern: a service whose container exits with code 0 by
+// design must not turn a healthy stack into drift "partial" — the state
+// records the stack's ignore_services and the matrix skips those containers
+// (by service and, as a fallback, by container name).
+func TestDriftMatrixIgnoresRecordedIgnoreServices(t *testing.T) {
+	containers := []compose.Container{
+		{Name: "traefik", Service: "traefik", State: "running"},
+		{Name: "traefik-init-container-1", Service: "init-container", State: "exited"},
+	}
+	ignored := map[string]bool{"init-container": true}
+	if got := driftFor(containers, ignored); got != driftOK {
+		t.Errorf("driftFor() = %q, want %q (init-container ignored)", got, driftOK)
+	}
+	if got := driftFor(containers, nil); got != driftPartial {
+		t.Errorf("driftFor() without ignore_services = %q, want %q", got, driftPartial)
+	}
+	// A troubled *kept* container still wins: ignoring one service must not
+	// hide a crash loop in another.
+	troubled := append(append([]compose.Container{}, containers...),
+		compose.Container{Name: "api", Service: "api", State: "restarting"})
+	if got := driftFor(troubled, ignored); got != driftPartial {
+		t.Errorf("driftFor() with crash loop = %q, want %q", got, driftPartial)
+	}
+	// Name fallback: state recorded the service name, the container matches
+	// only by name (older compose ps output without the service field).
+	byName := []compose.Container{
+		{Name: "init-container", State: "exited"},
+		{Name: "traefik", State: "running"},
+	}
+	if got := driftFor(byName, ignored); got != driftOK {
+		t.Errorf("driftFor() name fallback = %q, want %q", got, driftOK)
 	}
 }
