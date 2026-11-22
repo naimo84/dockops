@@ -486,6 +486,71 @@ hooks:
 	}
 }
 
+func TestImportComposeFilesOverride(t *testing.T) {
+	t.Run("import list replaces auto-detection and keeps order", func(t *testing.T) {
+		rootFile, _, workDir := newRepo(t)
+		writeRemoteStack(t, workDir, "stacks/alloy", "name: alloy\n", "compose.yaml")
+		// The overlay exists next to the base compose file but is NOT matched
+		// by the default auto-detection patterns; only the import list makes
+		// it part of the -f chain.
+		if err := os.WriteFile(filepath.Join(workDir, "infra", "stacks", "alloy", "netcup.compose.yaml"), []byte("services: {}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, rootFile, rootWithImports(workDir, `imports:
+  - remote: infra
+    path: stacks/alloy
+    compose_files: [compose.yaml, netcup.compose.yaml]
+`))
+
+		cfg, err := Load(rootFile)
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		s := cfg.Stacks[0]
+		dir := filepath.Join(workDir, "infra", "stacks", "alloy")
+		want := []string{
+			filepath.Join(dir, "compose.yaml"),
+			filepath.Join(dir, "netcup.compose.yaml"),
+		}
+		if !reflect.DeepEqual(s.ComposeFiles, want) {
+			t.Errorf("ComposeFiles = %v, want %v", s.ComposeFiles, want)
+		}
+		if s.ComposeFile != "" {
+			t.Errorf("ComposeFile = %q, want empty (compose_files wins over auto-detection)", s.ComposeFile)
+		}
+	})
+
+	t.Run("missing file fails with index", func(t *testing.T) {
+		rootFile, _, workDir := newRepo(t)
+		writeRemoteStack(t, workDir, "stacks/app", "name: app\n", "compose.yaml")
+		writeFile(t, rootFile, rootWithImports(workDir, `imports:
+  - remote: infra
+    path: stacks/app
+    compose_files: [compose.yaml, overlay.compose.yaml]
+`))
+
+		_, err := Load(rootFile)
+		if err == nil || !strings.Contains(err.Error(), `compose_files[1] "overlay.compose.yaml"`) {
+			t.Fatalf("Load() error = %v, want missing compose_files[1]", err)
+		}
+	})
+
+	t.Run("base compose_file plus import compose_files is an error", func(t *testing.T) {
+		rootFile, _, workDir := newRepo(t)
+		writeRemoteStack(t, workDir, "stacks/app", "name: app\ncompose_file: compose.yaml\n", "compose.yaml")
+		writeFile(t, rootFile, rootWithImports(workDir, `imports:
+  - remote: infra
+    path: stacks/app
+    compose_files: [compose.yaml]
+`))
+
+		_, err := Load(rootFile)
+		if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+			t.Fatalf("Load() error = %v, want mutually exclusive", err)
+		}
+	})
+}
+
 func TestImportServicesEmptyKeepsAll(t *testing.T) {
 	baseYAML := "services: [server, worker]\n"
 

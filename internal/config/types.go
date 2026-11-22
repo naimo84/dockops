@@ -215,6 +215,7 @@ type Import struct {
 	Profiles          []string `yaml:"profiles"`
 	Services          []string `yaml:"services"`
 	IgnoreServices    []string `yaml:"ignore_services"`
+	ComposeFiles      []string `yaml:"compose_files"`
 	EnvFiles          []string `yaml:"env_files"`
 	SopsFiles         []string `yaml:"sops_files"`
 	VaultPaths        []string `yaml:"vault_paths"`

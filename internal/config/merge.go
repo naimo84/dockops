@@ -5,14 +5,20 @@ package config
 //
 // Merge semantics per the briefing:
 //   - profiles, env_files, sops_files, vault_paths, vault_env_templates,
-//     hooks.* and ignore_services: concatenated base-first and
-//     de-duplicated (first occurrence wins).
+//     hooks.*, ignore_services and compose_files: concatenated base-first
+//     and de-duplicated (first occurrence wins).
 //   - services: if the import sets services, the import list replaces the
 //     base list (subset filter); an empty or unset import list means "all"
 //     and keeps the base list.
 //   - name: the import name overrides the stack name when set; otherwise the
 //     base name wins (the folder-name fallback is applied by the caller
 //     after the merge).
+//
+// compose_files concatenates because the -f order defines override
+// precedence: base files first, the host-specific overlay from the import
+// last. A base stack without compose_files auto-detects only after the
+// merge (resolveComposeFile), so an import list fully determines the files
+// when the base declares none.
 //
 // The import's sops_files are plain paths; they merge as SopsFile values
 // without an age key file.
@@ -23,6 +29,7 @@ func applyImport(base Stack, imp Import) Stack {
 	}
 	merged.Profiles = concatDedup(base.Profiles, imp.Profiles)
 	merged.IgnoreServices = concatDedup(base.IgnoreServices, imp.IgnoreServices)
+	merged.ComposeFiles = concatDedup(base.ComposeFiles, imp.ComposeFiles)
 	merged.EnvFiles = concatDedup(base.EnvFiles, imp.EnvFiles)
 	merged.VaultPaths = concatDedup(base.VaultPaths, imp.VaultPaths)
 	merged.VaultEnvTemplates = concatDedup(base.VaultEnvTemplates, imp.VaultEnvTemplates)
