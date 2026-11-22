@@ -1004,12 +1004,13 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	}
 
 	if err := r.state.Set(stack.Name, state.State{
-		Hash:         newHash,
-		Status:       state.StatusDeployed,
-		StackDir:     stack.Dir,
-		ComposeFile:  stack.ComposeFile,
-		ComposeFiles: stack.ComposeFiles,
-		UpdatePolicy: stack.EffectiveUpdatePolicy(),
+		Hash:           newHash,
+		Status:         state.StatusDeployed,
+		StackDir:       stack.Dir,
+		ComposeFile:    stack.ComposeFile,
+		ComposeFiles:   stack.ComposeFiles,
+		IgnoreServices: stack.IgnoreServices,
+		UpdatePolicy:   stack.EffectiveUpdatePolicy(),
 	}); err != nil {
 		return fmt.Errorf("stack %s: record state: %w", stack.Name, err)
 	}
