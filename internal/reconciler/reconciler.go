@@ -93,7 +93,7 @@ type GitManager interface {
 // ComposeExecutor is the subset of compose.Executor the reconciler needs.
 type ComposeExecutor interface {
 	// Up brings a stack up detached (compose.Executor.Up).
-	Up(ctx context.Context, stack config.Stack, stackDir, envFile string) error
+	Up(ctx context.Context, stack config.Stack, stackDir, envFile string, opts compose.UpOptions) error
 
 	// Down tears a stack down (compose.Executor.Down).
 	Down(ctx context.Context, stack config.Stack, stackDir, envFile string) error
@@ -838,9 +838,27 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 		}
 		envFileContents = append(envFileContents, content)
 	}
+	// restart_files are files the services read at startup behind compose's
+	// back (a bind-mounted static config). They enter the hash like
+	// env_files; a missing file is an error, not an empty content — a typo
+	// would otherwise silently disable the restart it was configured for.
+	restartContents := make([][]byte, 0, len(stack.RestartFiles))
+	for _, rel := range stack.RestartFiles {
+		path := rel
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(stack.Dir, path)
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("stack %s: read restart file %s: %w", stack.Name, path, err)
+		}
+		restartContents = append(restartContents, content)
+	}
+	restartDigest := stackhash.RestartFilesDigest(stack.RestartFiles, restartContents)
 	newHash, err := stackhash.ComputeWithInputs(stack, stackhash.Inputs{
 		VaultEnvTemplates: templateContents,
 		EnvFiles:          envFileContents,
+		RestartFiles:      restartContents,
 	}, contents...)
 	if err != nil {
 		return fmt.Errorf("stack %s: compute hash: %w", stack.Name, err)
@@ -877,7 +895,18 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 			return nil
 		}
 	}
-	r.logger.Info("deploying stack", "stack", stack.Name, "hash", newHash)
+	// A restart file differs from the last successful deploy (or that
+	// deploy predates restart_files, or the last attempt failed): compose
+	// cannot see the change, so the containers must be recreated
+	// explicitly. Without restart_files the digest is empty on both sides.
+	upOpts := compose.UpOptions{}
+	if restartDigest != "" {
+		prev, _ := r.state.Get(stack.Name)
+		if prev.Status != state.StatusDeployed || prev.RestartFilesDigest != restartDigest {
+			upOpts.ForceRecreate = true
+		}
+	}
+	r.logger.Info("deploying stack", "stack", stack.Name, "hash", newHash, "force_recreate", upOpts.ForceRecreate)
 
 	// Secrets: the Vault client is built and logged in lazily, at most once
 	// per pass, and only when a stack actually carries vault paths or vault
@@ -981,7 +1010,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 			"stack", stack.Name, "hint", "set "+envSelfImage)
 	}
 
-	if err := r.compose.Up(ctx, stack, stack.Dir, envFile); err != nil {
+	if err := r.compose.Up(ctx, stack, stack.Dir, envFile, upOpts); err != nil {
 		// Deployment failed: restore whatever .env was there before, so the
 		// stack directory does not advertise an environment its services
 		// are not running with.
@@ -1004,13 +1033,14 @@ func (r *Reconciler) deployStack(ctx context.Context, stack config.Stack, vaultS
 	}
 
 	if err := r.state.Set(stack.Name, state.State{
-		Hash:           newHash,
-		Status:         state.StatusDeployed,
-		StackDir:       stack.Dir,
-		ComposeFile:    stack.ComposeFile,
-		ComposeFiles:   stack.ComposeFiles,
-		IgnoreServices: stack.IgnoreServices,
-		UpdatePolicy:   stack.EffectiveUpdatePolicy(),
+		Hash:               newHash,
+		Status:             state.StatusDeployed,
+		StackDir:           stack.Dir,
+		ComposeFile:        stack.ComposeFile,
+		ComposeFiles:       stack.ComposeFiles,
+		IgnoreServices:     stack.IgnoreServices,
+		UpdatePolicy:       stack.EffectiveUpdatePolicy(),
+		RestartFilesDigest: restartDigest,
 	}); err != nil {
 		return fmt.Errorf("stack %s: record state: %w", stack.Name, err)
 	}

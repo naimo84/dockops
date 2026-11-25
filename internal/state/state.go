@@ -81,6 +81,11 @@ type State struct {
 	// drift "partial" on every stack that uses the pattern. Purely additive
 	// and optional (old state files load unchanged, fileVersion stays 1).
 	IgnoreServices []string `json:"ignore_services,omitempty"`
+	// RestartFilesDigest is stackhash.RestartFilesDigest of the stack's
+	// restart_files at the last successful deploy. A different digest on
+	// the next deploy means a restart file changed, and the stack is
+	// recreated with --force-recreate. Additive, omitempty.
+	RestartFilesDigest string `json:"restart_files_digest,omitempty"`
 	// Images holds the last update check per image reference (phase 10).
 	// Purely additive and optional: state files written before the field
 	// existed load unchanged, and fileVersion stays 1 — nothing about a

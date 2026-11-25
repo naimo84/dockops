@@ -561,6 +561,15 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
   Mounts (`reverseTranslate`) liegt — sonst wird der dokumentierte
   Host-Pfad-Workaround zum Fehlalarm.
 
+- `restart_files` (Stack + Import, concat+dedup): Dateien, die Container beim
+  Start lesen, ohne dass compose sie sieht (Bind-gemountete statische
+  Config). Inhalte als Digests im Stack-Hash (`RestartFileContents`,
+  omitempty, kein Schema-Bump — nur Stacks mit dem Feld bekommen einmal einen
+  neuen Hash). Zusätzlich `state.RestartFilesDigest`: weicht er ab (oder ist
+  der letzte Status nicht deployed), ruft der Reconciler
+  `compose.Up(..., UpOptions{ForceRecreate: true})` → `up -d --force-recreate`.
+  Fehlende Datei = Deploy-Fehler. Self-Stack-Helper-Pfad kennt kein Force.
+
 ## Checks vor jedem Commit
 
     export PATH=$HOME/.local/go/bin:$PATH

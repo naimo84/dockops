@@ -45,7 +45,7 @@ func TestDockerCallsHaveDeadlines(t *testing.T) {
 	}
 	stackDir := t.TempDir()
 	writeStackFile(t, stackDir, "compose.yaml", "services:\n  app:\n    image: alpine\n")
-	err = e.Up(context.Background(), config.Stack{Name: "web", ComposeFile: "compose.yaml"}, stackDir, filepath.Join(stackDir, "x.env"))
+	err = e.Up(context.Background(), config.Stack{Name: "web", ComposeFile: "compose.yaml"}, stackDir, filepath.Join(stackDir, "x.env"), UpOptions{})
 	if err == nil || !strings.Contains(err.Error(), "timed out after 100ms") {
 		t.Errorf("Up() error = %v, want a timeout", err)
 	}
