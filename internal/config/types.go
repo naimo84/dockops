@@ -220,6 +220,7 @@ type Import struct {
 	SopsFiles         []string `yaml:"sops_files"`
 	VaultPaths        []string `yaml:"vault_paths"`
 	VaultEnvTemplates []string `yaml:"vault_env_templates"`
+	RestartFiles      []string `yaml:"restart_files"`
 	Hooks             Hooks    `yaml:"hooks"`
 }
 
@@ -257,7 +258,14 @@ type Stack struct {
 	// into the stack environment at the same priority as vault_paths —
 	// compatibility with existing vault.env files (see env.RenderVaultTemplate).
 	VaultEnvTemplates []string `yaml:"vault_env_templates"`
-	Hooks             Hooks    `yaml:"hooks"`
+	// RestartFiles lists files (relative to Dir, or absolute) that the
+	// stack's containers read at startup without compose knowing about it —
+	// typically a bind-mounted static config such as traefik's config.yaml.
+	// Their contents enter the stack hash, and a change of any of them
+	// deploys the stack with --force-recreate: a plain "up -d" would leave
+	// the containers untouched because the compose model did not change.
+	RestartFiles []string `yaml:"restart_files"`
+	Hooks        Hooks    `yaml:"hooks"`
 	// UpdatePolicy decides what the image update check does with a stack
 	// whose image tag moved: "notify" (default) only reports it, "pinned"
 	// skips the stack completely (no registry lookups, no state records),

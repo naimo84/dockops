@@ -197,7 +197,7 @@ services:
 	stack := config.Stack{Name: "s", ComposeFile: "compose.yaml"}
 
 	ex := quietExecutor().WithSelfContainer("agent")
-	if err := ex.Up(context.Background(), stack, stackDir, envFile); err != nil {
+	if err := ex.Up(context.Background(), stack, stackDir, envFile, UpOptions{}); err != nil {
 		t.Fatalf("Up() error = %v", err)
 	}
 	raw, err := os.ReadFile(argsFile)

@@ -37,7 +37,7 @@ func TestUpPassesBindOverrideAndRemovesIt(t *testing.T) {
 	setDockerStdout(t, `[{"Type":"bind","Source":"/host`+stackDir+`","Destination":"`+stackDir+`"}]`)
 
 	ex := quietExecutor().WithSelfContainer("agent")
-	if err := ex.Up(context.Background(), stack, stackDir, ""); err != nil {
+	if err := ex.Up(context.Background(), stack, stackDir, "", UpOptions{}); err != nil {
 		t.Fatalf("Up() error = %v", err)
 	}
 	override := filepath.Join(stackDir, "dockops-binds-s.yaml")
@@ -62,7 +62,7 @@ func TestUpRefusesUntranslatableRelativeSource(t *testing.T) {
 	stack, stackDir := bindExecStack(t)
 
 	ex := quietExecutor().WithSelfContainer("agent")
-	err := ex.Up(context.Background(), stack, stackDir, "")
+	err := ex.Up(context.Background(), stack, stackDir, "", UpOptions{})
 	if err == nil || !strings.Contains(err.Error(), "outside every mount") {
 		t.Fatalf("Up() error = %v, want the bind refusal", err)
 	}

@@ -64,6 +64,7 @@ type upCall struct {
 	env            map[string]string // content of the env file at call time
 	stackEnvExists bool              // <stackDir>/.env existed at call time
 	stackEnv       map[string]string // content of <stackDir>/.env at call time
+	forceRecreate  bool              // UpOptions.ForceRecreate
 }
 
 // pullCall records one compose.Pull invocation (phase 11).
@@ -145,11 +146,11 @@ type fakeCompose struct {
 	tagErr            error
 }
 
-func (f *fakeCompose) Up(_ context.Context, stack config.Stack, stackDir, envFile string) error {
+func (f *fakeCompose) Up(_ context.Context, stack config.Stack, stackDir, envFile string, opts compose.UpOptions) error {
 	if f.onUp != nil {
 		f.onUp(stack.Name)
 	}
-	call := upCall{stack: stack, stackDir: stackDir, envFile: envFile}
+	call := upCall{stack: stack, stackDir: stackDir, envFile: envFile, forceRecreate: opts.ForceRecreate}
 	if info, err := os.Stat(envFile); err == nil && info.Mode().IsRegular() {
 		call.envExists = true
 		if raw, err := os.ReadFile(envFile); err == nil {

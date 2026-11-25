@@ -85,6 +85,13 @@ type canonicalStack struct {
 	// redeploy. Omitted when empty — see schemaVersion for why that keeps
 	// every other hash stable.
 	EnvFileContents []string `json:"env_file_contents,omitempty"`
+	// RestartFiles and RestartFileContents (one SHA-256 hex digest per
+	// entry, in order) cover the stack's restart_files: a change of such a
+	// file is a deployment change, just one compose cannot see. Both are
+	// omitted when empty, added without a schema bump for the same reason as
+	// EnvFileContents — only stacks that use restart_files get a new hash.
+	RestartFiles        []string `json:"restart_files,omitempty"`
+	RestartFileContents []string `json:"restart_file_contents,omitempty"`
 }
 
 // canonicalSopsFile is the hash-relevant projection of config.SopsFile.
@@ -162,10 +169,12 @@ type Inputs struct {
 	VaultEnvTemplates [][]byte
 	// EnvFiles are the contents of stack.EnvFiles.
 	EnvFiles [][]byte
+	// RestartFiles are the contents of stack.RestartFiles.
+	RestartFiles [][]byte
 }
 
 // ComputeWithInputs is Compute plus the contents of the stack's vault env
-// templates and env_files (see Inputs). The deploy path passes both, so an
+// templates, env_files and restart_files (see Inputs). The deploy path passes both, so an
 // edit of either redeploys the stack. Only file text enters the hash, never
 // a value resolved from a secret store.
 func ComputeWithInputs(stack config.Stack, in Inputs, composeContents ...[]byte) (string, error) {
@@ -177,6 +186,10 @@ func ComputeWithInputs(stack config.Stack, in Inputs, composeContents ...[]byte)
 	if len(in.EnvFiles) != 0 && len(in.EnvFiles) != len(stack.EnvFiles) {
 		return "", fmt.Errorf("stack %s: %d env file contents for %d env_files",
 			stack.Name, len(in.EnvFiles), len(stack.EnvFiles))
+	}
+	if len(in.RestartFiles) != 0 && len(in.RestartFiles) != len(stack.RestartFiles) {
+		return "", fmt.Errorf("stack %s: %d restart file contents for %d restart_files",
+			stack.Name, len(in.RestartFiles), len(stack.RestartFiles))
 	}
 	digests := contentDigests(templateContents)
 	files := stack.EffectiveComposeFiles()
@@ -206,6 +219,8 @@ func ComputeWithInputs(stack config.Stack, in Inputs, composeContents ...[]byte)
 		VaultEnvTemplates:        nilIfEmpty(stack.VaultEnvTemplates),
 		VaultEnvTemplateContents: nilIfEmpty(digests),
 		EnvFileContents:          nilIfEmpty(contentDigests(in.EnvFiles)),
+		RestartFiles:             nilIfEmpty(stack.RestartFiles),
+		RestartFileContents:      nilIfEmpty(contentDigests(in.RestartFiles)),
 		Hooks: canonicalHooks{
 			PreDeploy:  nilIfEmpty(stack.Hooks.PreDeploy),
 			PostDeploy: nilIfEmpty(stack.Hooks.PostDeploy),
@@ -221,6 +236,26 @@ func ComputeWithInputs(stack config.Stack, in Inputs, composeContents ...[]byte)
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// RestartFilesDigest condenses the restart_files contents into one SHA-256
+// hex digest (paths and contents, in order) for the state store, so the
+// reconciler can tell a restart_files change apart from any other hash
+// change. Empty when the stack has no restart_files.
+func RestartFilesDigest(paths []string, contents [][]byte) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	h := sha256.New()
+	for i, p := range paths {
+		var c []byte
+		if i < len(contents) {
+			c = contents[i]
+		}
+		sum := sha256.Sum256(c)
+		fmt.Fprintf(h, "%s\x00%s\n", p, hex.EncodeToString(sum[:]))
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // contentDigests returns the SHA-256 hex digest of every content, in order.

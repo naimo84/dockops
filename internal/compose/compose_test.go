@@ -80,7 +80,7 @@ func TestUpArguments(t *testing.T) {
 	// The bind rewrite reads the compose file; a file without volumes yields
 	// no override and the command line stays exactly as before.
 	writeStackFile(t, stackDir, "compose.yaml", "services:\n  api:\n    image: alpine\n")
-	if err := e.Up(context.Background(), stack, stackDir, envFile); err != nil {
+	if err := e.Up(context.Background(), stack, stackDir, envFile, UpOptions{}); err != nil {
 		t.Fatalf("Up() error = %v", err)
 	}
 
@@ -107,7 +107,7 @@ func TestUpMinimalArguments(t *testing.T) {
 
 	stack := config.Stack{Name: "solo", ComposeFile: "compose.yml"}
 	writeStackFile(t, stackDir, "compose.yml", "services:\n  solo:\n    image: alpine\n")
-	if err := e.Up(context.Background(), stack, stackDir, envFile); err != nil {
+	if err := e.Up(context.Background(), stack, stackDir, envFile, UpOptions{}); err != nil {
 		t.Fatalf("Up() error = %v", err)
 	}
 	want := []string{
@@ -135,7 +135,7 @@ func TestUpAbsoluteComposeFilePassesThrough(t *testing.T) {
 	}
 
 	stack := config.Stack{Name: "web", ComposeFile: composeFile}
-	if err := e.Up(context.Background(), stack, stackDir, filepath.Join(t.TempDir(), "e.env")); err != nil {
+	if err := e.Up(context.Background(), stack, stackDir, filepath.Join(t.TempDir(), "e.env"), UpOptions{}); err != nil {
 		t.Fatalf("Up() error = %v", err)
 	}
 	got := recordedArgs(t, argsFile)
@@ -177,7 +177,7 @@ func TestFailingCommand(t *testing.T) {
 	t.Setenv("DOCKER_EXIT", "1")
 	e := quietExecutor()
 
-	err := e.Up(context.Background(), config.Stack{Name: "web"}, t.TempDir(), "stack.env")
+	err := e.Up(context.Background(), config.Stack{Name: "web"}, t.TempDir(), "stack.env", UpOptions{})
 	if err == nil || !strings.Contains(err.Error(), "exit status 1") {
 		t.Errorf("Up() error = %v, want exit status 1", err)
 	}
@@ -193,7 +193,7 @@ func TestFailingCommand(t *testing.T) {
 
 func TestMissingBinary(t *testing.T) {
 	e := New(nil, filepath.Join(t.TempDir(), "no-such-docker"))
-	err := e.Up(context.Background(), config.Stack{Name: "web"}, t.TempDir(), "stack.env")
+	err := e.Up(context.Background(), config.Stack{Name: "web"}, t.TempDir(), "stack.env", UpOptions{})
 	if err == nil || !strings.Contains(err.Error(), "no-such-docker") {
 		t.Errorf("Up() with missing binary error = %v, want binary mention", err)
 	}
@@ -227,7 +227,7 @@ func TestUpMultiFileArguments(t *testing.T) {
 		ComposeFiles: []string{"base.yaml", abs, "extra.yaml"}, // relative, absolute, relative
 	}
 	envFile := filepath.Join(t.TempDir(), "stack.env")
-	if err := e.Up(context.Background(), stack, stackDir, envFile); err != nil {
+	if err := e.Up(context.Background(), stack, stackDir, envFile, UpOptions{}); err != nil {
 		t.Fatalf("Up() error = %v", err)
 	}
 	want := []string{
@@ -305,7 +305,7 @@ func TestUpServicesMinusIgnore(t *testing.T) {
 		Services:       []string{"api", "worker", "db"},
 		IgnoreServices: []string{"worker"},
 	}
-	if err := e.Up(context.Background(), stack, stackDir, filepath.Join(t.TempDir(), "e.env")); err != nil {
+	if err := e.Up(context.Background(), stack, stackDir, filepath.Join(t.TempDir(), "e.env"), UpOptions{}); err != nil {
 		t.Fatalf("Up() error = %v", err)
 	}
 	got := recordedArgs(t, argsFile)
@@ -326,7 +326,7 @@ func TestUpIgnoreOnlyDerivesFromComposeFiles(t *testing.T) {
 		"services:\n  db:\n    image: postgres\n",
 	)
 	stack := config.Stack{Name: "web", ComposeFiles: files, IgnoreServices: []string{"worker"}}
-	if err := e.Up(context.Background(), stack, stackDir, filepath.Join(t.TempDir(), "e.env")); err != nil {
+	if err := e.Up(context.Background(), stack, stackDir, filepath.Join(t.TempDir(), "e.env"), UpOptions{}); err != nil {
 		t.Fatalf("Up() error = %v", err)
 	}
 	got := recordedArgs(t, argsFile)
@@ -343,7 +343,7 @@ func TestUpIgnoreErrors(t *testing.T) {
 		stackDir := t.TempDir()
 		files := writeComposeFiles(t, stackDir, "services:\n  api:\n    image: nginx\n")
 		stack := config.Stack{Name: "web", ComposeFiles: files, IgnoreServices: []string{"api"}}
-		err := e.Up(context.Background(), stack, stackDir, "e.env")
+		err := e.Up(context.Background(), stack, stackDir, "e.env", UpOptions{})
 		if err == nil || !strings.Contains(err.Error(), "ignore_services covers every service") {
 			t.Errorf("Up() error = %v, want covers-every-service error (no positional args would deploy everything)", err)
 		}
@@ -356,7 +356,7 @@ func TestUpIgnoreErrors(t *testing.T) {
 			Services:       []string{"api"},
 			IgnoreServices: []string{"api"},
 		}
-		err := e.Up(context.Background(), stack, t.TempDir(), "e.env")
+		err := e.Up(context.Background(), stack, t.TempDir(), "e.env", UpOptions{})
 		if err == nil || !strings.Contains(err.Error(), "every configured service is in ignore_services") {
 			t.Errorf("Up() error = %v, want all-ignored error", err)
 		}
@@ -369,7 +369,7 @@ func TestUpIgnoreErrors(t *testing.T) {
 			t.Fatalf("write broken compose: %v", err)
 		}
 		stack := config.Stack{Name: "web", ComposeFiles: []string{"broken.yaml"}, IgnoreServices: []string{"api"}}
-		err := e.Up(context.Background(), stack, stackDir, "e.env")
+		err := e.Up(context.Background(), stack, stackDir, "e.env", UpOptions{})
 		if err == nil || !strings.Contains(err.Error(), broken) {
 			t.Errorf("Up() error = %v, want error naming the unparsable file", err)
 		}
@@ -377,9 +377,33 @@ func TestUpIgnoreErrors(t *testing.T) {
 
 	t.Run("missing compose file", func(t *testing.T) {
 		stack := config.Stack{Name: "web", ComposeFiles: []string{"missing.yaml"}, IgnoreServices: []string{"api"}}
-		err := e.Up(context.Background(), stack, t.TempDir(), "e.env")
+		err := e.Up(context.Background(), stack, t.TempDir(), "e.env", UpOptions{})
 		if err == nil || !strings.Contains(err.Error(), "missing.yaml") {
 			t.Errorf("Up() error = %v, want error naming the missing file", err)
 		}
 	})
+}
+
+// UpOptions.ForceRecreate (changed restart_files) adds --force-recreate
+// after the fixed up flags, before the positional services.
+func TestUpForceRecreate(t *testing.T) {
+	argsFile := fakeDocker(t)
+	e := quietExecutor()
+	stackDir := t.TempDir()
+	envFile := filepath.Join(t.TempDir(), "stack.env")
+	stack := config.Stack{Name: "traefik", ComposeFile: "compose.yaml", Services: []string{"traefik"}}
+	writeStackFile(t, stackDir, "compose.yaml", "services:\n  traefik:\n    image: traefik\n")
+	if err := e.Up(context.Background(), stack, stackDir, envFile, UpOptions{ForceRecreate: true}); err != nil {
+		t.Fatalf("Up() error = %v", err)
+	}
+	want := []string{
+		"compose", "-p", "traefik",
+		"-f", filepath.Join(stackDir, "compose.yaml"),
+		"--env-file", envFile,
+		"up", "-d", "--remove-orphans", "--force-recreate",
+		"traefik",
+	}
+	if got := recordedArgs(t, argsFile); !reflect.DeepEqual(got, want) {
+		t.Errorf("Up() args = %v, want %v", got, want)
+	}
 }

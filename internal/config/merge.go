@@ -5,6 +5,7 @@ package config
 //
 // Merge semantics per the briefing:
 //   - profiles, env_files, sops_files, vault_paths, vault_env_templates,
+//     restart_files,
 //     hooks.*, ignore_services and compose_files: concatenated base-first
 //     and de-duplicated (first occurrence wins).
 //   - services: if the import sets services, the import list replaces the
@@ -33,6 +34,7 @@ func applyImport(base Stack, imp Import) Stack {
 	merged.EnvFiles = concatDedup(base.EnvFiles, imp.EnvFiles)
 	merged.VaultPaths = concatDedup(base.VaultPaths, imp.VaultPaths)
 	merged.VaultEnvTemplates = concatDedup(base.VaultEnvTemplates, imp.VaultEnvTemplates)
+	merged.RestartFiles = concatDedup(base.RestartFiles, imp.RestartFiles)
 	merged.Hooks = Hooks{
 		PreDeploy:  concatDedup(base.Hooks.PreDeploy, imp.Hooks.PreDeploy),
 		PostDeploy: concatDedup(base.Hooks.PostDeploy, imp.Hooks.PostDeploy),

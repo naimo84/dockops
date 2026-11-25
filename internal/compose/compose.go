@@ -122,6 +122,16 @@ func (e *Executor) WithSelfContainer(name string) *Executor {
 	return &copy
 }
 
+// UpOptions tunes a stack deploy (Executor.Up).
+type UpOptions struct {
+	// ForceRecreate recreates every selected container even when compose
+	// sees no change in its model. The reconciler sets it when one of the
+	// stack's restart_files changed: files the services read at startup
+	// (a bind-mounted static config) are invisible to compose's own change
+	// detection.
+	ForceRecreate bool
+}
+
 // Up brings the stack up detached:
 //
 //	<binary> compose -p <stack.Name> [-f <file> ...] [--profile p ...]
@@ -134,7 +144,9 @@ func (e *Executor) WithSelfContainer(name string) *Executor {
 // Profiles are appended in their configured order; the service filter
 // (services minus ignore_services, see UpServices) yields the positional
 // service arguments — docker compose takes them without a preceding "--".
-func (e *Executor) Up(ctx context.Context, stack config.Stack, stackDir, envFile string) error {
+//
+// opts.ForceRecreate appends --force-recreate (restart_files changed).
+func (e *Executor) Up(ctx context.Context, stack config.Stack, stackDir, envFile string, opts UpOptions) error {
 	services, err := UpServices(stack, stackDir)
 	if err != nil {
 		return err
@@ -145,11 +157,12 @@ func (e *Executor) Up(ctx context.Context, stack config.Stack, stackDir, envFile
 	}
 	defer bindCleanup()
 	args, err := upSpec{
-		project:  stack.Name,
-		fileArgs: fileArgs,
-		stackDir: stackDir,
-		profiles: stack.Profiles,
-		envFile:  envFile,
+		project:       stack.Name,
+		fileArgs:      fileArgs,
+		stackDir:      stackDir,
+		profiles:      stack.Profiles,
+		envFile:       envFile,
+		forceRecreate: opts.ForceRecreate,
 	}.args()
 	if err != nil {
 		return err
@@ -336,6 +349,8 @@ type upSpec struct {
 	envFile string
 	// noDeps adds --no-deps (targeted recreation, see UpOverride).
 	noDeps bool
+	// forceRecreate adds --force-recreate (see UpOptions).
+	forceRecreate bool
 }
 
 // args assembles the command line up to (not including) the positional
@@ -364,6 +379,9 @@ func (s upSpec) args() ([]string, error) {
 	args = append(args, "up", "-d", "--remove-orphans")
 	if s.noDeps {
 		args = append(args, "--no-deps")
+	}
+	if s.forceRecreate {
+		args = append(args, "--force-recreate")
 	}
 	return args, nil
 }

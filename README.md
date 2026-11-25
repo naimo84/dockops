@@ -125,7 +125,7 @@ imports:
 ```
 
 Merge-Regeln für Imports: `profiles`, `env_files`, `sops_files`,
-`vault_paths` und `hooks.*` werden angehängt (base zuerst, Dubletten
+`vault_paths`, `vault_env_templates`, `restart_files` und `hooks.*` werden angehängt (base zuerst, Dubletten
 entfallen); `services` ersetzt die Basis-Liste, wenn gesetzt (leer =
 alle); `name` überschreibt den Basis-Namen.
 
@@ -224,6 +224,17 @@ vault_paths:
 # wie vault_paths, Pfad relativ zum Stack-Verzeichnis
 vault_env_templates:
   - vault.env
+
+# Dateien, die die Container beim Start lesen, ohne dass compose sie kennt
+# (z. B. eine per Bind gemountete statische Config wie traefik/config.yaml).
+# Ihr Inhalt geht in den Stack-Hash ein; ändert sich eine davon, deployt
+# dockops den Stack mit `up -d --force-recreate` — ein normales `up -d`
+# ließe die Container stehen, weil sich das compose-Modell nicht ändert.
+# Pfade relativ zum Stack-Verzeichnis oder absolut; eine fehlende Datei ist
+# ein Deploy-Fehler. Der erste Deploy nach dem Eintragen recreated einmal.
+# Grenze: der Self-Stack (dockops) läuft über den Helper ohne Force.
+restart_files:
+  - config.yaml
 
 hooks:
   pre_deploy:
