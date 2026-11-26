@@ -578,6 +578,15 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
   env_files). Im Hash als `target_hostname` (omitempty, nur bei Opt-in —
   kein Schema-Bump, keine Fleet-weite Neuerstellung).
 
+- `POST /pull` (`internal/webhook/pull.go`, `internal/reconciler/pull.go`):
+  `RequestUpdateCheck` validiert die Auswahl wie `/restart` (unbekannt =
+  400, `pinned`/disabled → `skipped`) und legt Namen in `forcedChecks`
+  (Mutex); der Handler feuert den Trigger und antwortet 202.
+  `checkImageUpdates` leert die Menge zu Beginn und behandelt vorgemerkte
+  Stacks als fällig — sonst unverändert (Policy, Apply, Self-Helper).
+  `update_check_interval: 0` verwirft Anforderungen mit WARN. Auth:
+  `DOCKOPS_PULL_TOKEN` → `DOCKOPS_RESTART_TOKEN` → Webhook-Auth → 503.
+
 ## Checks vor jedem Commit
 
     export PATH=$HOME/.local/go/bin:$PATH

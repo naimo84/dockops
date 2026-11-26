@@ -1330,7 +1330,8 @@ Dazu die Vault-Variablen (Namen in `global.vault` konfigurierbar):
 (`auth_method: token`) bzw. `VAULT_ROLE_ID` + `VAULT_SECRET_ID`
 (`auth_method: approle`). Ohne eigenes Flag: `DOCKOPS_STATUS_TOKEN`
 (Bearer-Schutz für `GET /status`, leer = offen), `DOCKOPS_RESTART_TOKEN`
-(Bearer-Token für `POST /restart`, siehe unten), `DOCKOPS_SOPS_SIDECAR_TOKEN`
+(Bearer-Token für `POST /restart`, siehe unten), `DOCKOPS_PULL_TOKEN`
+(Bearer-Token für `POST /pull`, Fallback Restart-Token), `DOCKOPS_SOPS_SIDECAR_TOKEN`
 (Bearer-Token für den Sidecar, siehe „SOPS decryption“),
 `DOCKOPS_HOOK_PASSTHROUGH` (weitere Variablen, die Hooks erben, siehe
 „Lokale `stack.yaml`“), `DOCKOPS_SELF_PROJECT`
@@ -1401,6 +1402,30 @@ anderen Modi.
   Unbekannte Stack-Namen lehnen den ganzen Request mit **400** ab (dann
   wird nichts neu gestartet), eine falsche Methode mit **405**, fehlende
   Authentifizierung mit **401**.
+
+- `POST /pull` — Image-Update-Check **jetzt** statt erst nach
+  `global.update_check_interval`. Der Endpunkt merkt die Stacks nur vor und
+  stößt einen Reconcile-Durchlauf an; der Check läuft dort auf demselben Pfad
+  wie der stündliche, `update_policy` entscheidet also über die Folge:
+  `apply`-Stacks werden aktualisiert (Health-Gate, Rollback; der Self-Stack
+  über seinen Helper), `notify`-Stacks melden nur, `pinned` und deaktivierte
+  Stacks landen in `skipped`. `update_check_interval: 0` bleibt die
+  Notbremse — eine Anforderung wird dann verworfen (WARN), nicht aufgehoben.
+  Authentifizierung: `DOCKOPS_PULL_TOKEN`, sonst `DOCKOPS_RESTART_TOKEN`, sonst
+  die Webhook-Authentifizierung; ohne alles **503**. Body wie bei
+  `/restart` (optional, ohne = alle Stacks):
+
+      # dockops selbst sofort auf das neueste Image heben
+      curl -X POST http://localhost:8080/pull \
+        -H "Authorization: Bearer $DOCKOPS_PULL_TOKEN" \
+        -d '{"stacks":["dockops"]}'
+
+  Antwort **202** (asynchron — das Ergebnis steht danach in `GET /status`
+  unter `updates` und in den Benachrichtigungen):
+
+      {"queued":["dockops"],"skipped":[{"stack":"db","reason":"update_policy: pinned"}]}
+
+  Unbekannte Namen → **400** (nichts vorgemerkt), falsche Methode → **405**.
 
 - `GET /healthz` — Liveness: `200 ok`, solange der Reconcile-Loop arbeitet;
   **503** mit Grund, wenn ein Durchlauf länger als max(3× Poll-Intervall, 1 h)
