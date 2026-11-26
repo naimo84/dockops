@@ -92,6 +92,11 @@ type canonicalStack struct {
 	// EnvFileContents — only stacks that use restart_files get a new hash.
 	RestartFiles        []string `json:"restart_files,omitempty"`
 	RestartFileContents []string `json:"restart_file_contents,omitempty"`
+	// TargetHostname is the TARGET_HOSTNAME value of a stack with
+	// inject_hostname (empty otherwise, then omitted — no schema bump, only
+	// opted-in stacks get a new hash once). A changed host_name redeploys
+	// them, because compose would otherwise keep the old interpolation.
+	TargetHostname string `json:"target_hostname,omitempty"`
 }
 
 // canonicalSopsFile is the hash-relevant projection of config.SopsFile.
@@ -221,6 +226,7 @@ func ComputeWithInputs(stack config.Stack, in Inputs, composeContents ...[]byte)
 		EnvFileContents:          nilIfEmpty(contentDigests(in.EnvFiles)),
 		RestartFiles:             nilIfEmpty(stack.RestartFiles),
 		RestartFileContents:      nilIfEmpty(contentDigests(in.RestartFiles)),
+		TargetHostname:           targetHostname(stack),
 		Hooks: canonicalHooks{
 			PreDeploy:  nilIfEmpty(stack.Hooks.PreDeploy),
 			PostDeploy: nilIfEmpty(stack.Hooks.PostDeploy),
@@ -412,4 +418,13 @@ func canonicalScalar(n *yaml.Node) any {
 	default:
 		return n.Value
 	}
+}
+
+// targetHostname is the hash-relevant TARGET_HOSTNAME of stack: the resolved
+// value when inject_hostname is on, empty (omitted) otherwise.
+func targetHostname(stack config.Stack) string {
+	if !stack.InjectHostname {
+		return ""
+	}
+	return stack.TargetHostname
 }

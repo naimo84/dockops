@@ -113,7 +113,15 @@ type Global struct {
 	// exists (e.g. /home/docker/apps) need no bind-mount gymnastics. The
 	// env variable EnvHostCheckout fills the gap when the YAML leaves the
 	// field unset (the YAML value wins, like VAULT_ADDR).
-	HostCheckout        string   `yaml:"host_checkout"`
+	HostCheckout string `yaml:"host_checkout"`
+	// HostName is the logical name of this host (e.g. "hvaler"). Stacks
+	// with inject_hostname get it as TARGET_HOSTNAME in their environment —
+	// the successor of Komodo's `vault-env --host <name>`, which appended
+	// that variable to the rendered .env. Inside the agent container
+	// os.Hostname() is the container ID, so the name has to be configured.
+	// The env variable EnvHostName fills the gap when the YAML leaves the
+	// field unset (the YAML value wins, like host_checkout).
+	HostName            string   `yaml:"host_name"`
 	Include             []string `yaml:"include"`
 	ComposeFilePatterns []string `yaml:"compose_file_patterns"`
 	Vault               Vault    `yaml:"vault"`
@@ -221,7 +229,10 @@ type Import struct {
 	VaultPaths        []string `yaml:"vault_paths"`
 	VaultEnvTemplates []string `yaml:"vault_env_templates"`
 	RestartFiles      []string `yaml:"restart_files"`
-	Hooks             Hooks    `yaml:"hooks"`
+	// InjectHostname enables TARGET_HOSTNAME for the imported stack; true
+	// on either side (base or import) enables it.
+	InjectHostname bool  `yaml:"inject_hostname"`
+	Hooks          Hooks `yaml:"hooks"`
 }
 
 // Hooks holds shell commands that run before and after a stack deployment.
@@ -265,7 +276,17 @@ type Stack struct {
 	// deploys the stack with --force-recreate: a plain "up -d" would leave
 	// the containers untouched because the compose model did not change.
 	RestartFiles []string `yaml:"restart_files"`
-	Hooks        Hooks    `yaml:"hooks"`
+	// InjectHostname makes dockops set TARGET_HOSTNAME=<global.host_name> in
+	// the stack environment, at the lowest priority (env_files, sops and
+	// Vault values override it). Opt-in per stack on purpose: the value
+	// enters the stack hash, and injecting it everywhere would recreate
+	// every stack of a host once. Requires global.host_name.
+	InjectHostname bool `yaml:"inject_hostname"`
+	// TargetHostname is the resolved value for InjectHostname: the loader
+	// copies global.host_name here (empty when InjectHostname is false), so
+	// the env merge and the stack hash need no access to the root config.
+	TargetHostname string `yaml:"-"`
+	Hooks          Hooks  `yaml:"hooks"`
 	// UpdatePolicy decides what the image update check does with a stack
 	// whose image tag moved: "notify" (default) only reports it, "pinned"
 	// skips the stack completely (no registry lookups, no state records),

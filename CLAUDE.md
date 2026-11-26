@@ -570,6 +570,14 @@ Optionen bleibt es `0600`; Tests in `internal/env/phase14_test.go`,
   `compose.Up(..., UpOptions{ForceRecreate: true})` → `up -d --force-recreate`.
   Fehlende Datei = Deploy-Fehler. Self-Stack-Helper-Pfad kennt kein Force.
 
+- `inject_hostname` (Stack + Import, OR-Merge) + `global.host_name`
+  (Env-Fallback `DOCKOPS_HOST_NAME`, YAML gewinnt, DNS-Zeichen validiert):
+  Komodo-Parität zu `vault-env --host`. Der Loader löst den Namen in
+  `Stack.TargetHostname` (`yaml:"-"`) auf; Opt-in ohne host_name =
+  StackError. `env.Merge` setzt `TARGET_HOSTNAME` als niedrigste Stufe (vor
+  env_files). Im Hash als `target_hostname` (omitempty, nur bei Opt-in —
+  kein Schema-Bump, keine Fleet-weite Neuerstellung).
+
 ## Checks vor jedem Commit
 
     export PATH=$HOME/.local/go/bin:$PATH

@@ -34,6 +34,10 @@ var shmDir = "/dev/shm"
 // directory (see WriteStackEnv).
 const stackEnvFile = ".env"
 
+// TargetHostnameVar is the variable a stack with inject_hostname receives;
+// its value is global.host_name (see config.Stack.InjectHostname).
+const TargetHostnameVar = "TARGET_HOSTNAME"
+
 // SystemVars are the variables dockops itself injects into every stack
 // environment. They are passed explicitly instead of being read from the
 // process environment (os.Getenv), so callers — and tests — control the
@@ -81,7 +85,8 @@ func MergeStackEnv(ctx context.Context, stack config.Stack, secrets secrets.Reso
 // relative env_files, sops and vault template paths resolve against
 // (typically stack.Dir, passed separately so callers and tests control it).
 //
-// Merge priority, low to high: env_files < sops_files < vault_paths and
+// Merge priority, low to high: TARGET_HOSTNAME (inject_hostname) <
+// env_files < sops_files < vault_paths and
 // vault_env_templates < system variables — and within each group, later
 // list entries win. The vault templates sit on the same level as
 // vault_paths (the briefing groups them there for compatibility with
@@ -106,6 +111,13 @@ func Merge(ctx context.Context, stack config.Stack, secrets secrets.Resolver, ba
 	// Reading it back (a stale file from a previous deployment or one
 	// committed to the repository) would freeze old resolved values into
 	// the merge, so any env_files entry resolving to it is skipped.
+	// TARGET_HOSTNAME (inject_hostname) sits below everything else: a stack
+	// or host that sets the variable explicitly keeps its value. Komodo's
+	// vault-env appended it to the rendered .env; here it is a default.
+	if stack.InjectHostname && stack.TargetHostname != "" {
+		set(TargetHostnameVar, stack.TargetHostname, dotenv.Literal(stack.TargetHostname))
+	}
+
 	generatedEnv := filepath.Clean(filepath.Join(baseDir, stackEnvFile))
 	for i, rel := range stack.EnvFiles {
 		path := rel

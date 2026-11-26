@@ -35,6 +35,9 @@ func applyImport(base Stack, imp Import) Stack {
 	merged.VaultPaths = concatDedup(base.VaultPaths, imp.VaultPaths)
 	merged.VaultEnvTemplates = concatDedup(base.VaultEnvTemplates, imp.VaultEnvTemplates)
 	merged.RestartFiles = concatDedup(base.RestartFiles, imp.RestartFiles)
+	// inject_hostname: either side can switch it on; there is no "off"
+	// override, a bool cannot tell "unset" from "false".
+	merged.InjectHostname = base.InjectHostname || imp.InjectHostname
 	merged.Hooks = Hooks{
 		PreDeploy:  concatDedup(base.Hooks.PreDeploy, imp.Hooks.PreDeploy),
 		PostDeploy: concatDedup(base.Hooks.PostDeploy, imp.Hooks.PostDeploy),

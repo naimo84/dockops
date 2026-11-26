@@ -28,6 +28,11 @@ const DefaultWorkDir = "/var/lib/dockops/repos"
 // configuration.
 const EnvHostCheckout = "DOCKOPS_HOST_CHECKOUT"
 
+// EnvHostName is the environment fallback for global.host_name (the YAML
+// value wins, like EnvHostCheckout). Fleet hosts share one dockops compose
+// file, so the per-host name can come from the host's own environment.
+const EnvHostName = "DOCKOPS_HOST_NAME"
+
 // EnvFileMode and EnvFileGroup are the environment fallbacks for
 // global.env_file.mode and global.env_file.group: an explicit YAML value
 // wins, the variable fills only a missing field (same precedence as
@@ -180,6 +185,12 @@ func load(rootFile string) (*Config, error) {
 	}
 	for _, file := range files {
 		stack, err := loadStackFile(file, cfg.Global.ComposeFilePatterns)
+		if err == nil {
+			err = resolveTargetHostname(&stack, cfg.Global.HostName)
+			if err != nil {
+				err = fmt.Errorf("%s: %w", file, err)
+			}
+		}
 		if err != nil {
 			cfg.StackErrors = append(cfg.StackErrors, fmt.Errorf("discover local stacks below %s: %w", hostRoot, err))
 			continue
@@ -190,6 +201,9 @@ func load(rootFile string) (*Config, error) {
 	for _, imp := range cfg.Imports {
 		rem := cfg.Remotes[imp.Remote] // existence validated by loadRoot
 		stack, err := loadImportStack(cfg.Global, rem, imp)
+		if err == nil {
+			err = resolveTargetHostname(&stack, cfg.Global.HostName)
+		}
 		if err != nil {
 			cfg.StackErrors = append(cfg.StackErrors, fmt.Errorf("import remote=%q path=%q: %w", imp.Remote, imp.Path, err))
 			continue
@@ -288,6 +302,9 @@ func applyRootDefaults(root *Root) {
 	if g.HostCheckout == "" {
 		g.HostCheckout = os.Getenv(EnvHostCheckout)
 	}
+	if g.HostName == "" {
+		g.HostName = os.Getenv(EnvHostName)
+	}
 	// Phase 14: permissions of the generated <stackDir>/.env. Same
 	// precedence again — the YAML block wins over DOCKOPS_ENV_FILE_MODE and
 	// DOCKOPS_ENV_FILE_GROUP, the variables only fill a gap. The mode
@@ -324,6 +341,9 @@ func validateRoot(root *Root, file string) error {
 	}
 	if err := validateCheckoutPath(root.Global.HostCheckout); err != nil {
 		return fmt.Errorf("%s: global.host_checkout: %w", file, err)
+	}
+	if err := validateHostName(root.Global.HostName); err != nil {
+		return fmt.Errorf("%s: global.host_name: %w", file, err)
 	}
 	if root.Global.EnvFile.Mode != nil {
 		if _, err := ParseEnvFileMode(*root.Global.EnvFile.Mode); err != nil {
@@ -398,6 +418,47 @@ func sortedRemoteNames(remotes map[string]Remote) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// resolveTargetHostname fills stack.TargetHostname from global.host_name for
+// a stack with inject_hostname. A stack that asks for the variable on a host
+// without a name is a stack error, not a silent empty value: an empty
+// TARGET_HOSTNAME is exactly the broken "traefik-.int..." router this
+// feature exists to prevent.
+func resolveTargetHostname(stack *Stack, hostName string) error {
+	stack.TargetHostname = ""
+	if !stack.InjectHostname {
+		return nil
+	}
+	if hostName == "" {
+		return fmt.Errorf("stack %s: inject_hostname requires global.host_name (or env %s)", stack.Name, EnvHostName)
+	}
+	stack.TargetHostname = hostName
+	return nil
+}
+
+// validateHostName accepts an empty value (feature unused) or a DNS-style
+// name: lowercase letters, digits, '-' and '.', at most 253 characters, not
+// starting or ending with '-' or '.'. The value lands in dotenv files and
+// usually in host names (routers, container names), so anything else is a
+// configuration mistake.
+func validateHostName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if len(name) > 253 {
+		return fmt.Errorf("%q is longer than 253 characters", name)
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '.') {
+			return fmt.Errorf("%q: invalid character %q (allowed: a-z, 0-9, '-', '.')", name, c)
+		}
+	}
+	if first, last := name[0], name[len(name)-1]; first == '-' || first == '.' || last == '-' || last == '.' {
+		return fmt.Errorf("%q must not start or end with '-' or '.'", name)
+	}
+	return nil
 }
 
 // validateCheckoutPath checks a configured checkout path
