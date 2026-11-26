@@ -48,6 +48,7 @@ const (
 	envStatusToken    = "DOCKOPS_STATUS_TOKEN"
 	envLogsToken      = "DOCKOPS_LOGS_TOKEN"
 	envRestartToken   = "DOCKOPS_RESTART_TOKEN"
+	envPullToken      = "DOCKOPS_PULL_TOKEN"
 	envSelfProject    = "DOCKOPS_SELF_PROJECT"
 	envSelfUpdate     = "DOCKOPS_SELF_UPDATE"
 	envSelfImage      = "DOCKOPS_SELF_IMAGE"
@@ -721,16 +722,20 @@ func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconcil
 			// generated .env (see Reconciler.Restart).
 			Restart:      rec.Restart,
 			RestartToken: restartToken,
-			Logger:       logger,
-			State:        collab.store,
-			Compose:      collab.compose,
-			RepoURL:      opts.RepoURL,
-			Branch:       opts.Branch,
-			HeadCommit:   hostCommitFn(collab.git),
-			SelfProject:  selfProject(),
-			Token:        os.Getenv(envStatusToken),
-			Logs:         collab.compose,
-			LogsToken:    logsToken,
+			// POST /pull queues an immediate image update check; the
+			// trigger above runs it in the next pass.
+			Pull:        rec.RequestUpdateCheck,
+			PullToken:   os.Getenv(envPullToken),
+			Logger:      logger,
+			State:       collab.store,
+			Compose:     collab.compose,
+			RepoURL:     opts.RepoURL,
+			Branch:      opts.Branch,
+			HeadCommit:  hostCommitFn(collab.git),
+			SelfProject: selfProject(),
+			Token:       os.Getenv(envStatusToken),
+			Logs:        collab.compose,
+			LogsToken:   logsToken,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -748,7 +753,7 @@ func serve(ctx context.Context, opts options, logger *slog.Logger, rec *reconcil
 	}()
 	logger.Info("webhook server listening",
 		"addr", opts.Addr,
-		"endpoints", "POST /webhook, POST /restart, GET /healthz, GET /status")
+		"endpoints", "POST /webhook, POST /restart, POST /pull, GET /healthz, GET /status")
 
 	// First pass immediately: deploy the current state on startup; it also
 	// loads the config and thereby the poll interval.

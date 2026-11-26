@@ -442,6 +442,13 @@ type Reconciler struct {
 	// set.
 	stacks   []config.Stack
 	stacksMu sync.RWMutex
+
+	// forcedChecks are the stacks POST /pull queued for an image update
+	// check regardless of update_check_interval (see pull.go); the next
+	// checkImageUpdates drains them. forcedMu guards the set because the
+	// HTTP goroutine fills it while a pass may be running.
+	forcedChecks map[string]struct{}
+	forcedMu     sync.Mutex
 }
 
 // New returns a Reconciler for deps, applying the defaults documented on

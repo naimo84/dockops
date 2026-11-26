@@ -49,7 +49,16 @@ const locallyBuiltImage = "locally built image"
 // Only state persistence failures are returned to the caller.
 func (r *Reconciler) checkImageUpdates(ctx context.Context, cfg *config.Config, pn *passNotify) []error {
 	interval := cfg.Global.EffectiveUpdateCheckInterval()
+	// POST /pull requests are drained up front, so a disabled check does not
+	// keep them queued until it is switched back on.
+	forced := r.takeForcedChecks()
 	if interval <= 0 {
+		if len(forced) > 0 {
+			// update_check_interval: 0 is the global emergency brake for
+			// rate-limited registries; an explicit request does not lift it.
+			r.logger.Warn("image update check disabled (update_check_interval: 0); POST /pull request dropped",
+				"stacks", sortedNames(forced))
+		}
 		r.logger.Debug("image update check disabled (update_check_interval: 0)")
 		return nil
 	}
@@ -67,7 +76,9 @@ func (r *Reconciler) checkImageUpdates(ctx context.Context, cfg *config.Config, 
 			// its records then).
 			continue
 		}
-		if !updateDue(st, interval, now) {
+		if _, requested := forced[stack.Name]; requested {
+			r.logger.Info("image update check: requested via POST /pull", "stack", stack.Name)
+		} else if !updateDue(st, interval, now) {
 			r.logger.Debug("image update check: not due yet", "stack", stack.Name, "interval", interval.String())
 			continue
 		}

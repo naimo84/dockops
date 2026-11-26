@@ -85,6 +85,11 @@ type Deps struct {
 	// and with neither configured the endpoint is disabled (503).
 	RestartToken string
 
+	// PullToken guards POST /pull (Authorization: Bearer). Empty falls back
+	// to RestartToken, then to the webhook authentication; with none of
+	// them the endpoint is disabled (503).
+	PullToken string
+
 	// Liveness reports whether the reconcile loop makes progress; a non-nil
 	// error turns GET /healthz into 503 with the error text, so a watchdog
 	// notices an agent whose loop hangs while its HTTP server still answers.
@@ -104,6 +109,11 @@ type Deps struct {
 	// not a failed request. The error return is reserved for requests that
 	// cannot be served at all (500). Nil disables the endpoint with 503.
 	Restart RestartFunc
+
+	// Pull serves POST /pull (see pull.go): it queues stacks for an image
+	// update check in the next pass, which the handler then triggers. Nil
+	// disables the endpoint with 503.
+	Pull PullFunc
 
 	// Logger; nil falls back to slog.Default().
 	Logger *slog.Logger
@@ -154,11 +164,14 @@ type Deps struct {
 type Handler struct {
 	secret       string
 	restartToken string
+	pullToken    string
 	liveness     func() error
 	trigger      func()
 	// restart serves POST /restart (Deps.Restart); nil → 503.
 	restart RestartFunc
-	logger  *slog.Logger
+	// pull serves POST /pull (Deps.Pull); nil → 503.
+	pull   PullFunc
+	logger *slog.Logger
 	// status feeds BuildStatus for GET /status (Logger pinned to the
 	// handler's logger).
 	status StatusDeps
@@ -182,9 +195,11 @@ func New(deps Deps) *Handler {
 	return &Handler{
 		secret:       deps.Secret,
 		restartToken: deps.RestartToken,
+		pullToken:    deps.PullToken,
 		liveness:     deps.Liveness,
 		trigger:      deps.Trigger,
 		restart:      deps.Restart,
+		pull:         deps.Pull,
 		logger:       logger,
 		status: StatusDeps{
 			State:       deps.State,
@@ -234,6 +249,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleRestart(w, r)
+	case "/pull":
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handlePull(w, r)
 	case "/status":
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
