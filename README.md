@@ -62,6 +62,11 @@ global:
   # Env-Fallback DOCKOPS_HOST_CHECKOUT, ein YAML-Wert gewinnt) —
   # siehe „Konfigurierbare Checkout-Pfade“
   # host_checkout: /home/docker/apps
+  # Logischer Name dieses Hosts. Stacks mit `inject_hostname: true` bekommen
+  # ihn als TARGET_HOSTNAME (Nachfolger von Komodos `vault-env --host`).
+  # Env-Fallback DOCKOPS_HOST_NAME, ein YAML-Wert gewinnt; erlaubt sind
+  # a-z, 0-9, '-' und '.'.
+  # host_name: hvaler
   # Poll-Intervall des Daemon-Modus (Default: 5m)
   poll_interval: 5m
   # Stacks, die aus der Config verschwinden, mit `compose down` entfernen
@@ -235,6 +240,14 @@ vault_env_templates:
 # Grenze: der Self-Stack (dockops) läuft über den Helper ohne Force.
 restart_files:
   - config.yaml
+
+# TARGET_HOSTNAME=<global.host_name> in die Stack-Env setzen, mit der
+# niedrigsten Priorität (env_files, sops und Vault überschreiben ihn).
+# Opt-in pro Stack, weil der Wert in den Stack-Hash eingeht: das erste
+# Eintragen und jede Änderung von host_name deployen den Stack neu. Ohne
+# host_name ist der Stack ein Ladefehler (nie ein leerer Wert). Im Import
+# genügt `inject_hostname: true` auf einer der beiden Seiten.
+inject_hostname: true
 
 hooks:
   pre_deploy:
